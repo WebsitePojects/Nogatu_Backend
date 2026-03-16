@@ -1,0 +1,26 @@
+{
+  "name": "nogatualliance-backend",
+  "version": "1.0.0",
+  "description": "NOGATU Alliance - Express API Server",
+  "private": true,
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development nodemon index.js",
+    "start": "cross-env NODE_ENV=production node index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "connect-session-sequelize": "^7.1.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.1",
+    "express-mysql-session": "^3.0.3",
+    "express-rate-limit": "^7.4.1",
+    "express-session": "^1.18.1",
+    "helmet": "^8.0.0",
+    "mysql2": "^3.11.5"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "nodemon": "^3.1.7"
+  }
+}
