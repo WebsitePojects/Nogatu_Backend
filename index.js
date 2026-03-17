@@ -72,6 +72,8 @@ app.use('/api/registration', require('./routes/registration'));
 app.use('/api/pairing', require('./routes/pairing'));
 app.use('/api/hifive', require('./routes/hifive'));
 app.use('/api/transactions', require('./routes/transactions'));
+app.use('/api/news', require('./routes/news'));
+app.use('/api/stats', require('./routes/stats'));
 
 // Admin routes
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -81,6 +83,7 @@ app.use('/api/admin/codes', require('./routes/admin/codes'));
 app.use('/api/admin/encashment', require('./routes/admin/encashment'));
 app.use('/api/admin/redeem', require('./routes/admin/redeem'));
 app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
+app.use('/api/admin/news', require('./routes/admin/news'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {

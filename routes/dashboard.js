@@ -7,29 +7,29 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
+const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
 
 /**
  * GET /api/dashboard
- * Returns all dashboard metrics for the logged-in member
+ * Returns all dashboard metrics for the logged-in member.
+ * Triggers income calculation first so values are always current —
+ * no need to visit the wallet page to see earned income.
  */
 router.get('/', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
+    const currentaccttype = req.session.currentaccttype;
 
-    // 1. Get income totals from payouttotaltab
-    const [incomeRows] = await pool.query(
-      `SELECT ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome6,
-              ttlcashbalance FROM payouttotaltab WHERE uid = ?`,
-      [uid]
-    );
+    // 1. Calculate any new income and persist it, then read the updated totals.
+    //    All income types are idempotent — repeated calls never double-credit.
+    const income = await calculateAndStoreIncome(uid, currentaccttype);
 
-    const income = incomeRows[0] || {};
-    const ttlincome1 = Number(income.ttlincome1 || 0);
-    const ttlincome2 = Number(income.ttlincome2 || 0);
-    const ttlincome3 = Number(income.ttlincome3 || 0);
-    const ttlincome4 = Number(income.ttlincome4 || 0);
-    const ttlincome5 = Number(income.ttlincome5 || 0);
-    const ttlincome6 = Number(income.ttlincome6 || 0);
+    const ttlincome1     = Number(income.ttlincome1     || 0);
+    const ttlincome2     = Number(income.ttlincome2     || 0);
+    const ttlincome3     = Number(income.ttlincome3     || 0);
+    const ttlincome4     = Number(income.ttlincome4     || 0);
+    const ttlincome5     = Number(income.ttlincome5     || 0);
+    const ttlincome6     = Number(income.ttlincome6     || 0);
     const ttlcashbalance = Number(income.ttlcashbalance || 0);
 
     // Total Cash Income = income1 + income2 + income4 + income5 + income6
