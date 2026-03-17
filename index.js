@@ -17,6 +17,9 @@ const { testConnection, pool } = require('./config/database');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust Nginx reverse proxy — required for secure cookies behind HTTPS proxy
+app.set('trust proxy', 1);
+
 // ─── Middleware ───────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
