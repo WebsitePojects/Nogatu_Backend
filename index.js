@@ -3,9 +3,27 @@
  * Modern Node.js backend serving the same MySQL database as the PHP system
  */
 const path = require('path');
-const envFile = process.env.NODE_ENV === 'production' ? '.env.prod' : '.env.dev';
+const fs = require('fs');
+
+function resolveEnvFile() {
+  if (process.env.NODE_ENV === 'production') {
+    return '.env.prod';
+  }
+
+  // Support both naming styles used in this repo history
+  const candidates = ['.env.development', '.env.dev'];
+  for (const file of candidates) {
+    if (fs.existsSync(path.resolve(__dirname, file))) {
+      return file;
+    }
+  }
+
+  return '.env.dev';
+}
+
+const envFile = resolveEnvFile();
 require('dotenv').config({ path: path.resolve(__dirname, envFile) });
-console.log(`[Server] Loaded env: ${envFile}`);
+console.log(`[Server] Loaded env file: ${envFile}`);
 
 const express = require('express');
 const session = require('express-session');
@@ -14,6 +32,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const { testConnection, pool } = require('./config/database');
 
+const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -45,9 +64,14 @@ const sessionStore = new MySQLStore({
   },
 }, pool);
 
+// Validate session secret
+if (!process.env.SESSION_SECRET) {
+  console.warn('[Server] WARNING: SESSION_SECRET not set in environment. Using insecure fallback for development only.');
+}
+
 // Session config
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'nogatualliance_secret',
+  secret: process.env.SESSION_SECRET || 'dev-only-insecure-secret-' + Date.now(),
   store: sessionStore,
   resave: false,
   saveUninitialized: false,
@@ -58,6 +82,17 @@ app.use(session({
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   },
 }));
+
+// ─── Rate limiting on login endpoints ────────────────────────
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,                   // Max 10 attempts per window
+  message: { error: 'Too many login attempts. Please try again after 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/auth/login', loginLimiter);
+app.use('/api/admin/auth/login', loginLimiter);
 
 // ─── API Routes ──────────────────────────────────────────────
 // Member routes
@@ -74,6 +109,8 @@ app.use('/api/hifive', require('./routes/hifive'));
 app.use('/api/transactions', require('./routes/transactions'));
 app.use('/api/news', require('./routes/news'));
 app.use('/api/stats', require('./routes/stats'));
+app.use('/api/vouchers', require('./routes/vouchers'));
+app.use('/api/ranking', require('./routes/ranking'));
 
 // Admin routes
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -84,6 +121,8 @@ app.use('/api/admin/encashment', require('./routes/admin/encashment'));
 app.use('/api/admin/redeem', require('./routes/admin/redeem'));
 app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
 app.use('/api/admin/news', require('./routes/admin/news'));
+app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
+app.use('/api/admin/rankings', require('./routes/admin/rankings'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {

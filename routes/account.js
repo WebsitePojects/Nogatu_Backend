@@ -4,6 +4,7 @@
  */
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 
@@ -42,7 +43,6 @@ router.get('/', memberAuth, async (req, res) => {
       email: user.email,
       payoutid: user.payoutid,
       payoutdetails: user.payoutdetails,
-      password: user.password,
       accttype: user.currentaccttype,
       codeid: user.codeid,
       datereg: user.datereg,
@@ -63,14 +63,29 @@ router.put('/', memberAuth, async (req, res) => {
     const uid = req.session.uid;
     const { address, password, payoutdetails, payoutoptions, contactnos } = req.body;
 
+    // Build update query — only update password if provided
+    if (password && password.trim()) {
+      const hashedPassword = await bcrypt.hash(password, 12);
+      await pool.query(
+        `UPDATE memberstab SET address = ?, password = ?,
+         payoutdetails = ?, payoutid = ?, contactnos = ?
+         WHERE uid = ? LIMIT 1`,
+        [address, hashedPassword, payoutdetails, payoutoptions, contactnos, uid]
+      );
+    } else {
+      await pool.query(
+        `UPDATE memberstab SET address = ?,
+         payoutdetails = ?, payoutid = ?, contactnos = ?
+         WHERE uid = ? LIMIT 1`,
+        [address, payoutdetails, payoutoptions, contactnos, uid]
+      );
+    }
+
     const [result] = await pool.query(
-      `UPDATE memberstab SET address = ?, password = ?,
-       payoutdetails = ?, payoutid = ?, contactnos = ?
-       WHERE uid = ? LIMIT 1`,
-      [address, password, payoutdetails, payoutoptions, contactnos, uid]
+      'SELECT uid FROM memberstab WHERE uid = ?', [uid]
     );
 
-    if (result.affectedRows === 1) {
+    if (result.length > 0) {
       res.json({ success: true, message: 'Account updated successfully' });
     } else {
       res.status(400).json({ error: 'Update failed' });

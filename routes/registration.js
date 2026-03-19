@@ -81,6 +81,40 @@ router.get('/available-position', memberAuth, async (req, res) => {
 });
 
 /**
+ * GET /api/registration/check-duplicate-name?firstname=XXX&lastname=XXX
+ * Check for one-name duplicates (DOC2 §4.4)
+ */
+router.get('/check-duplicate-name', memberAuth, async (req, res) => {
+  try {
+    const { firstname, lastname } = req.query;
+    const result = await registrationService.checkDuplicateName(firstname || '', lastname || '');
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/registration/available-codes?package_type=10
+ * Auto-fill registration codes from sponsor's inventory (DOC2 §4.5)
+ */
+router.get('/available-codes', memberAuth, async (req, res) => {
+  try {
+    const sponsorUid = req.session.uid;
+    const packageType = Number(req.query.package_type);
+
+    if (!packageType) {
+      return res.status(400).json({ error: 'Package type is required' });
+    }
+
+    const codes = await registrationService.getAvailableCodes(sponsorUid, packageType);
+    res.json({ codes });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
  * POST /api/registration/register
  * Full account registration
  */
@@ -90,6 +124,20 @@ router.post('/register', memberAuth, async (req, res) => {
       activationCode, placementUid, username, password,
       firstname, lastname, middlename, position
     } = req.body;
+
+    // Input validation
+    if (!activationCode || !username || !password || !firstname || !lastname || !placementUid) {
+      return res.status(400).json({ error: 'All required fields must be filled' });
+    }
+    if (username.length < 3 || username.length > 30) {
+      return res.status(400).json({ error: 'Username must be 3-30 characters' });
+    }
+    if (password.length < 6 || password.length > 50) {
+      return res.status(400).json({ error: 'Password must be 6-50 characters' });
+    }
+    if (firstname.length > 50 || lastname.length > 50) {
+      return res.status(400).json({ error: 'Name fields must be under 50 characters' });
+    }
 
     const result = await registrationService.registerMember({
       activationCode,

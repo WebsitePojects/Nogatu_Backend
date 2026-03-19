@@ -11,7 +11,7 @@
  * - Requires monthly maintenance (>= 200 points)
  */
 const { pool } = require('../../config/database');
-const { previousMonthRange } = require('../../utils/helpers');
+const { previousMonthRange, currentMonthRange } = require('../../utils/helpers');
 
 /**
  * Get total repurchase points for a user in previous month
@@ -45,10 +45,11 @@ async function checkLastMaintenance(uid) {
 
 /**
  * Check if unilevel income has already been calculated this month
- * Mirrors PHP chk_unileveltransdate()
+ * Mirrors PHP chk_unileveltransdate() — uses CURRENT month range
+ * to prevent duplicate calculation within the same calendar month
  */
 async function checkUnilevelTransDate(uid) {
-  const { start, end } = previousMonthRange();
+  const { start, end } = currentMonthRange();
 
   const [rows] = await pool.query(
     `SELECT * FROM incometransdatetab

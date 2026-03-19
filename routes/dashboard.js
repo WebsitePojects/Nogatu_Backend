@@ -32,8 +32,8 @@ router.get('/', memberAuth, async (req, res) => {
     const ttlincome6     = Number(income.ttlincome6     || 0);
     const ttlcashbalance = Number(income.ttlcashbalance || 0);
 
-    // Total Cash Income = income1 + income2 + income4 + income5 + income6
-    const totalCashIncome = ttlincome1 + ttlincome2 + ttlincome4 + ttlincome5 + ttlincome6;
+    // Total Cash Income = all 6 income types
+    const totalCashIncome = ttlincome1 + ttlincome2 + ttlincome3 + ttlincome4 + ttlincome5 + ttlincome6;
 
     // 2. Get maintenance status (current month repurchases)
     const { start, end } = currentMonthRange();

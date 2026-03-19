@@ -4,6 +4,7 @@
  */
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcryptjs');
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName, ENTRY_TYPES } = require('../../utils/helpers');
@@ -81,7 +82,7 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
-              m.username, m.password, m.firstname, m.lastname, m.middlename,
+              m.username, m.firstname, m.lastname, m.middlename,
               m.address, m.contactnos, m.payoutid, m.payoutdetails
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
@@ -110,15 +111,28 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
     const { firstname, lastname, middlename, address, password,
             payoutdetails, payoutoptions, contactnos } = req.body;
 
-    const [result] = await pool.query(
-      `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-       address = ?, password = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
-       WHERE uid = ? LIMIT 1`,
-      [firstname, lastname, middlename, address, password,
-       payoutdetails, payoutoptions, contactnos, uid]
-    );
+    if (password && password.trim()) {
+      const hashedPassword = await bcrypt.hash(password, 12);
+      await pool.query(
+        `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
+         address = ?, password = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
+         WHERE uid = ? LIMIT 1`,
+        [firstname, lastname, middlename, address, hashedPassword,
+         payoutdetails, payoutoptions, contactnos, uid]
+      );
+    } else {
+      await pool.query(
+        `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
+         address = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
+         WHERE uid = ? LIMIT 1`,
+        [firstname, lastname, middlename, address,
+         payoutdetails, payoutoptions, contactnos, uid]
+      );
+    }
 
-    if (result.affectedRows === 1) {
+    const [result] = await pool.query('SELECT uid FROM memberstab WHERE uid = ?', [uid]);
+
+    if (result.length > 0) {
       res.json({ success: true, message: 'Account updated successfully' });
     } else {
       res.status(400).json({ error: 'Update failed' });
@@ -131,16 +145,44 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
 
 /**
  * POST /api/admin/accounts/change-password
- * Change admin password
- * Mirrors PHP adminpanel/change-password.php
+ * Change admin password — requires old password verification
  */
 router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const { adminAccount, password } = req.body;
+    const { adminAccount, password, oldPassword } = req.body;
 
+    if (!adminAccount || !password) {
+      return res.status(400).json({ error: 'Admin account and new password are required' });
+    }
+
+    // Verify old password first
+    const [adminRows] = await pool.query(
+      'SELECT username, password FROM accesstab WHERE username = ?',
+      [adminAccount]
+    );
+
+    if (adminRows.length === 0) {
+      return res.status(404).json({ error: 'Admin account not found' });
+    }
+
+    if (oldPassword) {
+      const storedPw = adminRows[0].password;
+      const isHashed = storedPw && storedPw.startsWith('$2');
+      let oldMatch = false;
+      if (isHashed) {
+        oldMatch = await bcrypt.compare(oldPassword, storedPw);
+      } else {
+        oldMatch = (oldPassword === storedPw);
+      }
+      if (!oldMatch) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+      }
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
     const [result] = await pool.query(
       'UPDATE accesstab SET password = ? WHERE username = ? LIMIT 1',
-      [password, adminAccount]
+      [hashedPassword, adminAccount]
     );
 
     if (result.affectedRows === 1) {

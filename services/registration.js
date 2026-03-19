@@ -4,8 +4,10 @@
  *
  * Handles validation, UID generation, and member/user insertion
  */
+const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { sanitizeAlphaNum, getOffsetTimestamp } = require('../utils/helpers');
+const { issueVoucher } = require('./voucher');
 
 /**
  * Check if activation code is valid and available
@@ -115,7 +117,7 @@ async function checkPlacementSlots(placementId) {
 }
 
 /**
- * Check if account name already exists
+ * Check if account name already exists (exact match)
  * Mirrors PHP get_accountname()
  */
 async function checkAccountName(firstname, lastname, middlename) {
@@ -133,6 +135,58 @@ async function checkAccountName(firstname, lastname, middlename) {
     count: rows.length,
     uid: rows.length > 0 ? rows[0].uid : 0,
   };
+}
+
+/**
+ * Normalize name for duplicate detection (DOC2 §4.4)
+ * "Juan Delgado" and "Delgado Juan" both → "delgadojuan"
+ */
+function normalizeName(first, last) {
+  const parts = [first, last]
+    .map(s => (s || '').toLowerCase().trim())
+    .filter(s => s.length > 0)
+    .sort();
+  return parts.join('');
+}
+
+/**
+ * Check for one-name duplicates using normalized name comparison
+ * Returns matching records if any found
+ */
+async function checkDuplicateName(firstname, lastname) {
+  const normalized = normalizeName(firstname, lastname);
+  if (!normalized) return { isDuplicate: false, matches: [] };
+
+  const [rows] = await pool.query(
+    'SELECT uid, firstname, lastname FROM memberstab'
+  );
+
+  const matches = rows.filter(row => {
+    const existing = normalizeName(row.firstname, row.lastname);
+    return existing === normalized;
+  });
+
+  return {
+    isDuplicate: matches.length > 0,
+    matches: matches.map(m => ({
+      uid: m.uid,
+      name: `${m.firstname} ${m.lastname}`,
+    })),
+  };
+}
+
+/**
+ * Get available codes for a sponsor by package type (DOC2 §4.5)
+ * Used for auto-fill code dropdown on registration form
+ */
+async function getAvailableCodes(sponsorUid, packageType) {
+  const [rows] = await pool.query(
+    `SELECT code, producttype FROM codestab
+     WHERE uid = ? AND codestatus = 1 AND producttype = ?
+     ORDER BY id ASC`,
+    [sponsorUid, packageType]
+  );
+  return rows;
 }
 
 /**
@@ -240,12 +294,22 @@ async function registerMember({
        codeData.incentivepoints, cdAmount, cdTotal, cdStatus, codeData.profitsharing, sponsorUid]
     );
 
-    // 8. Insert into memberstab
+    // 8. Insert into memberstab (hash password with bcrypt)
+    const hashedPassword = await bcrypt.hash(password, 12);
     await conn.query(
       `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename)
        VALUES (NULL, ?, ?, ?, ?, ?, ?)`,
-      [newUid, sanitizeAlphaNum(username), password, firstname, lastname, middlename]
+      [newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename]
     );
+
+    // 9. Issue voucher for new member (DOC2 §4.1)
+    try {
+      await issueVoucher(conn, newUid, codeData.producttype);
+    } catch (voucherErr) {
+      // Voucher issuance is non-critical — log but don't block registration
+      // Table may not exist yet if migrations haven't run
+      console.warn('[Registration] Voucher issuance skipped:', voucherErr.message);
+    }
 
     await conn.commit();
 
@@ -273,6 +337,9 @@ module.exports = {
   getAvailablePosition,
   checkPlacementSlots,
   checkAccountName,
+  checkDuplicateName,
+  getAvailableCodes,
+  normalizeName,
   generateUID,
   getNextCountId,
   registerMember,

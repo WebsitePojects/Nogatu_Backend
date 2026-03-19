@@ -31,8 +31,8 @@ router.get('/', memberAuth, async (req, res) => {
       lpc:            Number(updated.ttlincome6 || 0),
       cashBalance:    Number(updated.ttlcashbalance || 0),
       totalIncome:    Number(updated.ttlincome1 || 0) + Number(updated.ttlincome2 || 0) +
-                      Number(updated.ttlincome4 || 0) + Number(updated.ttlincome5 || 0) +
-                      Number(updated.ttlincome6 || 0),
+                      Number(updated.ttlincome3 || 0) + Number(updated.ttlincome4 || 0) +
+                      Number(updated.ttlincome5 || 0) + Number(updated.ttlincome6 || 0),
     });
   } catch (err) {
     console.error('[Wallet] Error:', err);
@@ -47,10 +47,10 @@ router.get('/', memberAuth, async (req, res) => {
 router.post('/encash', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
-    const { amount } = req.body;
+    const amount = Number(req.body.amount);
 
-    if (!amount || amount < 500) {
-      return res.status(400).json({ error: 'Minimum encashment is 500' });
+    if (!amount || isNaN(amount) || amount < 500) {
+      return res.status(400).json({ error: 'Minimum encashment is ₱500' });
     }
 
     // Get user info for CD deduction check

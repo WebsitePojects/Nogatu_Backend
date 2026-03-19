@@ -4,6 +4,7 @@
  */
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcryptjs');
 const { pool } = require('../../config/database');
 
 /**
@@ -21,8 +22,8 @@ router.post('/login', async (req, res) => {
     }
 
     const [rows] = await pool.query(
-      'SELECT id, username, password, name, rights FROM accesstab WHERE username = ? AND password = ?',
-      [username, password]
+      'SELECT id, username, password, name, rights FROM accesstab WHERE username = ?',
+      [username]
     );
 
     if (rows.length === 0) {
@@ -30,6 +31,23 @@ router.post('/login', async (req, res) => {
     }
 
     const admin = rows[0];
+
+    // Compare password — supports both bcrypt hashed and legacy plaintext
+    const isHashed = admin.password && admin.password.startsWith('$2');
+    let passwordMatch = false;
+    if (isHashed) {
+      passwordMatch = await bcrypt.compare(password, admin.password);
+    } else {
+      passwordMatch = (password === admin.password);
+      if (passwordMatch) {
+        const hashed = await bcrypt.hash(password, 12);
+        await pool.query('UPDATE accesstab SET password = ? WHERE username = ?', [hashed, admin.username]);
+      }
+    }
+
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
 
     req.session.adminid = admin.username;
     req.session.adminname = admin.name;

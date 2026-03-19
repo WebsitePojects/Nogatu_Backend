@@ -4,6 +4,7 @@
  */
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
 
@@ -25,8 +26,8 @@ router.post('/login', async (req, res) => {
               u.codeid, DATE_FORMAT(u.datereg, '%Y-%m-%d') as datereg, u.position,
               m.uid as mUid, m.username, m.password, m.firstname, m.lastname
        FROM memberstab m, usertab u
-       WHERE m.uid = u.uid AND m.username = ? AND m.password = ?`,
-      [username, password]
+       WHERE m.uid = u.uid AND m.username = ?`,
+      [username]
     );
 
     if (rows.length === 0) {
@@ -34,6 +35,24 @@ router.post('/login', async (req, res) => {
     }
 
     const user = rows[0];
+
+    // Compare password — supports both bcrypt hashed and legacy plaintext
+    const isHashed = user.password && user.password.startsWith('$2');
+    let passwordMatch = false;
+    if (isHashed) {
+      passwordMatch = await bcrypt.compare(password, user.password);
+    } else {
+      // Legacy plaintext comparison — auto-upgrade to bcrypt on successful login
+      passwordMatch = (password === user.password);
+      if (passwordMatch) {
+        const hashed = await bcrypt.hash(password, 12);
+        await pool.query('UPDATE memberstab SET password = ? WHERE uid = ?', [hashed, user.uid]);
+      }
+    }
+
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
 
     // Set session variables (mirrors PHP session exactly)
     req.session.uid = user.uid;

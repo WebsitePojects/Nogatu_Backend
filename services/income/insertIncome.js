@@ -91,10 +91,13 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
   const tax = encashmentAmount * 0.10; // 10% tax
   const fee = 50; // Fixed processing fee
 
-  // CD deduction (25% if codeid == 3 and cdstatus == 1)
+  // CD deduction (25% if codeid == 3 and cdstatus == 1, capped against remaining CD debt)
   let cdDeduction = 0;
-  if (userInfo.codeid === 3 && userInfo.cdstatus === 1) {
-    cdDeduction = encashmentAmount * 0.25;
+  if (Number(userInfo.codeid) === 3 && Number(userInfo.cdstatus) === 1) {
+    const cdAmount = Number(userInfo.cdamount || 0);
+    const cdTotal = Number(userInfo.cdtotal || 0);
+    const cdRemaining = cdAmount - cdTotal; // Remaining CD debt
+    cdDeduction = Math.min(encashmentAmount * 0.25, Math.max(0, cdRemaining));
   }
 
   const grossDeduction = tax + fee + cdDeduction;
@@ -108,6 +111,17 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
     'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = ? WHERE uid = ?',
     [newBalance, now, uid]
   );
+
+  // Update CD tracking: increment cdtotal and clear cdstatus when fully paid
+  if (cdDeduction > 0) {
+    const newCdTotal = Number(userInfo.cdtotal || 0) + cdDeduction;
+    const cdAmount = Number(userInfo.cdamount || 0);
+    const newCdStatus = newCdTotal >= cdAmount ? 2 : 1; // 2 = fully paid
+    await pool.query(
+      'UPDATE usertab SET cdtotal = ?, cdstatus = ? WHERE uid = ?',
+      [newCdTotal, newCdStatus, uid]
+    );
+  }
 
   // Insert encashment record into payouthistorytab
   await pool.query(
