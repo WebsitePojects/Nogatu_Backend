@@ -196,4 +196,175 @@ router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res)
   }
 });
 
+/**
+ * GET /api/admin/accounts/:uid/income
+ * Income transaction details for a member (transactiontype=1)
+ * Mirrors PHP adminpanel/accounts-income-details.php
+ */
+router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const uid = Number(req.params.uid);
+
+    // Member info
+    const [memberRows] = await pool.query(
+      `SELECT m.firstname, m.lastname, m.username
+       FROM memberstab m WHERE m.uid = ? LIMIT 1`,
+      [uid]
+    );
+    if (memberRows.length === 0) return res.status(404).json({ error: 'Account not found' });
+    const member = memberRows[0];
+
+    // Income transactions (type 1 = income credit)
+    const [txRows] = await pool.query(
+      `SELECT pid, transdate, beginningbalance, endingbalance,
+              income1, income2, income3, income4, income5, income6
+       FROM payouthistorytab
+       WHERE uid = ? AND transactiontype = 1
+       ORDER BY pid DESC`,
+      [uid]
+    );
+
+    // Cumulative income totals
+    const [totalsRows] = await pool.query(
+      `SELECT ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome6, ttlcashbalance
+       FROM payouttotaltab WHERE uid = ? LIMIT 1`,
+      [uid]
+    );
+    const totals = totalsRows[0] || {};
+
+    // Direct referrals (sponsor tree)
+    const [drefRows] = await pool.query(
+      `SELECT m.firstname, m.lastname, m.username, u.currentaccttype, u.datereg
+       FROM usertab u INNER JOIN memberstab m ON m.uid = u.uid
+       WHERE u.drefid = ? ORDER BY u.datereg DESC`,
+      [uid]
+    );
+
+    // Binary pair direct children (position 1=Left, 2=Right)
+    const [pairRows] = await pool.query(
+      `SELECT m.firstname, m.lastname, m.username, u.currentaccttype, u.position
+       FROM usertab u INNER JOIN memberstab m ON m.uid = u.uid
+       WHERE u.refid = ? LIMIT 2`,
+      [uid]
+    );
+
+    // Leadership binary downline L1–L3
+    const [ldrsRows] = await pool.query(
+      `SELECT m1.firstname, m1.lastname, m1.username, u1.currentaccttype, 'L1' AS lvl
+       FROM usertab u1 INNER JOIN memberstab m1 ON m1.uid = u1.uid WHERE u1.refid = ?
+       UNION
+       SELECT m2.firstname, m2.lastname, m2.username, u2.currentaccttype, 'L2' AS lvl
+       FROM usertab u1
+       INNER JOIN usertab u2 ON u2.refid = u1.uid
+       INNER JOIN memberstab m2 ON m2.uid = u2.uid WHERE u1.refid = ?
+       UNION
+       SELECT m3.firstname, m3.lastname, m3.username, u3.currentaccttype, 'L3' AS lvl
+       FROM usertab u1
+       INNER JOIN usertab u2 ON u2.refid = u1.uid
+       INNER JOIN usertab u3 ON u3.refid = u2.uid
+       INNER JOIN memberstab m3 ON m3.uid = u3.uid WHERE u1.refid = ?
+       LIMIT 30`,
+      [uid, uid, uid]
+    );
+
+    const pkgMap = { 10: 'Bronze', 20: 'Silver', 30: 'Gold', 40: 'Platinum', 50: 'Garnet', 60: 'Diamond' };
+
+    res.json({
+      member: {
+        uid,
+        username: member.username,
+        fullname: `${member.firstname} ${member.lastname}`,
+      },
+      totals,
+      transactions: txRows.map(r => ({
+        pid: r.pid,
+        transdate: r.transdate,
+        beginningbalance: Number(r.beginningbalance),
+        endingbalance: Number(r.endingbalance),
+        income1: Number(r.income1),
+        income2: Number(r.income2),
+        income3: Number(r.income3),
+        income4: Number(r.income4),
+        income5: Number(r.income5),
+        income6: Number(r.income6),
+        total: Number(r.income1) + Number(r.income2) + Number(r.income3) +
+               Number(r.income4) + Number(r.income5) + Number(r.income6),
+      })),
+      directReferrals: drefRows.map(r => ({
+        name: `${r.firstname} ${r.lastname}`,
+        username: r.username,
+        pkg: pkgMap[r.currentaccttype] || '',
+        datereg: r.datereg,
+      })),
+      binaryChildren: pairRows.map(r => ({
+        name: `${r.firstname} ${r.lastname}`,
+        username: r.username,
+        pkg: pkgMap[r.currentaccttype] || '',
+        side: r.position === 1 ? 'Left' : 'Right',
+      })),
+      leadershipDownline: ldrsRows.map(r => ({
+        name: `${r.firstname} ${r.lastname}`,
+        username: r.username,
+        pkg: pkgMap[r.currentaccttype] || '',
+        lvl: r.lvl,
+      })),
+    });
+  } catch (err) {
+    console.error('[Admin Accounts] Income details error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/accounts/:uid/cd
+ * CD deduction history for a member (encashments with cddeduction > 0)
+ * Mirrors PHP adminpanel/accounts-cdpayment-details.php
+ */
+router.get('/:uid/cd', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const uid = Number(req.params.uid);
+
+    const [memberRows] = await pool.query(
+      `SELECT m.firstname, m.lastname, m.username,
+              u.cdamount, u.cdtotal, u.cdstatus, u.codeid
+       FROM memberstab m INNER JOIN usertab u ON u.uid = m.uid
+       WHERE m.uid = ? LIMIT 1`,
+      [uid]
+    );
+    if (memberRows.length === 0) return res.status(404).json({ error: 'Account not found' });
+    const member = memberRows[0];
+
+    const [rows] = await pool.query(
+      `SELECT pid, transdate, encashment1, tax_1, encashmentfee, cddeduction
+       FROM payouthistorytab
+       WHERE uid = ? AND transactiontype = 10 AND cddeduction > 0
+       ORDER BY pid DESC`,
+      [uid]
+    );
+
+    res.json({
+      member: {
+        uid,
+        username: member.username,
+        fullname: `${member.firstname} ${member.lastname}`,
+        codeid: member.codeid,
+        cdamount: Number(member.cdamount),
+        cdtotal: Number(member.cdtotal),
+        cdstatus: member.cdstatus,
+        cdRemaining: Math.max(0, Number(member.cdamount) - Number(member.cdtotal)),
+      },
+      records: rows.map(r => ({
+        pid: r.pid,
+        transdate: r.transdate,
+        encashment: Number(r.encashment1),
+        taxAndFee: Number(r.tax_1) + Number(r.encashmentfee),
+        cddeduction: Number(r.cddeduction),
+      })),
+    });
+  } catch (err) {
+    console.error('[Admin Accounts] CD payment details error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;
