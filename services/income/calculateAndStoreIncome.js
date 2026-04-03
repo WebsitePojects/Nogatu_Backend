@@ -13,7 +13,7 @@
  */
 const { pool } = require('../../config/database');
 const { getDREF } = require('./directReferral');
-const { getPairing } = require('./pairing');
+const { getPairing, savePairingReport } = require('./pairing');
 const { getLeadershipBonus } = require('./leadership');
 const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('./unilevel');
 const { getLPC, checkLpcTransDate } = require('./lpc');
@@ -37,11 +37,11 @@ async function calculateAndStoreIncome(uid, accttype) {
 
   // ── Continuous income (deduplication via Math.max) ───────────────
   const drefResult       = await getDREF(uid);
-  const pairingAmount    = await getPairing(uid, accttype);
+  const pairingResult    = await getPairing(uid, accttype);
   const leadershipAmount = await getLeadershipBonus(uid);
 
-  const newDref       = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
-  const newPairing    = Math.max(0, pairingAmount             - Number(stored.ttlincome2 || 0));
+  const newDref       = Math.max(0, drefResult.directreferral  - Number(stored.ttlincome1 || 0));
+  const newPairing    = Math.max(0, pairingResult.totalPay     - Number(stored.ttlincome2 || 0));
   const newLeadership = Math.max(0, leadershipAmount          - Number(stored.ttlincome3 || 0));
   const newHifive     = Math.max(0, drefResult.hifive         - Number(stored.ttlincome5 || 0));
 
@@ -75,6 +75,20 @@ async function calculateAndStoreIncome(uid, accttype) {
       lpc:              lpcAmount,
       beginningbalance: beginningBalance,
       endingbalance:    endingBalance,
+    });
+  }
+
+  // Save pairing breakdown to pairingstab whenever pairing income exists
+  if (pairingResult.totalPay > 0) {
+    await savePairingReport(uid, {
+      totalleft:       pairingResult.leftCount,
+      totalpointsleft: pairingResult.leftPts,
+      totalright:      pairingResult.rightCount,
+      totalpointsright: pairingResult.rightPts,
+      left:            pairingResult.leftPts,
+      right:           pairingResult.rightPts,
+      totalpoints:     pairingResult.pairedPts,
+      totalbpay:       pairingResult.totalPay,
     });
   }
 

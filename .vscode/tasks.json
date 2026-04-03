@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Inspect auth password formats",
+			"type": "shell",
+			"command": "node",
+			"args": [
+				"-e",
+				"const path=require('path'); require('dotenv').config({path:path.resolve('.env.development')}); const mysql=require('mysql2/promise'); (async()=>{const conn=await mysql.createConnection({host:process.env.DB_HOST,user:process.env.DB_USER,password:process.env.DB_PASSWORD,database:process.env.DB_NAME}); const [a]=await conn.query(\"SELECT username,password,CHAR_LENGTH(password) AS len FROM accesstab ORDER BY id\"); const [m]=await conn.query(\"SELECT username,password,CHAR_LENGTH(password) AS len FROM memberstab WHERE username IN ('00001','00002','00003')\"); console.log('DB',process.env.DB_NAME); console.log('ADMIN',a.map(r=>({u:r.username,len:r.len,prefix:String(r.password||'').slice(0,4)}))); console.log('MEMBER_SAMPLE',m.map(r=>({u:r.username,len:r.len,prefix:String(r.password||'').slice(0,4)}))); await conn.end();})().catch(e=>{console.error(e); process.exit(1);});"
+			]
+		},
+		{
+			"label": "inspect-auth-formats-2",
+			"type": "shell",
+			"command": "node -e \"console.log('hello2')\""
+		}
+	]
+}

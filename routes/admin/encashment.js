@@ -8,8 +8,8 @@ const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 
 /**
- * GET /api/admin/encashment?page=1&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
- * List encashment records with date filtering
+ * GET /api/admin/encashment?page=1&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&q=keyword
+ * List encashment records with date + member name/username filtering
  */
 router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
@@ -22,13 +22,32 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const twoMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 2, 1);
     const startDate = req.query.startDate || twoMonthsAgo.toISOString().slice(0, 10);
     const endDate = req.query.endDate || now.toISOString().slice(0, 10);
+    const q = (req.query.q || '').trim();
+    const searchLike = `%${q}%`;
+
+    let whereSql = `
+      WHERE m.uid = u.uid AND u.uid = p.uid AND p.transactiontype = 10
+      AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') >= ?
+      AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') <= ?
+    `;
+    const baseParams = [startDate, endDate];
+
+    if (q) {
+      whereSql += `
+        AND (
+          m.username LIKE ?
+          OR m.firstname LIKE ?
+          OR m.lastname LIKE ?
+          OR CONCAT(m.firstname, ' ', m.lastname) LIKE ?
+        )
+      `;
+      baseParams.push(searchLike, searchLike, searchLike, searchLike);
+    }
 
     const [countRows] = await pool.query(
       `SELECT COUNT(*) as total FROM payouthistorytab p, usertab u, memberstab m
-       WHERE m.uid = u.uid AND u.uid = p.uid AND p.transactiontype = 10
-       AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') >= ?
-       AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') <= ?`,
-      [startDate, endDate]
+       ${whereSql}`,
+      baseParams
     );
     const total = Number(countRows[0].total);
 
@@ -39,11 +58,9 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
               u.uid as uUid, u.mainid,
               m.payoutid, m.payoutdetails, m.username, m.firstname, m.lastname
        FROM payouthistorytab p, usertab u, memberstab m
-       WHERE m.uid = u.uid AND u.uid = p.uid AND p.transactiontype = 10
-       AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') >= ?
-       AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') <= ?
+            ${whereSql}
        ORDER BY p.cashtransdate DESC LIMIT ?, ?`,
-      [startDate, endDate, offset, perPage]
+                [...baseParams, offset, perPage]
     );
 
     const records = rows.map(r => ({

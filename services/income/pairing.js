@@ -116,7 +116,7 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype) {
  * Main pairing calculation
  * @param {number} uid - User ID
  * @param {number} accttype - Account type code (10-60)
- * @returns {number} Total pairing income
+ * @returns {{ totalPay, leftCount, leftPts, rightCount, rightPts, pairedPts }} Pairing result
  */
 async function getPairing(uid, accttype) {
   const leftPoints = [];
@@ -125,11 +125,23 @@ async function getPairing(uid, accttype) {
 
   await getNumLevels(uid, 1, leftPoints, rightPoints, allDates);
 
-  if (allDates.length === 0) return 0;
+  if (allDates.length === 0) {
+    return { totalPay: 0, leftCount: 0, leftPts: 0, rightCount: 0, rightPts: 0, pairedPts: 0 };
+  }
 
+  const leftPts  = leftPoints.reduce((s, p) => s + p.points, 0);
+  const rightPts = rightPoints.reduce((s, p) => s + p.points, 0);
+  const pairedPts = Math.min(leftPts, rightPts);
   const totalPay = totalPairingAmount(leftPoints, rightPoints, allDates, accttype);
 
-  return totalPay;
+  return {
+    totalPay,
+    leftCount:  leftPoints.length,
+    leftPts,
+    rightCount: rightPoints.length,
+    rightPts,
+    pairedPts,
+  };
 }
 
 /**
