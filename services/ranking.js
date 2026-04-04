@@ -20,6 +20,15 @@ const RANK_INCENTIVES = {
   3: 'International Asian Travel, ₱20,000, Silver Pin',
 };
 
+const PACKAGE_LABELS = {
+  10: 'Bronze',
+  20: 'Silver',
+  30: 'Gold',
+  40: 'Platinum',
+  50: 'Garnet',
+  60: 'Diamond',
+};
+
 async function ensureRankingTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS rankingstab (
@@ -41,6 +50,10 @@ async function ensureRankingTable() {
       KEY idx_rank_level (rank_level)
     ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
   );
+}
+
+function toNumber(value) {
+  return Number(value || 0);
 }
 
 function parseRankRow(row) {
@@ -70,6 +83,26 @@ async function getTotalPairingPoints(uid) {
     [uid]
   );
   return Number(rows[0]?.ttlpoints || 0);
+}
+
+async function getLatestPairingSnapshot(uid) {
+  const [rows] = await pool.query(
+    `SELECT totalbpay, totalleft, totalright, totalpointsleft, totalpointsright
+     FROM pairingstab
+     WHERE uid = ?
+     ORDER BY transdate DESC, id DESC
+     LIMIT 1`,
+    [uid]
+  );
+
+  const row = rows[0] || {};
+  return {
+    binaryPoints: toNumber(row.totalbpay),
+    leftCount: toNumber(row.totalleft),
+    rightCount: toNumber(row.totalright),
+    leftPoints: toNumber(row.totalpointsleft),
+    rightPoints: toNumber(row.totalpointsright),
+  };
 }
 
 /**
@@ -139,6 +172,113 @@ async function getCurrentRank(uid) {
   return parseRankRow(rows[0]).rank;
 }
 
+async function getCurrentRankMap(uidList) {
+  if (!uidList || uidList.length === 0) return new Map();
+
+  const uniqueIds = [...new Set(uidList.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  if (uniqueIds.length === 0) return new Map();
+
+  const placeholders = uniqueIds.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT uid, current_rank, rank_level
+     FROM rankingstab
+     WHERE uid IN (${placeholders})`,
+    uniqueIds
+  );
+
+  const rankMap = new Map();
+  for (const row of rows) {
+    rankMap.set(Number(row.uid), Math.max(toNumber(row.current_rank), toNumber(row.rank_level)));
+  }
+  return rankMap;
+}
+
+async function collectLegDownlineUids(uid) {
+  const [directRows] = await pool.query(
+    'SELECT uid, position FROM usertab WHERE refid = ?',
+    [uid]
+  );
+
+  const queue = [];
+  const visited = new Set();
+
+  for (const row of directRows) {
+    const childUid = Number(row.uid);
+    if (!childUid || visited.has(childUid)) continue;
+    const side = Number(row.position) === 1 ? 'left' : 'right';
+    queue.push({ uid: childUid, side });
+    visited.add(childUid);
+  }
+
+  const leftUids = [];
+  const rightUids = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current.side === 'left') leftUids.push(current.uid);
+    else rightUids.push(current.uid);
+
+    const [children] = await pool.query('SELECT uid FROM usertab WHERE refid = ?', [current.uid]);
+    for (const child of children) {
+      const childUid = Number(child.uid);
+      if (!childUid || visited.has(childUid)) continue;
+      queue.push({ uid: childUid, side: current.side });
+      visited.add(childUid);
+    }
+  }
+
+  return { leftUids, rightUids };
+}
+
+async function getLegQualification(uid, requiredRank) {
+  const { leftUids, rightUids } = await collectLegDownlineUids(uid);
+  const rankMap = await getCurrentRankMap([...leftUids, ...rightUids]);
+
+  let leftQualifiedCount = 0;
+  let rightQualifiedCount = 0;
+
+  for (const leftUid of leftUids) {
+    if (toNumber(rankMap.get(leftUid)) >= requiredRank) leftQualifiedCount += 1;
+  }
+  for (const rightUid of rightUids) {
+    if (toNumber(rankMap.get(rightUid)) >= requiredRank) rightQualifiedCount += 1;
+  }
+
+  return {
+    leftQualified: leftQualifiedCount > 0,
+    rightQualified: rightQualifiedCount > 0,
+    leftQualifiedCount,
+    rightQualifiedCount,
+  };
+}
+
+async function upsertRankState(uid, payload) {
+  await pool.query(
+    `INSERT INTO rankingstab (
+       uid, current_rank, rank_level, binary_points_total,
+       left_qualified_count, right_qualified_count,
+       rank_date, qualified_date, incentive_status, reward_status
+     )
+     VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), 0, 0)
+     ON DUPLICATE KEY UPDATE
+       current_rank = VALUES(current_rank),
+       rank_level = VALUES(rank_level),
+       binary_points_total = VALUES(binary_points_total),
+       left_qualified_count = VALUES(left_qualified_count),
+       right_qualified_count = VALUES(right_qualified_count),
+       rank_date = IF(VALUES(current_rank) > current_rank, NOW(), rank_date),
+       qualified_date = IF(VALUES(current_rank) > current_rank, NOW(), qualified_date)`,
+    [
+      uid,
+      payload.currentRank,
+      payload.currentRank,
+      payload.binaryPoints,
+      payload.leftQualifiedCount,
+      payload.rightQualifiedCount,
+    ]
+  );
+}
+
 async function getRankState(uid) {
   await ensureRankingTable();
 
@@ -158,78 +298,87 @@ async function getRankState(uid) {
 async function getRankProgress(uid) {
   await ensureRankingTable();
 
-  const totalPoints = await getTotalPairingPoints(uid);
+  const pairing = await getLatestPairingSnapshot(uid);
+  const totalPoints = pairing.binaryPoints;
   const currentState = await getRankState(uid);
   const currentRank = currentState.rank;
 
+  const legForS1 = await getLegQualification(uid, 1);
+  const legForS2 = await getLegQualification(uid, 2);
+
+  const isS1Qualified = totalPoints >= RANK_REQUIREMENTS[1].minPoints && legForS1.leftQualified && legForS1.rightQualified;
+  const isS2Qualified = totalPoints >= RANK_REQUIREMENTS[2].minPoints;
+  const isS3Qualified = totalPoints >= RANK_REQUIREMENTS[3].minPoints && legForS2.leftQualified && legForS2.rightQualified;
+
+  let newRank = 0;
+  if (isS1Qualified) newRank = 1;
+  if (isS1Qualified && isS2Qualified) newRank = 2;
+  if (isS1Qualified && isS2Qualified && isS3Qualified) newRank = 3;
+
+  const effectiveRank = Math.max(currentRank, newRank);
+  await upsertRankState(uid, {
+    currentRank: effectiveRank,
+    binaryPoints: totalPoints,
+    leftQualifiedCount: legForS1.leftQualifiedCount,
+    rightQualifiedCount: legForS1.rightQualifiedCount,
+  });
+
+  const finalState = await getRankState(uid);
+
   // Determine next rank target
-  let nextRank = currentRank + 1;
+  let nextRank = effectiveRank + 1;
   if (nextRank > 3) nextRank = 3;
 
   const nextReq = RANK_REQUIREMENTS[nextRank];
   const progress = nextReq ? Math.min(100, (totalPoints / nextReq.minPoints) * 100) : 100;
 
-  // Check leg qualifications for next rank
+  // Next-rank leg check (only rank1 and rank3 have structure requirements).
   let legStatus = { leftQualified: false, rightQualified: false };
   if (nextRank === 1) {
-    legStatus = await checkLegQualification(uid, 1);
+    legStatus = { leftQualified: legForS1.leftQualified, rightQualified: legForS1.rightQualified };
   } else if (nextRank === 3) {
-    legStatus = await checkLegQualification(uid, 2);
+    legStatus = { leftQualified: legForS2.leftQualified, rightQualified: legForS2.rightQualified };
   }
 
-  // Auto-promote if qualifications met
-  let newRank = currentRank;
-  for (let r = currentRank + 1; r <= 3; r++) {
-    const req = RANK_REQUIREMENTS[r];
-    if (totalPoints >= req.minPoints) {
-      let qualified = true;
-      if (r === 1) {
-        const leg = await checkLegQualification(uid, 1);
-        qualified = leg.leftQualified && leg.rightQualified;
-      } else if (r === 3) {
-        const leg = await checkLegQualification(uid, 2);
-        qualified = leg.leftQualified && leg.rightQualified;
-      }
-      if (qualified) newRank = r;
-      else break;
-    } else {
-      break;
-    }
-  }
-
-  // Update rank if promoted
-  if (newRank > currentRank) {
-    await pool.query(
-      `INSERT INTO rankingstab (
-         uid, current_rank, rank_level, rank_date, qualified_date,
-         incentive_status, reward_status, binary_points_total
-       )
-       VALUES (?, ?, ?, NOW(), NOW(), 0, 0, ?)
-       ON DUPLICATE KEY UPDATE
-         current_rank = VALUES(current_rank),
-         rank_level = VALUES(rank_level),
-         rank_date = NOW(),
-         qualified_date = NOW(),
-         binary_points_total = GREATEST(binary_points_total, VALUES(binary_points_total))`,
-      [uid, newRank, newRank, totalPoints]
-    );
-  }
-
-  const finalState = await getRankState(uid);
+  const ranks = [1, 2, 3].map((rankNo) => ({
+    rank: rankNo,
+    label: RANK_REQUIREMENTS[rankNo].label,
+    minPoints: RANK_REQUIREMENTS[rankNo].minPoints,
+    qualified:
+      rankNo === 1 ? isS1Qualified :
+      rankNo === 2 ? (isS1Qualified && isS2Qualified) :
+      (isS1Qualified && isS2Qualified && isS3Qualified),
+    qualifiedDate: finalState.rankDate,
+  }));
 
   return {
     uid,
-    currentRank: newRank,
-    currentRankLabel: RANK_REQUIREMENTS[newRank]?.label || 'None',
-    currentRankColor: RANK_REQUIREMENTS[newRank]?.color || '#6B7280',
+    currentRank: effectiveRank,
+    currentRankLabel: RANK_REQUIREMENTS[effectiveRank]?.label || 'Unranked',
+    currentRankColor: RANK_REQUIREMENTS[effectiveRank]?.color || '#6B7280',
+    binaryPoints: totalPoints,
     totalPoints,
-    nextRank: newRank < 3 ? newRank + 1 : null,
-    nextRankLabel: newRank < 3 ? RANK_REQUIREMENTS[newRank + 1].label : 'Max Rank Achieved',
-    nextRankMinPoints: newRank < 3 ? RANK_REQUIREMENTS[newRank + 1].minPoints : null,
+    left: {
+      count: pairing.leftCount,
+      points: pairing.leftPoints,
+      qualifiedS1: legForS1.leftQualified ? 1 : 0,
+      qualifiedS2: legForS2.leftQualified ? 1 : 0,
+    },
+    right: {
+      count: pairing.rightCount,
+      points: pairing.rightPoints,
+      qualifiedS1: legForS1.rightQualified ? 1 : 0,
+      qualifiedS2: legForS2.rightQualified ? 1 : 0,
+    },
+    ranks,
+    nextRank: effectiveRank < 3 ? effectiveRank + 1 : null,
+    nextRankLabel: effectiveRank < 3 ? RANK_REQUIREMENTS[effectiveRank + 1].label : 'Max Rank Achieved',
+    nextRankMinPoints: effectiveRank < 3 ? RANK_REQUIREMENTS[effectiveRank + 1].minPoints : null,
     progress: Math.round(progress * 100) / 100,
     legStatus,
-    incentives: RANK_INCENTIVES[newRank] || 'N/A',
+    incentives: RANK_INCENTIVES[effectiveRank] || 'N/A',
     incentiveStatus: finalState.incentiveStatus,
+    rewardStatus: finalState.rewardStatus,
   };
 }
 
@@ -239,41 +388,72 @@ async function getRankProgress(uid) {
 async function getAllRankings(page = 1, perPage = 30) {
   await ensureRankingTable();
 
-  const offset = (page - 1) * perPage;
+  const currentPage = Math.max(1, Number(page) || 1);
+  const size = Math.min(100, Math.max(1, Number(perPage) || 30));
+  const offset = (currentPage - 1) * size;
 
   const [countRows] = await pool.query(
     `SELECT COUNT(*) as total
-     FROM rankingstab
-     WHERE current_rank > 0 OR rank_level > 0`
+     FROM usertab u
+     WHERE u.codeid = 1 AND u.uid = u.mainid`
   );
-  const total = Number(countRows[0].total);
+  const total = Number(countRows[0]?.total || 0);
 
   const [rows] = await pool.query(
-    `SELECT r.uid, r.current_rank, r.rank_level, r.rank_date, r.qualified_date,
-            r.incentive_status, r.reward_status,
-            m.firstname, m.lastname, m.username
-     FROM rankingstab r
-     LEFT JOIN memberstab m ON r.uid = m.uid
-     WHERE r.current_rank > 0 OR r.rank_level > 0
-     ORDER BY GREATEST(r.current_rank, r.rank_level) DESC, r.rank_date ASC
+    `SELECT u.uid, u.currentaccttype,
+            m.firstname, m.lastname, m.username,
+            COALESCE(r.current_rank, 0) AS current_rank,
+            COALESCE(r.rank_level, 0) AS rank_level,
+            r.rank_date, r.qualified_date,
+            COALESCE(r.incentive_status, 0) AS incentive_status,
+            COALESCE(r.reward_status, 0) AS reward_status,
+            COALESCE((
+              SELECT p.totalbpay
+              FROM pairingstab p
+              WHERE p.uid = u.uid
+              ORDER BY p.transdate DESC, p.id DESC
+              LIMIT 1
+            ), 0) AS binaryPoints
+     FROM usertab u
+     INNER JOIN memberstab m ON m.uid = u.uid
+     LEFT JOIN rankingstab r ON r.uid = u.uid
+     WHERE u.codeid = 1 AND u.uid = u.mainid
+     ORDER BY binaryPoints DESC, u.uid ASC
      LIMIT ?, ?`,
-    [offset, perPage]
+    [offset, size]
   );
 
-  const rankings = rows.map((r) => {
-    const rank = Math.max(Number(r.current_rank || 0), Number(r.rank_level || 0));
+  const rankings = rows.map((r, idx) => {
+    const rank = Math.max(toNumber(r.current_rank), toNumber(r.rank_level));
     return {
-      ...r,
+      uid: toNumber(r.uid),
+      firstname: r.firstname,
+      lastname: r.lastname,
+      username: r.username,
+      packageType: toNumber(r.currentaccttype),
+      packageLabel: PACKAGE_LABELS[toNumber(r.currentaccttype)] || 'Unknown',
+      binaryPoints: toNumber(r.binaryPoints),
       current_rank: rank,
-      rank_date: r.rank_date || r.qualified_date,
-      incentive_status: Number(r.incentive_status || r.reward_status || 0),
-      rankLabel: RANK_REQUIREMENTS[rank]?.label || 'Unknown',
+      supervisorLevel: rank,
+      rankLabel: RANK_REQUIREMENTS[rank]?.label || 'Unranked',
       rankColor: RANK_REQUIREMENTS[rank]?.color || '#6B7280',
       incentives: RANK_INCENTIVES[rank] || 'N/A',
+      rank_date: r.rank_date || r.qualified_date,
+      qualifiedDate: r.qualified_date || r.rank_date,
+      incentive_status: toNumber(r.incentive_status),
+      reward_status: toNumber(r.reward_status),
+      rewardStatus: toNumber(r.reward_status),
+      position: offset + idx + 1,
     };
   });
 
-  return { rankings, total, page, totalPages: Math.ceil(total / perPage) };
+  return {
+    rankings,
+    total,
+    page: currentPage,
+    totalPages: Math.max(1, Math.ceil(total / size)),
+    perPage: size,
+  };
 }
 
 /**
@@ -299,6 +479,8 @@ module.exports = {
   getAllRankings,
   processIncentive,
   getCurrentRank,
+  getLatestPairingSnapshot,
   RANK_REQUIREMENTS,
   RANK_INCENTIVES,
+  PACKAGE_LABELS,
 };

@@ -31,87 +31,103 @@ const ENABLE_LPC_PAYOUT = false;
  * @returns {Object}           - Updated payouttotaltab row after calculation
  */
 async function calculateAndStoreIncome(uid, accttype) {
-  // Read current stored totals
-  const [totals] = await pool.query(
-    'SELECT * FROM payouttotaltab WHERE uid = ?',
-    [uid]
-  );
-  const stored = totals[0] || {};
-  const beginningBalance = Number(stored.ttlcashbalance || 0);
+  const lockConn = await pool.getConnection();
+  const lockKey = `nogatu_income_calc_${Number(uid)}`;
 
-  // Pairing income eligibility mirrors production ewallet.php rules.
-  const [memberRows] = await pool.query(
-    'SELECT codeid, cdstatus FROM usertab WHERE uid = ? LIMIT 1',
-    [uid]
-  );
-  const member = memberRows[0] || {};
-  const canEarnPairing =
-    Number(member.codeid) === 1 ||
-    (Number(member.codeid) === 3 && Number(member.cdstatus) === 2);
-
-  // ── Continuous income (deduplication via Math.max) ───────────────
-  const drefResult       = await getDREF(uid);
-  const pairingResult    = await getPairing(uid, accttype);
-  const leadershipAmount = await getLeadershipBonus(uid);
-
-  const newDref       = Math.max(0, drefResult.directreferral  - Number(stored.ttlincome1 || 0));
-  const newPairing    = canEarnPairing
-    ? Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0))
-    : 0;
-  const newLeadership = Math.max(0, leadershipAmount          - Number(stored.ttlincome3 || 0));
-  const newHifive     = Math.max(0, drefResult.hifive         - Number(stored.ttlincome5 || 0));
-
-  // ── Monthly income — unilevel (incometype=4) ─────────────────────
-  const hasMaintenance     = await checkLastMaintenance(uid);
-  const alreadyCalcUnilevel = await checkUnilevelTransDate(uid);
-  let unilevelAmount = 0;
-  if (hasMaintenance && !alreadyCalcUnilevel) {
-    unilevelAmount = await getUnilevel(uid);
-  }
-
-  // ── Monthly income — LPC (incometype=6) ──────────────────────────
-  let lpcAmount = 0;
-  if (ENABLE_LPC_PAYOUT) {
-    const alreadyCalcLpc = await checkLpcTransDate(uid);
-    if (!alreadyCalcLpc) {
-      lpcAmount = await getLPC(uid);
+  try {
+    const [lockRows] = await lockConn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
+    if (Number(lockRows[0]?.lockState || 0) !== 1) {
+      throw new Error('Unable to acquire income processing lock');
     }
+
+    // Read current stored totals after lock acquisition.
+    const [totals] = await pool.query(
+      'SELECT * FROM payouttotaltab WHERE uid = ?',
+      [uid]
+    );
+    const stored = totals[0] || {};
+    const beginningBalance = Number(stored.ttlcashbalance || 0);
+
+    // Pairing income eligibility mirrors production ewallet.php rules.
+    const [memberRows] = await pool.query(
+      'SELECT codeid, cdstatus FROM usertab WHERE uid = ? LIMIT 1',
+      [uid]
+    );
+    const member = memberRows[0] || {};
+    const canEarnPairing =
+      Number(member.codeid) === 1 ||
+      (Number(member.codeid) === 3 && Number(member.cdstatus) === 2);
+
+    // ── Continuous income (deduplication via Math.max) ───────────────
+    const drefResult = await getDREF(uid);
+    const pairingResult = await getPairing(uid, accttype);
+    const leadershipAmount = await getLeadershipBonus(uid);
+
+    const newDref = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
+    const newPairing = canEarnPairing
+      ? Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0))
+      : 0;
+    const newLeadership = Math.max(0, leadershipAmount - Number(stored.ttlincome3 || 0));
+    const newHifive = Math.max(0, drefResult.hifive - Number(stored.ttlincome5 || 0));
+
+    // ── Monthly income — unilevel (incometype=4) ─────────────────────
+    let activeUnilevel = 0;
+    if (ENABLE_UNILEVEL_PAYOUT) {
+      const hasMaintenance = await checkLastMaintenance(uid);
+      const alreadyCalcUnilevel = await checkUnilevelTransDate(uid);
+      if (hasMaintenance && !alreadyCalcUnilevel) {
+        activeUnilevel = await getUnilevel(uid);
+      }
+    }
+
+    // ── Monthly income — LPC (incometype=6) ──────────────────────────
+    let activeLpc = 0;
+    if (ENABLE_LPC_PAYOUT) {
+      const alreadyCalcLpc = await checkLpcTransDate(uid);
+      if (!alreadyCalcLpc) {
+        activeLpc = await getLPC(uid);
+      }
+    }
+
+    // ── Persist if there is new income ───────────────────────────────
+    const totalNewIncome = newDref + newPairing + newLeadership +
+      activeUnilevel + newHifive + activeLpc;
+    const endingBalance = beginningBalance + totalNewIncome;
+
+    if (totalNewIncome >= 1) {
+      await insertIncome(uid, {
+        dref: newDref,
+        paircash: newPairing,
+        leadership: newLeadership,
+        unilevel: activeUnilevel,
+        hifive: newHifive,
+        ppctemp: 0,
+        lpc: activeLpc,
+        pairproduct: 0,
+        beginningbalance: beginningBalance,
+        endingbalance: endingBalance,
+      });
+    }
+
+    // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
+    if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
+      await savePairingReport(uid, pairingResult.dailyReports);
+    }
+
+    // ── Return fresh totals after update ─────────────────────────────
+    const [updated] = await pool.query(
+      'SELECT * FROM payouttotaltab WHERE uid = ?',
+      [uid]
+    );
+    return updated[0] || {};
+  } finally {
+    try {
+      await lockConn.query('SELECT RELEASE_LOCK(?)', [lockKey]);
+    } catch (releaseErr) {
+      // Ignore release failures to avoid masking upstream errors.
+    }
+    lockConn.release();
   }
-
-  const activeUnilevel = ENABLE_UNILEVEL_PAYOUT ? unilevelAmount : 0;
-  const activeLpc = ENABLE_LPC_PAYOUT ? lpcAmount : 0;
-
-  // ── Persist if there is new income ───────────────────────────────
-  const totalNewIncome = newDref + newPairing + newLeadership +
-                         activeUnilevel + newHifive + activeLpc;
-  const endingBalance  = beginningBalance + totalNewIncome;
-
-  if (totalNewIncome >= 1) {
-    await insertIncome(uid, {
-      dref:             newDref,
-      paircash:         newPairing,
-      leadership:       newLeadership,
-      unilevel:         activeUnilevel,
-      hifive:           newHifive,
-      ppctemp:          0,
-      lpc:              activeLpc,
-      pairproduct:      0,
-      beginningbalance: beginningBalance,
-      endingbalance:    endingBalance,
-    });
-  }
-
-  // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
-  if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
-    await savePairingReport(uid, pairingResult.dailyReports);
-  }
-
-  // ── Return fresh totals after update ─────────────────────────────
-  const [updated] = await pool.query(
-    'SELECT * FROM payouttotaltab WHERE uid = ?',
-    [uid]
-  );
-  return updated[0] || {};
 }
 
 module.exports = { calculateAndStoreIncome };
