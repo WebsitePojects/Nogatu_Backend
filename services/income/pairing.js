@@ -22,44 +22,45 @@ const PAIRING_CAPS = {
 };
 
 /**
- * Recursively traverse binary tree to collect binary points by leg
+ * Recursively traverse binary tree to collect binary points by leg.
+ * Only PD accounts (codeid=1) of the same tier as the member (memberAccttype) are counted.
  */
-async function getNumLevels(parent, level, leftPoints, rightPoints, allDates) {
+async function getNumLevels(parent, level, leftPoints, rightPoints, allDates, memberAccttype) {
   const [rows] = await pool.query(
-    'SELECT uid, refid, position, binarypoints, DATE_FORMAT(datereg, "%Y-%m-%d %H:%i:%s") as datereg FROM usertab WHERE refid = ?',
+    'SELECT uid, refid, position, codeid, currentaccttype, binarypoints, DATE_FORMAT(datereg, "%Y-%m-%d %H:%i:%s") as datereg FROM usertab WHERE refid = ?',
     [parent]
   );
 
   for (const row of rows) {
     const bp = Number(row.binarypoints || 0);
     const dateKey = row.datereg;
+    const isSameTierPD = Number(row.codeid) === 1 && Number(row.currentaccttype) === Number(memberAccttype);
 
     if (level === 1) {
       // Level 1: direct children determine left/right assignment
       if (Number(row.position) === 1) {
-        // Left leg (position A)
-        leftPoints.push({ uid: row.uid, points: bp, date: dateKey });
-        // Recurse into left subtree
-        await getNumLevels(row.uid, 2, leftPoints, rightPoints, allDates);
+        // Left leg (position A) — only count same-tier PD accounts
+        if (isSameTierPD) leftPoints.push({ uid: row.uid, points: bp, date: dateKey });
+        await getNumLevels(row.uid, 2, leftPoints, rightPoints, allDates, memberAccttype);
       } else {
-        // Right leg (position B)
-        rightPoints.push({ uid: row.uid, points: bp, date: dateKey });
-        // Recurse into right subtree
-        await getNumLevels(row.uid, 2, leftPoints, rightPoints, allDates);
+        // Right leg (position B) — only count same-tier PD accounts
+        if (isSameTierPD) rightPoints.push({ uid: row.uid, points: bp, date: dateKey });
+        await getNumLevels(row.uid, 2, leftPoints, rightPoints, allDates, memberAccttype);
       }
     } else {
-      // Level 2+: inherit the leg from parent
-      // Determine which leg this uid belongs to
+      // Level 2+: inherit the leg from parent — only count same-tier PD accounts
       const isLeft = leftPoints.some(p => p.uid === parent);
-      if (isLeft) {
-        leftPoints.push({ uid: row.uid, points: bp, date: dateKey });
-      } else {
-        rightPoints.push({ uid: row.uid, points: bp, date: dateKey });
+      if (isSameTierPD) {
+        if (isLeft) {
+          leftPoints.push({ uid: row.uid, points: bp, date: dateKey });
+        } else {
+          rightPoints.push({ uid: row.uid, points: bp, date: dateKey });
+        }
       }
-      await getNumLevels(row.uid, level + 1, leftPoints, rightPoints, allDates);
+      await getNumLevels(row.uid, level + 1, leftPoints, rightPoints, allDates, memberAccttype);
     }
 
-    if (dateKey && !allDates.includes(dateKey)) {
+    if (isSameTierPD && dateKey && !allDates.includes(dateKey)) {
       allDates.push(dateKey);
     }
   }
@@ -123,7 +124,7 @@ async function getPairing(uid, accttype) {
   const rightPoints = [];
   const allDates = [];
 
-  await getNumLevels(uid, 1, leftPoints, rightPoints, allDates);
+  await getNumLevels(uid, 1, leftPoints, rightPoints, allDates, accttype);
 
   if (allDates.length === 0) return 0;
 

@@ -37,11 +37,14 @@ async function calculateAndStoreIncome(uid, accttype) {
 
   // ── Continuous income (deduplication via Math.max) ───────────────
   const drefResult       = await getDREF(uid);
-  const pairingAmount    = await getPairing(uid, accttype);
   const leadershipAmount = await getLeadershipBonus(uid);
 
+  // Pairing is ONE-TIME ONLY: skip calculation entirely if already credited
+  const alreadyPaidPairing = Number(stored.ttlincome2 || 0) > 0;
+  const pairingAmount = alreadyPaidPairing ? 0 : await getPairing(uid, accttype);
+
   const newDref       = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
-  const newPairing    = Math.max(0, pairingAmount             - Number(stored.ttlincome2 || 0));
+  const newPairing    = alreadyPaidPairing ? 0 : Math.max(0, pairingAmount - Number(stored.ttlincome2 || 0));
   const newLeadership = Math.max(0, leadershipAmount          - Number(stored.ttlincome3 || 0));
   const newHifive     = Math.max(0, drefResult.hifive         - Number(stored.ttlincome5 || 0));
 
