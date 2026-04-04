@@ -8,7 +8,6 @@
  * - Redeemable via insert_Redeem()
  */
 const { pool } = require('../../config/database');
-const { currentMonthRange } = require('../../utils/helpers');
 
 // Product key to column mapping
 const PRODUCT_COLS = {
@@ -64,21 +63,17 @@ async function checkH5Bonus(uid) {
 }
 
 /**
- * Get direct referral purchase counts for current month
+ * Get direct referral purchase counts (all-time)
  * Mirrors PHP get_drefpurchase()
  */
 async function getDrefPurchase(uid) {
-  const { start, end } = currentMonthRange();
-
   const [rows] = await pool.query(
     `SELECT producttype, COUNT(*) as cnt
      FROM repurchasetab
      WHERE uid = ?
-       AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
-       AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
        AND producttype >= 100
      GROUP BY producttype`,
-    [uid, start, end]
+    [uid]
   );
 
   const purchases = {};

@@ -20,6 +20,47 @@ const RANK_INCENTIVES = {
   3: 'International Asian Travel, ₱20,000, Silver Pin',
 };
 
+async function ensureRankingTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS rankingstab (
+      id INT NOT NULL AUTO_INCREMENT,
+      uid INT NOT NULL,
+      current_rank INT NOT NULL DEFAULT 0,
+      rank_level INT NOT NULL DEFAULT 0,
+      binary_points_total FLOAT NOT NULL DEFAULT 0,
+      left_qualified_count INT NOT NULL DEFAULT 0,
+      right_qualified_count INT NOT NULL DEFAULT 0,
+      rank_date DATETIME DEFAULT NULL,
+      qualified_date DATETIME DEFAULT NULL,
+      incentive_status INT NOT NULL DEFAULT 0,
+      reward_status INT NOT NULL DEFAULT 0,
+      reward_claimed_date DATETIME DEFAULT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_uid (uid),
+      KEY idx_current_rank (current_rank),
+      KEY idx_rank_level (rank_level)
+    ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
+  );
+}
+
+function parseRankRow(row) {
+  if (!row) {
+    return {
+      rank: 0,
+      incentiveStatus: 0,
+      rewardStatus: 0,
+      rankDate: null,
+    };
+  }
+
+  return {
+    rank: Math.max(Number(row.current_rank || 0), Number(row.rank_level || 0)),
+    incentiveStatus: Number(row.incentive_status || 0),
+    rewardStatus: Number(row.reward_status || 0),
+    rankDate: row.rank_date || row.qualified_date || null,
+  };
+}
+
 /**
  * Get total accumulated pairing points for a user
  */
@@ -89,18 +130,37 @@ async function hasQualifiedDownline(parentUid, requiredRank) {
  */
 async function getCurrentRank(uid) {
   const [rows] = await pool.query(
-    'SELECT current_rank FROM rankingstab WHERE uid = ?',
+    `SELECT current_rank, rank_level, incentive_status, reward_status,
+            rank_date, qualified_date
+     FROM rankingstab WHERE uid = ?`,
     [uid]
   );
-  return rows.length > 0 ? Number(rows[0].current_rank) : 0;
+
+  return parseRankRow(rows[0]).rank;
+}
+
+async function getRankState(uid) {
+  await ensureRankingTable();
+
+  const [rows] = await pool.query(
+    `SELECT current_rank, rank_level, incentive_status, reward_status,
+            rank_date, qualified_date
+     FROM rankingstab WHERE uid = ?`,
+    [uid]
+  );
+
+  return parseRankRow(rows[0]);
 }
 
 /**
  * Calculate rank progress for a member
  */
 async function getRankProgress(uid) {
+  await ensureRankingTable();
+
   const totalPoints = await getTotalPairingPoints(uid);
-  const currentRank = await getCurrentRank(uid);
+  const currentState = await getRankState(uid);
+  const currentRank = currentState.rank;
 
   // Determine next rank target
   let nextRank = currentRank + 1;
@@ -140,12 +200,22 @@ async function getRankProgress(uid) {
   // Update rank if promoted
   if (newRank > currentRank) {
     await pool.query(
-      `INSERT INTO rankingstab (uid, current_rank, rank_date, incentive_status)
-       VALUES (?, ?, NOW(), 0)
-       ON DUPLICATE KEY UPDATE current_rank = ?, rank_date = NOW()`,
-      [uid, newRank, newRank]
+      `INSERT INTO rankingstab (
+         uid, current_rank, rank_level, rank_date, qualified_date,
+         incentive_status, reward_status, binary_points_total
+       )
+       VALUES (?, ?, ?, NOW(), NOW(), 0, 0, ?)
+       ON DUPLICATE KEY UPDATE
+         current_rank = VALUES(current_rank),
+         rank_level = VALUES(rank_level),
+         rank_date = NOW(),
+         qualified_date = NOW(),
+         binary_points_total = GREATEST(binary_points_total, VALUES(binary_points_total))`,
+      [uid, newRank, newRank, totalPoints]
     );
   }
+
+  const finalState = await getRankState(uid);
 
   return {
     uid,
@@ -159,7 +229,7 @@ async function getRankProgress(uid) {
     progress: Math.round(progress * 100) / 100,
     legStatus,
     incentives: RANK_INCENTIVES[newRank] || 'N/A',
-    incentiveStatus: 0, // Will be read from DB
+    incentiveStatus: finalState.incentiveStatus,
   };
 }
 
@@ -167,30 +237,41 @@ async function getRankProgress(uid) {
  * Get all rankings for admin view
  */
 async function getAllRankings(page = 1, perPage = 30) {
+  await ensureRankingTable();
+
   const offset = (page - 1) * perPage;
 
   const [countRows] = await pool.query(
-    'SELECT COUNT(*) as total FROM rankingstab WHERE current_rank > 0'
+    `SELECT COUNT(*) as total
+     FROM rankingstab
+     WHERE current_rank > 0 OR rank_level > 0`
   );
   const total = Number(countRows[0].total);
 
   const [rows] = await pool.query(
-    `SELECT r.uid, r.current_rank, r.rank_date, r.incentive_status,
+    `SELECT r.uid, r.current_rank, r.rank_level, r.rank_date, r.qualified_date,
+            r.incentive_status, r.reward_status,
             m.firstname, m.lastname, m.username
      FROM rankingstab r
      LEFT JOIN memberstab m ON r.uid = m.uid
-     WHERE r.current_rank > 0
-     ORDER BY r.current_rank DESC, r.rank_date ASC
+     WHERE r.current_rank > 0 OR r.rank_level > 0
+     ORDER BY GREATEST(r.current_rank, r.rank_level) DESC, r.rank_date ASC
      LIMIT ?, ?`,
     [offset, perPage]
   );
 
-  const rankings = rows.map(r => ({
-    ...r,
-    rankLabel: RANK_REQUIREMENTS[r.current_rank]?.label || 'Unknown',
-    rankColor: RANK_REQUIREMENTS[r.current_rank]?.color || '#6B7280',
-    incentives: RANK_INCENTIVES[r.current_rank] || 'N/A',
-  }));
+  const rankings = rows.map((r) => {
+    const rank = Math.max(Number(r.current_rank || 0), Number(r.rank_level || 0));
+    return {
+      ...r,
+      current_rank: rank,
+      rank_date: r.rank_date || r.qualified_date,
+      incentive_status: Number(r.incentive_status || r.reward_status || 0),
+      rankLabel: RANK_REQUIREMENTS[rank]?.label || 'Unknown',
+      rankColor: RANK_REQUIREMENTS[rank]?.color || '#6B7280',
+      incentives: RANK_INCENTIVES[rank] || 'N/A',
+    };
+  });
 
   return { rankings, total, page, totalPages: Math.ceil(total / perPage) };
 }
@@ -199,14 +280,21 @@ async function getAllRankings(page = 1, perPage = 30) {
  * Process incentive claim (admin)
  */
 async function processIncentive(uid) {
+  await ensureRankingTable();
+
   const [result] = await pool.query(
-    'UPDATE rankingstab SET incentive_status = 1 WHERE uid = ? AND incentive_status = 0',
+    `UPDATE rankingstab
+        SET incentive_status = 1,
+            reward_status = 1,
+            reward_claimed_date = NOW()
+      WHERE uid = ? AND (incentive_status = 0 OR reward_status = 0)`,
     [uid]
   );
   return result.affectedRows > 0;
 }
 
 module.exports = {
+  ensureRankingTable,
   getRankProgress,
   getAllRankings,
   processIncentive,

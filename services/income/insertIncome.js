@@ -22,7 +22,9 @@ async function insertIncome(uid, income) {
     leadership = 0,
     unilevel = 0,
     hifive = 0,
+    ppctemp = 0,
     lpc = 0,
+    pairproduct = 0,
     beginningbalance = 0,
     endingbalance = 0,
   } = income;
@@ -49,19 +51,21 @@ async function insertIncome(uid, income) {
   // Upsert into payouttotaltab (cumulative totals)
   await pool.query(
     `INSERT INTO payouttotaltab
-     (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome6,
+     (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
       ttlcashbalance, ttlpointsbalance, transdate)
-     VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+     VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE
       ttlincome1 = ttlincome1 + VALUES(ttlincome1),
       ttlincome2 = ttlincome2 + VALUES(ttlincome2),
       ttlincome3 = ttlincome3 + VALUES(ttlincome3),
       ttlincome4 = ttlincome4 + VALUES(ttlincome4),
       ttlincome5 = ttlincome5 + VALUES(ttlincome5),
+      ttlincome51 = VALUES(ttlincome51),
       ttlincome6 = ttlincome6 + VALUES(ttlincome6),
-      ttlcashbalance = ttlcashbalance + VALUES(ttlcashbalance),
+      ttlcashbalance = VALUES(ttlcashbalance),
+      ttlpointsbalance = ttlpointsbalance + VALUES(ttlpointsbalance),
       transdate = VALUES(transdate)`,
-    [uid, dref, paircash, leadership, unilevel, hifive, lpc, endingbalance - beginningbalance, now]
+    [uid, dref, paircash, leadership, unilevel, hifive, ppctemp, lpc, endingbalance, pairproduct, now]
   );
 
   return true;
@@ -83,7 +87,7 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
 
   const currentBalance = Number(balanceRows[0]?.ttlcashbalance || 0);
 
-  if (encashmentAmount > currentBalance || encashmentAmount < 500) {
+  if (encashmentAmount > currentBalance || encashmentAmount <= 0) {
     throw new Error('Invalid encashment amount');
   }
 
@@ -91,9 +95,12 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
   const tax = encashmentAmount * 0.10; // 10% tax
   const fee = 50; // Fixed processing fee
 
-  // CD deduction (25% if codeid == 3 and cdstatus == 1, capped against remaining CD debt)
+  // CD deduction (25% if codeid == 3 and CD debt is still active).
   let cdDeduction = 0;
-  if (Number(userInfo.codeid) === 3 && Number(userInfo.cdstatus) === 1) {
+  if (
+    Number(userInfo.codeid) === 3 &&
+    (Number(userInfo.cdstatus) === 1 || Number(userInfo.cdamount || 0) > Number(userInfo.cdtotal || 0))
+  ) {
     const cdAmount = Number(userInfo.cdamount || 0);
     const cdTotal = Number(userInfo.cdtotal || 0);
     const cdRemaining = cdAmount - cdTotal; // Remaining CD debt
@@ -103,6 +110,10 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
   const grossDeduction = tax + fee + cdDeduction;
   const netEncashment = encashmentAmount - grossDeduction;
   const newBalance = currentBalance - encashmentAmount;
+
+  if (netEncashment <= 0) {
+    throw new Error('Invalid encashment amount');
+  }
 
   const now = nowMySQL();
 
@@ -137,7 +148,7 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
       ?, ?, 0, 0, ?, ?,
       0, ?, ?, 10, 0, NULL)`,
     [uid, currentBalance, newBalance,
-     encashmentAmount, tax, fee, cdDeduction,
+     netEncashment, tax, fee, cdDeduction,
      now, now]
   );
 

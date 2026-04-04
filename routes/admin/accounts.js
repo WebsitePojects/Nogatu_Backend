@@ -151,8 +151,12 @@ router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res)
   try {
     const { adminAccount, password, oldPassword } = req.body;
 
-    if (!adminAccount || !password) {
-      return res.status(400).json({ error: 'Admin account and new password are required' });
+    if (!adminAccount || !password || !oldPassword) {
+      return res.status(400).json({ error: 'Admin account, current password, and new password are required' });
+    }
+
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
     }
 
     // Verify old password first
@@ -165,18 +169,16 @@ router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res)
       return res.status(404).json({ error: 'Admin account not found' });
     }
 
-    if (oldPassword) {
-      const storedPw = adminRows[0].password;
-      const isHashed = storedPw && storedPw.startsWith('$2');
-      let oldMatch = false;
-      if (isHashed) {
-        oldMatch = await bcrypt.compare(oldPassword, storedPw);
-      } else {
-        oldMatch = (oldPassword === storedPw);
-      }
-      if (!oldMatch) {
-        return res.status(401).json({ error: 'Current password is incorrect' });
-      }
+    const storedPw = adminRows[0].password;
+    const isHashed = storedPw && storedPw.startsWith('$2');
+    let oldMatch = false;
+    if (isHashed) {
+      oldMatch = await bcrypt.compare(oldPassword, storedPw);
+    } else {
+      oldMatch = (oldPassword === storedPw);
+    }
+    if (!oldMatch) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 12);

@@ -42,15 +42,15 @@ router.get('/', memberAuth, async (req, res) => {
 
 /**
  * POST /api/wallet/encash
- * Process encashment (minimum 500)
+ * Process encashment
  */
 router.post('/encash', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
     const amount = Number(req.body.amount);
 
-    if (!amount || isNaN(amount) || amount < 500) {
-      return res.status(400).json({ error: 'Minimum encashment is ₱500' });
+    if (!amount || isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
 
     // Get user info for CD deduction check

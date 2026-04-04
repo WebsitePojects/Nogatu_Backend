@@ -19,6 +19,10 @@ const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('.
 const { getLPC, checkLpcTransDate } = require('./lpc');
 const { insertIncome } = require('./insertIncome');
 
+// Match current production behavior: Unilevel and LPC are feature-flagged off.
+const ENABLE_UNILEVEL_PAYOUT = false;
+const ENABLE_LPC_PAYOUT = false;
+
 /**
  * Run income calculation for a member and persist any new income.
  *
@@ -35,17 +39,25 @@ async function calculateAndStoreIncome(uid, accttype) {
   const stored = totals[0] || {};
   const beginningBalance = Number(stored.ttlcashbalance || 0);
 
+  // Pairing income eligibility mirrors production ewallet.php rules.
+  const [memberRows] = await pool.query(
+    'SELECT codeid, cdstatus FROM usertab WHERE uid = ? LIMIT 1',
+    [uid]
+  );
+  const member = memberRows[0] || {};
+  const canEarnPairing =
+    Number(member.codeid) === 1 ||
+    (Number(member.codeid) === 3 && Number(member.cdstatus) === 2);
+
   // ── Continuous income (deduplication via Math.max) ───────────────
   const drefResult       = await getDREF(uid);
   const pairingResult    = await getPairing(uid, accttype);
   const leadershipAmount = await getLeadershipBonus(uid);
 
-  // Pairing is ONE-TIME ONLY: skip calculation entirely if already credited
-  const alreadyPaidPairing = Number(stored.ttlincome2 || 0) > 0;
-  const pairingAmount = alreadyPaidPairing ? 0 : await getPairing(uid, accttype);
-
   const newDref       = Math.max(0, drefResult.directreferral  - Number(stored.ttlincome1 || 0));
-  const newPairing    = Math.max(0, pairingResult.totalPay     - Number(stored.ttlincome2 || 0));
+  const newPairing    = canEarnPairing
+    ? Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0))
+    : 0;
   const newLeadership = Math.max(0, leadershipAmount          - Number(stored.ttlincome3 || 0));
   const newHifive     = Math.max(0, drefResult.hifive         - Number(stored.ttlincome5 || 0));
 
@@ -58,15 +70,20 @@ async function calculateAndStoreIncome(uid, accttype) {
   }
 
   // ── Monthly income — LPC (incometype=6) ──────────────────────────
-  const alreadyCalcLpc = await checkLpcTransDate(uid);
   let lpcAmount = 0;
-  if (!alreadyCalcLpc) {
-    lpcAmount = await getLPC(uid);
+  if (ENABLE_LPC_PAYOUT) {
+    const alreadyCalcLpc = await checkLpcTransDate(uid);
+    if (!alreadyCalcLpc) {
+      lpcAmount = await getLPC(uid);
+    }
   }
+
+  const activeUnilevel = ENABLE_UNILEVEL_PAYOUT ? unilevelAmount : 0;
+  const activeLpc = ENABLE_LPC_PAYOUT ? lpcAmount : 0;
 
   // ── Persist if there is new income ───────────────────────────────
   const totalNewIncome = newDref + newPairing + newLeadership +
-                         unilevelAmount + newHifive + lpcAmount;
+                         activeUnilevel + newHifive + activeLpc;
   const endingBalance  = beginningBalance + totalNewIncome;
 
   if (totalNewIncome >= 1) {
@@ -74,26 +91,19 @@ async function calculateAndStoreIncome(uid, accttype) {
       dref:             newDref,
       paircash:         newPairing,
       leadership:       newLeadership,
-      unilevel:         unilevelAmount,
+      unilevel:         activeUnilevel,
       hifive:           newHifive,
-      lpc:              lpcAmount,
+      ppctemp:          0,
+      lpc:              activeLpc,
+      pairproduct:      0,
       beginningbalance: beginningBalance,
       endingbalance:    endingBalance,
     });
   }
 
-  // Save pairing breakdown to pairingstab whenever pairing income exists
-  if (pairingResult.totalPay > 0) {
-    await savePairingReport(uid, {
-      totalleft:       pairingResult.leftCount,
-      totalpointsleft: pairingResult.leftPts,
-      totalright:      pairingResult.rightCount,
-      totalpointsright: pairingResult.rightPts,
-      left:            pairingResult.leftPts,
-      right:           pairingResult.rightPts,
-      totalpoints:     pairingResult.pairedPts,
-      totalbpay:       pairingResult.totalPay,
-    });
+  // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
+  if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
+    await savePairingReport(uid, pairingResult.dailyReports);
   }
 
   // ── Return fresh totals after update ─────────────────────────────

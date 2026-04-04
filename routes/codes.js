@@ -119,44 +119,59 @@ router.post('/transfer', memberAuth, async (req, res) => {
  * Upgrade account using activation code
  */
 router.post('/upgrade', memberAuth, async (req, res) => {
+  let conn;
   try {
     const uid = req.session.uid;
-    const { code } = req.body;
+    const code = sanitizeAlphaNum(req.body?.code || '');
+
+    if (!code) {
+      return res.status(400).json({ error: 'Upgrade code is required' });
+    }
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
 
     // Validate upgrade code
-    const [codeRows] = await pool.query(
+    const [codeRows] = await conn.query(
       `SELECT * FROM codestab WHERE code = ? AND producttype > ?
        AND codetype = 1 AND producttype <= 90 AND codestatus = 1 AND uid = ?`,
       [code, req.session.currentaccttype, uid]
     );
 
     if (codeRows.length === 0) {
+      await conn.rollback();
       return res.status(400).json({ error: 'Invalid upgrade code' });
     }
 
     const codeData = codeRows[0];
 
     // Update code status
-    await pool.query(
+    const [useResult] = await conn.query(
       "UPDATE codestab SET dateused = NOW(), codestatus = 2, uid = ? WHERE code = ? LIMIT 1",
       [uid, code]
     );
+    if (useResult.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Upgrade code is no longer available' });
+    }
 
     // Update account type
-    await pool.query(
+    await conn.query(
       'UPDATE usertab SET currentaccttype = ? WHERE uid = ? LIMIT 1',
       [codeData.producttype, uid]
     );
 
     // Insert upgrade record
     const now = nowMySQL();
-    await pool.query(
+    await conn.query(
       `INSERT INTO upgradetab (id, uid, producttype, transtype, codeid,
        binarypoints, incentivepoints, processid, transdate)
        VALUES (NULL, ?, ?, 1, ?, ?, ?, ?, ?)`,
       [uid, codeData.producttype, codeData.id, codeData.binarypoints,
        codeData.directreferral, String(uid), now]
     );
+
+    await conn.commit();
 
     // Update session
     req.session.currentaccttype = codeData.producttype;
@@ -168,8 +183,11 @@ router.post('/upgrade', memberAuth, async (req, res) => {
       newAccountTypeName: ACCOUNT_TYPES[codeData.producttype],
     });
   } catch (err) {
+    if (conn) await conn.rollback();
     console.error('[Codes] Upgrade error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
@@ -178,40 +196,63 @@ router.post('/upgrade', memberAuth, async (req, res) => {
  * Activate maintenance code (repurchase)
  */
 router.post('/maintenance', memberAuth, async (req, res) => {
+  let conn;
   try {
     const uid = req.session.uid;
-    const { code, transType } = req.body; // transType: 1 = Maintenance, 2 = Hi-Five
+    const code = sanitizeAlphaNum(req.body?.code || '');
+    const transType = Number(req.body?.transType || 1); // 1 = Maintenance, 2 = Hi-Five
+
+    if (!code) {
+      return res.status(400).json({ error: 'Maintenance code is required' });
+    }
+
+    if (transType !== 1 && transType !== 2) {
+      return res.status(400).json({ error: 'Invalid maintenance transaction type' });
+    }
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
 
     // Validate maintenance code
-    const [codeRows] = await pool.query(
+    const [codeRows] = await conn.query(
       'SELECT * FROM codestab WHERE code = ? AND codestatus = 1 AND producttype >= 100 AND uid = ?',
       [code, uid]
     );
 
     if (codeRows.length === 0) {
+      await conn.rollback();
       return res.status(400).json({ error: 'Invalid maintenance code' });
     }
 
     const codeData = codeRows[0];
 
     // Update code status to used
-    await pool.query(
+    const [useResult] = await conn.query(
       "UPDATE codestab SET dateused = NOW(), codestatus = 2 WHERE code = ? AND uid = ? LIMIT 1",
       [code, uid]
     );
+    if (useResult.affectedRows !== 1) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Maintenance code is no longer available' });
+    }
 
     // Insert repurchase record
-    await pool.query(
+    await conn.query(
       `INSERT INTO repurchasetab (id, uid, producttype, code, transtype, codeid,
        incentivepoints1, transdate)
        VALUES (NULL, ?, ?, ?, ?, ?, ?, NOW())`,
-      [uid, codeData.producttype, code, transType || 1, codeData.id, codeData.unilevelpoints]
+      [uid, codeData.producttype, code, transType, codeData.codetype, codeData.unilevelpoints]
     );
+
+    await conn.commit();
 
     res.json({ success: true, producttype: codeData.producttype });
   } catch (err) {
+    if (conn) await conn.rollback();
     console.error('[Codes] Maintenance error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
