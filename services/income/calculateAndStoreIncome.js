@@ -40,6 +40,10 @@ async function calculateAndStoreIncome(uid, accttype) {
   const pairingResult    = await getPairing(uid, accttype);
   const leadershipAmount = await getLeadershipBonus(uid);
 
+  // Pairing is ONE-TIME ONLY: skip calculation entirely if already credited
+  const alreadyPaidPairing = Number(stored.ttlincome2 || 0) > 0;
+  const pairingAmount = alreadyPaidPairing ? 0 : await getPairing(uid, accttype);
+
   const newDref       = Math.max(0, drefResult.directreferral  - Number(stored.ttlincome1 || 0));
   const newPairing    = Math.max(0, pairingResult.totalPay     - Number(stored.ttlincome2 || 0));
   const newLeadership = Math.max(0, leadershipAmount          - Number(stored.ttlincome3 || 0));
