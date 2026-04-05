@@ -8,19 +8,34 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 
+let memberTinColumnReady = false;
+
+async function ensureMemberTinColumn() {
+  if (memberTinColumnReady) return;
+
+  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
+  if (columns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
+  }
+
+  memberTinColumnReady = true;
+}
+
 /**
  * GET /api/account
  * Get member account details
  */
 router.get('/', memberAuth, async (req, res) => {
   try {
+    await ensureMemberTinColumn();
+
     const uid = req.session.uid;
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
               m.uid as mUid, m.username, m.password, m.firstname, m.lastname,
               m.middlename, m.address, m.contactnos, m.payoutid, m.payoutdetails,
-              m.email, m.fbaccount, m.gender, m.dob
+              m.email, m.fbaccount, m.gender, m.dob, m.tin
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
       [uid]
@@ -41,6 +56,7 @@ router.get('/', memberAuth, async (req, res) => {
       address: user.address,
       contactnos: user.contactnos,
       email: user.email,
+      tin: user.tin,
       payoutid: user.payoutid,
       payoutdetails: user.payoutdetails,
       accttype: user.currentaccttype,

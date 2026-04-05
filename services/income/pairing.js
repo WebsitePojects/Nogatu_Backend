@@ -44,7 +44,7 @@ async function getUpgradeAccount(uid) {
 
 /**
  * Recursively traverse binary tree to collect binary points by leg.
- * Only PD accounts (codeid=1) of the same tier as the member (memberAccttype) are counted.
+ * Only PD accounts (codeid=1) are counted — all tiers contribute to pairing.
  */
 async function getNumLevels(
   parent,
@@ -70,14 +70,14 @@ async function getNumLevels(
       : (sideMap[parent] || 'right');
     sideMap[row.uid] = side;
 
-    const isSameTierPD = Number(row.codeid) === 1 && Number(row.currentaccttype) === Number(memberAccttype);
+    const isPD = Number(row.codeid) === 1;
     const baseDate = normalizeToDay(row.datereg);
 
-    if (isSameTierPD && baseDate) {
+    if (isPD && baseDate) {
       allDates.add(baseDate);
     }
 
-    if (isSameTierPD) {
+    if (isPD) {
       const pointEntry = {
         uid: row.uid,
         points: Number(row.binarypoints || 0),

@@ -34,6 +34,55 @@ async function ensureContactMessagesTable() {
   );
 }
 
+async function ensureContactBlocklistTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS contact_blockedtab (
+      id INT NOT NULL AUTO_INCREMENT,
+      email VARCHAR(200) DEFAULT NULL,
+      ip_address VARCHAR(45) DEFAULT NULL,
+      reason VARCHAR(255) DEFAULT NULL,
+      blocked_by VARCHAR(120) DEFAULT NULL,
+      active TINYINT NOT NULL DEFAULT 1,
+      blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_email (email),
+      KEY idx_ip_address (ip_address),
+      KEY idx_active (active)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+  );
+}
+
+async function isBlockedSender(email, ipAddress) {
+  const emailVal = String(email || '').trim();
+  const ipVal = String(ipAddress || '').trim();
+
+  if (!emailVal && !ipVal) return false;
+
+  if (emailVal && ipVal) {
+    const [rows] = await pool.query(
+      `SELECT id FROM contact_blockedtab
+       WHERE active = 1 AND (email = ? OR ip_address = ?)
+       LIMIT 1`,
+      [emailVal, ipVal]
+    );
+    return rows.length > 0;
+  }
+
+  if (emailVal) {
+    const [rows] = await pool.query(
+      'SELECT id FROM contact_blockedtab WHERE active = 1 AND email = ? LIMIT 1',
+      [emailVal]
+    );
+    return rows.length > 0;
+  }
+
+  const [rows] = await pool.query(
+    'SELECT id FROM contact_blockedtab WHERE active = 1 AND ip_address = ? LIMIT 1',
+    [ipVal]
+  );
+  return rows.length > 0;
+}
+
 /**
  * POST /api/contact
  */
@@ -57,6 +106,14 @@ router.post('/', contactLimiter, async (req, res) => {
     }
 
     await ensureContactMessagesTable();
+    await ensureContactBlocklistTable();
+
+    const blocked = await isBlockedSender(email, req.ip || null);
+    if (blocked) {
+      return res.status(403).json({
+        error: 'Your message cannot be accepted at this time. Please contact support through other official channels.',
+      });
+    }
 
     const [result] = await pool.query(
       `INSERT INTO contact_messagestab
