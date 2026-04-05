@@ -8,6 +8,20 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName, ENTRY_TYPES } = require('../../utils/helpers');
+const { resolveTin, isValidTin } = require('../../utils/tin');
+
+let memberTinColumnReady = false;
+
+async function ensureMemberTinColumn() {
+  if (memberTinColumnReady) return;
+
+  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
+  if (columns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
+  }
+
+  memberTinColumnReady = true;
+}
 
 /**
  * GET /api/admin/accounts?page=1&search=name
@@ -78,12 +92,14 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
+    await ensureMemberTinColumn();
+
     const uid = Number(req.params.uid);
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
               m.username, m.firstname, m.lastname, m.middlename,
-              m.address, m.contactnos, m.payoutid, m.payoutdetails
+              m.address, m.contactnos, m.tin, m.payoutid, m.payoutdetails
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
       [uid]
@@ -93,7 +109,12 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    res.json(rows[0]);
+    const account = rows[0];
+    res.json({
+      ...account,
+      tin: account.tin || null,
+      tinno: account.tin || null,
+    });
   } catch (err) {
     console.error('[Admin Accounts] Get error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -107,28 +128,56 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
+    await ensureMemberTinColumn();
+
     const uid = Number(req.params.uid);
     const { firstname, lastname, middlename, address, password,
             payoutdetails, payoutoptions, contactnos } = req.body;
 
+    const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
+      || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
+    const normalizedTin = resolveTin(req.body);
+
+    if (hasTinField && normalizedTin && !isValidTin(normalizedTin)) {
+      return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+    }
+
+    const setClauses = [
+      'firstname = ?',
+      'lastname = ?',
+      'middlename = ?',
+      'address = ?',
+      'payoutdetails = ?',
+      'payoutid = ?',
+      'contactnos = ?',
+    ];
+    const values = [
+      firstname,
+      lastname,
+      middlename,
+      address,
+      payoutdetails,
+      payoutoptions,
+      contactnos,
+    ];
+
+    if (hasTinField) {
+      setClauses.push('tin = ?');
+      values.push(normalizedTin || null);
+    }
+
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);
-      await pool.query(
-        `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-         address = ?, password = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
-         WHERE uid = ? LIMIT 1`,
-        [firstname, lastname, middlename, address, hashedPassword,
-         payoutdetails, payoutoptions, contactnos, uid]
-      );
-    } else {
-      await pool.query(
-        `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-         address = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
-         WHERE uid = ? LIMIT 1`,
-        [firstname, lastname, middlename, address,
-         payoutdetails, payoutoptions, contactnos, uid]
-      );
+      setClauses.push('password = ?');
+      values.push(hashedPassword);
     }
+
+    values.push(uid);
+    await pool.query(
+      `UPDATE memberstab SET ${setClauses.join(', ')}
+       WHERE uid = ? LIMIT 1`,
+      values
+    );
 
     const [result] = await pool.query('SELECT uid FROM memberstab WHERE uid = ?', [uid]);
 
@@ -151,8 +200,12 @@ router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res)
   try {
     const { adminAccount, password, oldPassword } = req.body;
 
-    if (!adminAccount || !password) {
-      return res.status(400).json({ error: 'Admin account and new password are required' });
+    if (!adminAccount || !password || !oldPassword) {
+      return res.status(400).json({ error: 'Admin account, current password, and new password are required' });
+    }
+
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
     }
 
     // Verify old password first
@@ -165,18 +218,16 @@ router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res)
       return res.status(404).json({ error: 'Admin account not found' });
     }
 
-    if (oldPassword) {
-      const storedPw = adminRows[0].password;
-      const isHashed = storedPw && storedPw.startsWith('$2');
-      let oldMatch = false;
-      if (isHashed) {
-        oldMatch = await bcrypt.compare(oldPassword, storedPw);
-      } else {
-        oldMatch = (oldPassword === storedPw);
-      }
-      if (!oldMatch) {
-        return res.status(401).json({ error: 'Current password is incorrect' });
-      }
+    const storedPw = adminRows[0].password;
+    const isHashed = storedPw && storedPw.startsWith('$2');
+    let oldMatch = false;
+    if (isHashed) {
+      oldMatch = await bcrypt.compare(oldPassword, storedPw);
+    } else {
+      oldMatch = (oldPassword === storedPw);
+    }
+    if (!oldMatch) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 12);

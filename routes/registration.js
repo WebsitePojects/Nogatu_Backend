@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const registrationService = require('../services/registration');
+const { resolveTin, isValidTin } = require('../utils/tin');
 
 /**
  * GET /api/registration/validate-code?code=XXX
@@ -125,8 +126,10 @@ router.post('/register', memberAuth, async (req, res) => {
       firstname, lastname, middlename, position
     } = req.body;
 
+    const normalizedTin = resolveTin(req.body);
+
     // Input validation
-    if (!activationCode || !username || !password || !firstname || !lastname || !placementUid) {
+    if (!activationCode || !username || !password || !firstname || !lastname || !placementUid || !normalizedTin) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -138,6 +141,9 @@ router.post('/register', memberAuth, async (req, res) => {
     if (firstname.length > 50 || lastname.length > 50) {
       return res.status(400).json({ error: 'Name fields must be under 50 characters' });
     }
+    if (!isValidTin(normalizedTin)) {
+      return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+    }
 
     const result = await registrationService.registerMember({
       activationCode,
@@ -148,6 +154,7 @@ router.post('/register', memberAuth, async (req, res) => {
       firstname,
       lastname,
       middlename,
+      tin: normalizedTin,
       position: Number(position),
     });
 

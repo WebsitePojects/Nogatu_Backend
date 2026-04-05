@@ -65,13 +65,13 @@ const sessionStore = new MySQLStore({
 }, pool);
 
 // Validate session secret
-if (!process.env.SESSION_SECRET) {
-  console.warn('[Server] WARNING: SESSION_SECRET not set in environment. Using insecure fallback for development only.');
+if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
+  throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
 }
 
 // Session config
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'dev-only-insecure-secret-' + Date.now(),
+  secret: String(process.env.SESSION_SECRET),
   store: sessionStore,
   resave: false,
   saveUninitialized: false,
@@ -111,6 +111,7 @@ app.use('/api/news', require('./routes/news'));
 app.use('/api/stats', require('./routes/stats'));
 app.use('/api/vouchers', require('./routes/vouchers'));
 app.use('/api/ranking', require('./routes/ranking'));
+app.use('/api/contact', require('./routes/contact'));
 
 // Admin routes
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -123,6 +124,7 @@ app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
 app.use('/api/admin/news', require('./routes/admin/news'));
 app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
 app.use('/api/admin/rankings', require('./routes/admin/rankings'));
+app.use('/api/admin/messages', require('./routes/admin/messages'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {
