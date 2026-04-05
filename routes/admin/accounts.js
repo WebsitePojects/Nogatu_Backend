@@ -18,6 +18,32 @@ const PACKAGE_MAP = {
   60: 'Diamond',
 };
 
+let tinColumnChecked = false;
+async function ensureMemberTinColumn() {
+  if (tinColumnChecked) return;
+  try {
+    const [dbRows] = await pool.query('SELECT DATABASE() AS db');
+    const dbName = dbRows?.[0]?.db;
+    if (!dbName) return;
+
+    const [colRows] = await pool.query(
+      `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'memberstab' AND COLUMN_NAME = 'tinno'`,
+      [dbName]
+    );
+
+    if (colRows.length === 0) {
+      await pool.query('ALTER TABLE memberstab ADD COLUMN tinno VARCHAR(30) DEFAULT NULL AFTER contactnos');
+      console.log('[Admin Accounts] Added memberstab.tinno column');
+    }
+
+    tinColumnChecked = true;
+  } catch (err) {
+    console.error('[Admin Accounts] Failed ensuring tinno column:', err.message);
+  }
+}
+
 /**
  * GET /api/admin/accounts?page=1&search=name
  * Account masterlist (paginated, 50 per page)
@@ -87,12 +113,13 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
+    await ensureMemberTinColumn();
     const uid = Number(req.params.uid);
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
               m.username, m.firstname, m.lastname, m.middlename,
-              m.address, m.contactnos, m.payoutid, m.payoutdetails
+              m.address, m.contactnos, m.tinno, m.payoutid, m.payoutdetails
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
       [uid]
@@ -116,26 +143,27 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
+    await ensureMemberTinColumn();
     const uid = Number(req.params.uid);
     const { firstname, lastname, middlename, address, password,
-            payoutdetails, payoutoptions, contactnos } = req.body;
+            payoutdetails, payoutoptions, contactnos, tinno } = req.body;
 
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);
       await pool.query(
         `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-         address = ?, password = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
+         address = ?, password = ?, payoutdetails = ?, payoutid = ?, contactnos = ?, tinno = ?
          WHERE uid = ? LIMIT 1`,
         [firstname, lastname, middlename, address, hashedPassword,
-         payoutdetails, payoutoptions, contactnos, uid]
+         payoutdetails, payoutoptions, contactnos, tinno || null, uid]
       );
     } else {
       await pool.query(
         `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-         address = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
+         address = ?, payoutdetails = ?, payoutid = ?, contactnos = ?, tinno = ?
          WHERE uid = ? LIMIT 1`,
         [firstname, lastname, middlename, address,
-         payoutdetails, payoutoptions, contactnos, uid]
+         payoutdetails, payoutoptions, contactnos, tinno || null, uid]
       );
     }
 

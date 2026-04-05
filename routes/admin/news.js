@@ -102,7 +102,7 @@ router.post('/', handleUpload, async (req, res) => {
     if (!normalizedTitle || !normalizedContent) {
       return res.status(400).json({ error: 'Title and content are required' });
     }
-    if (!['news', 'announcement', 'promo'].includes(type)) {
+    if (!['news', 'announcement', 'promo', 'memo'].includes(type)) {
       return res.status(400).json({ error: 'Invalid type' });
     }
     if (normalizedTitle.length > 255) {
@@ -146,7 +146,7 @@ router.put('/:id', handleUpload, async (req, res) => {
     if (!normalizedTitle || !normalizedContent) {
       return res.status(400).json({ error: 'Title and content are required' });
     }
-    if (!['news', 'announcement', 'promo'].includes(type || 'news')) {
+    if (!['news', 'announcement', 'promo', 'memo'].includes(type || 'news')) {
       return res.status(400).json({ error: 'Invalid type' });
     }
     if (normalizedTitle.length > 255) {
