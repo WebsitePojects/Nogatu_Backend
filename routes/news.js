@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS newstab (
   id INT AUTO_INCREMENT PRIMARY KEY,
   title VARCHAR(255) NOT NULL,
   content TEXT NOT NULL,
-  type ENUM('news', 'announcement', 'promo') DEFAULT 'news',
+  type ENUM('news', 'announcement', 'promo', 'memo') DEFAULT 'news',
   image_url VARCHAR(500) DEFAULT NULL,
   is_published TINYINT(1) DEFAULT 1,
   created_by INT DEFAULT NULL,
@@ -25,13 +25,14 @@ async function ensureTable() {
   if (tableReady) return;
   try {
     await pool.query(INIT_SQL);
+    await pool.query("ALTER TABLE newstab MODIFY COLUMN type ENUM('news','announcement','promo','memo') DEFAULT 'news'");
     tableReady = true;
   } catch (err) {
     console.error('[News] Failed to create table:', err.message);
   }
 }
 
-// GET /api/news - Public: Get published news/announcements/promos
+// GET /api/news - Public: Get published posts by type
 router.get('/', async (req, res) => {
   try {
     await ensureTable();
@@ -40,7 +41,7 @@ router.get('/', async (req, res) => {
     let sql = 'SELECT id, title, content, type, image_url, created_at FROM newstab WHERE is_published = 1';
     const params = [];
 
-    if (type && ['news', 'announcement', 'promo'].includes(type)) {
+    if (type && ['news', 'announcement', 'promo', 'memo'].includes(type)) {
       sql += ' AND type = ?';
       params.push(type);
     }
