@@ -27,7 +27,7 @@ router.get('/', memberAuth, async (req, res) => {
     const [rows] = await pool.query(
       `SELECT pid, uid, beginningbalance, endingbalance, cashbalance,
               income1, income2, income3, income4, income5, income6,
-              encashment1, tax_1, encashmentfee, cddeduction,
+              encashment1, tax_1 AS tax, encashmentfee AS fee, cddeduction,
               cashstatus, DATE_FORMAT(cashtransdate, '%Y-%m-%d %H:%i') as cashtransdate,
               DATE_FORMAT(transdate, '%Y-%m-%d %H:%i') as transdate,
               transactiontype
@@ -47,12 +47,18 @@ router.get('/', memberAuth, async (req, res) => {
       hifive: Number(r.income5 || 0),
       lpc: Number(r.income6 || 0),
       encashment: Number(r.encashment1 || 0),
-      tax: Number(r.tax_1 || 0),
-      fee: Number(r.encashmentfee || 0),
+      tax: Number(r.tax || 0),
+      fee: Number(r.fee || 0),
       cdDeduction: Number(r.cddeduction || 0),
-      cashStatus: r.cashstatus,
-      transactionType: r.transactiontype,
-      transactionTypeName: r.transactiontype === 1 ? 'Income' : r.transactiontype === 10 ? 'Encashment' : 'Other',
+      deductions: Number(r.tax || 0) + Number(r.fee || 0) + Number(r.cddeduction || 0),
+      cashStatus: Number(r.cashstatus || 0),
+      transactionType: Number(r.transactiontype || 0),
+      transactionTypeName:
+        Number(r.transactiontype || 0) === 1
+          ? 'Income'
+          : Number(r.transactiontype || 0) === 10
+            ? 'Encashment'
+            : 'Other',
       transdate: r.transdate,
       cashtransdate: r.cashtransdate,
     }));

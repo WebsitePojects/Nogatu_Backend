@@ -9,6 +9,19 @@ const { pool } = require('../config/database');
 const { sanitizeAlphaNum, getOffsetTimestamp } = require('../utils/helpers');
 const { issueVoucher } = require('./voucher');
 
+let memberTinColumnReady = false;
+
+async function ensureMemberTinColumn() {
+  if (memberTinColumnReady) return;
+
+  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
+  if (columns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
+  }
+
+  memberTinColumnReady = true;
+}
+
 /**
  * Check if activation code is valid and available
  * Mirrors PHP chk_code()
@@ -228,11 +241,18 @@ async function getNextCountId() {
  */
 async function registerMember({
   activationCode, sponsorUid, placementUid, username, password,
-  firstname, lastname, middlename, position
+  firstname, lastname, middlename, tin, position
 }) {
+  await ensureMemberTinColumn();
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    const normalizedTin = String(tin || '').trim();
+    if (!normalizedTin || normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin)) {
+      throw new Error('Invalid TIN format');
+    }
 
     // 1. Validate activation code
     const [codeRows] = await conn.query(
@@ -297,9 +317,9 @@ async function registerMember({
     // 8. Insert into memberstab (hash password with bcrypt)
     const hashedPassword = await bcrypt.hash(password, 12);
     await conn.query(
-      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename)
-       VALUES (NULL, ?, ?, ?, ?, ?, ?)`,
-      [newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename]
+      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin)
+       VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)`,
+      [newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename, normalizedTin]
     );
 
     // 9. Issue voucher for new member (DOC2 §4.1)
@@ -343,4 +363,5 @@ module.exports = {
   generateUID,
   getNextCountId,
   registerMember,
+  ensureMemberTinColumn,
 };

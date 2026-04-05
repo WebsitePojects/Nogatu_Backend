@@ -32,8 +32,8 @@ router.get('/', memberAuth, async (req, res) => {
     const ttlincome6     = Number(income.ttlincome6     || 0);
     const ttlcashbalance = Number(income.ttlcashbalance || 0);
 
-    // Total Cash Income = all 6 income types
-    const totalCashIncome = ttlincome1 + ttlincome2 + ttlincome3 + ttlincome4 + ttlincome5 + ttlincome6;
+    // Match production: active cash summary includes income1,2,3,5 only.
+    const totalCashIncome = ttlincome1 + ttlincome2 + ttlincome3 + ttlincome5;
 
     // 2. Get maintenance status (current month repurchases)
     const { start, end } = currentMonthRange();
@@ -57,23 +57,54 @@ router.get('/', memberAuth, async (req, res) => {
       [uid]
     );
 
-    const drefByType = {};
+    const drefByType = {
+      Bronze: 0,
+      Silver: 0,
+      Gold: 0,
+      Platinum: 0,
+      Garnet: 0,
+      Diamond: 0,
+    };
     for (const row of drefRows) {
       const typeName = getAccountTypeName(row.currentaccttype);
       drefByType[typeName] = Number(row.cnt);
     }
 
-    // 4. Get pairing (left/right) counts
-    const [pairingRows] = await pool.query(
-      `SELECT position, COUNT(*) as total
-       FROM usertab WHERE refid = ? GROUP BY position`,
+    // 4. Get latest pairing summary from pairingstab (production chkPairing parity)
+    const [pairSummaryRows] = await pool.query(
+      `SELECT totalleft, totalpointsleft, totalright, totalpointsright,
+              \`left\`, \`right\`, totalpoints
+       FROM pairingstab WHERE uid = ?
+       ORDER BY id DESC LIMIT 1`,
       [uid]
     );
 
-    let leftAccounts = 0, rightAccounts = 0;
-    for (const row of pairingRows) {
-      if (Number(row.position) === 1) leftAccounts = Number(row.total);
-      if (Number(row.position) === 2) rightAccounts = Number(row.total);
+    let leftAccounts = 0;
+    let rightAccounts = 0;
+    let leftPoints = 0;
+    let rightPoints = 0;
+    let pairingBalance = 0;
+
+    if (pairSummaryRows.length > 0) {
+      const p = pairSummaryRows[0];
+      leftAccounts = Number(p.totalleft || 0);
+      rightAccounts = Number(p.totalright || 0);
+      // Production dashboard displays these as /250-converted points.
+      leftPoints = Number(p.totalpointsleft || 0) / 250;
+      rightPoints = Number(p.totalpointsright || 0) / 250;
+      pairingBalance = Math.abs(Number(p.left || 0) - Number(p.right || 0));
+    } else {
+      // Fallback when pairing table has no rows yet.
+      const [pairingRows] = await pool.query(
+        `SELECT position, COUNT(*) as total
+         FROM usertab WHERE refid = ? GROUP BY position`,
+        [uid]
+      );
+
+      for (const row of pairingRows) {
+        if (Number(row.position) === 1) leftAccounts = Number(row.total);
+        if (Number(row.position) === 2) rightAccounts = Number(row.total);
+      }
     }
 
     res.json({
@@ -89,7 +120,10 @@ router.get('/', memberAuth, async (req, res) => {
       maintenancePoints,
       directReferrals: drefByType,
       leftAccounts,
+      leftPoints,
       rightAccounts,
+      rightPoints,
+      pairingBalance,
       accountType: req.session.caccttype,
     });
   } catch (err) {

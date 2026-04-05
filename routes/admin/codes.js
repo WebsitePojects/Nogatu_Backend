@@ -39,26 +39,37 @@ router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
 });
 
 /**
- * GET /api/admin/codes?page=1
- * List all codes (paginated, 100 per page)
+ * GET /api/admin/codes?page=1&q=keyword
+ * List all codes (paginated, 100 per page) with optional code search
  */
 router.get('/', adminAuth, async (req, res) => {
   try {
+    const adminRight = Number(req.session.adminrights || 0);
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = 100;
     const offset = (page - 1) * perPage;
+    const q = (req.query.q || '').trim();
+
+    // Cashier (rights=2) can only manage transferable released codes.
+    let whereSql = adminRight === 2 ? 'WHERE codestatus = 1' : 'WHERE codestatus <= 2';
+    const whereParams = [];
+    if (q) {
+      whereSql += ' AND code LIKE ?';
+      whereParams.push(`%${q}%`);
+    }
 
     const [countRows] = await pool.query(
-      'SELECT COUNT(*) as total FROM codestab WHERE codestatus <= 2'
+      `SELECT COUNT(*) as total FROM codestab ${whereSql}`,
+      whereParams
     );
     const total = Number(countRows[0].total);
 
     const [rows] = await pool.query(
       `SELECT id, code, producttype, uid, codestatus, releasedate,
               DATE_FORMAT(dategen, '%Y-%m-%d %H:%i') as dategen
-       FROM codestab WHERE codestatus <= 2
+       FROM codestab ${whereSql}
        ORDER BY id DESC LIMIT ?, ?`,
-      [offset, perPage]
+      [...whereParams, offset, perPage]
     );
 
     const codes = rows.map(r => ({
@@ -76,6 +87,40 @@ router.get('/', adminAuth, async (req, res) => {
     res.json({ codes, total, page, totalPages: Math.ceil(total / perPage) });
   } catch (err) {
     console.error('[Admin Codes] List error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/codes/lookup-account?username=00001
+ * Legacy parity helper: search and tag transfer account by username
+ */
+router.get('/lookup-account', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    const username = sanitizeAlphaNum((req.query.username || '').trim());
+    if (!username) {
+      return res.status(400).json({ error: 'Username is required' });
+    }
+
+    const [rows] = await pool.query(
+      'SELECT uid, username, firstname, lastname FROM memberstab WHERE username = ? LIMIT 1',
+      [username]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const row = rows[0];
+    res.json({
+      account: {
+        uid: row.uid,
+        username: row.username,
+        fullname: `${row.firstname} ${row.lastname}`.trim(),
+      },
+    });
+  } catch (err) {
+    console.error('[Admin Codes] Lookup account error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -108,8 +153,9 @@ router.post('/release', adminAuth, adminRights([1, 3]), async (req, res) => {
  * POST /api/admin/codes/transfer
  * Transfer codes to member account
  */
-router.post('/transfer', adminAuth, async (req, res) => {
+router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
+    const adminRight = Number(req.session.adminrights || 0);
     const { targetUsername, codes: selectedCodes } = req.body;
 
     const targetSanitized = sanitizeAlphaNum(targetUsername);
@@ -126,8 +172,9 @@ router.post('/transfer', adminAuth, async (req, res) => {
     let transferred = 0;
 
     for (const code of selectedCodes) {
+      const codeWhere = adminRight === 2 ? 'codestatus = 1' : 'codestatus <= 1';
       const [codeRows] = await pool.query(
-        'SELECT * FROM codestab WHERE code = ? AND codestatus <= 1',
+        `SELECT * FROM codestab WHERE code = ? AND ${codeWhere}`,
         [code]
       );
       if (codeRows.length === 0) continue;

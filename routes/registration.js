@@ -122,11 +122,13 @@ router.post('/register', memberAuth, async (req, res) => {
   try {
     const {
       activationCode, placementUid, username, password,
-      firstname, lastname, middlename, position
+      firstname, lastname, middlename, position, tin, tinno
     } = req.body;
 
+    const rawTin = String(tin || tinno || '').trim();
+
     // Input validation
-    if (!activationCode || !username || !password || !firstname || !lastname || !placementUid) {
+    if (!activationCode || !username || !password || !firstname || !lastname || !placementUid || !rawTin) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -139,6 +141,10 @@ router.post('/register', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Name fields must be under 50 characters' });
     }
 
+    if (rawTin.length < 9 || rawTin.length > 30 || !/^[0-9-]+$/.test(rawTin)) {
+      return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+    }
+
     const result = await registrationService.registerMember({
       activationCode,
       sponsorUid: req.session.uid,
@@ -148,6 +154,7 @@ router.post('/register', memberAuth, async (req, res) => {
       firstname,
       lastname,
       middlename,
+      tin: rawTin,
       position: Number(position),
     });
 
