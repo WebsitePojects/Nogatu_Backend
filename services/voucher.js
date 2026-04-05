@@ -9,6 +9,32 @@
  */
 const { pool } = require('../config/database');
 
+let voucherTableReady = false;
+
+async function ensureVoucherTable() {
+  if (voucherTableReady) return;
+
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS voucherstab (
+      id INT NOT NULL AUTO_INCREMENT,
+      uid INT NOT NULL,
+      package_type INT NOT NULL,
+      voucher_amount DECIMAL(12,2) NOT NULL,
+      remaining_balance DECIMAL(12,2) NOT NULL,
+      issued_date DATETIME NOT NULL,
+      expiry_date DATETIME NOT NULL,
+      status INT NOT NULL DEFAULT 1,
+      redeemed_date DATETIME DEFAULT NULL,
+      PRIMARY KEY (id),
+      KEY idx_uid (uid),
+      KEY idx_status (status),
+      KEY idx_expiry_date (expiry_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+  );
+
+  voucherTableReady = true;
+}
+
 // Voucher expiry days by package type
 const VOUCHER_EXPIRY_DAYS = {
   10: 30,   // Bronze
@@ -36,6 +62,8 @@ const PACKAGE_AMOUNTS = {
  * @param {number} packageType - Account type code (10-60)
  */
 async function issueVoucher(conn, uid, packageType) {
+  await ensureVoucherTable();
+
   const amount = PACKAGE_AMOUNTS[packageType];
   const expiryDays = VOUCHER_EXPIRY_DAYS[packageType];
 
@@ -55,6 +83,13 @@ async function issueVoucher(conn, uid, packageType) {
  * Get all vouchers for a member
  */
 async function getVouchers(uid) {
+  await ensureVoucherTable();
+
+  await pool.query(
+    'UPDATE voucherstab SET status = 2 WHERE uid = ? AND status = 1 AND expiry_date < NOW()',
+    [uid]
+  );
+
   const [rows] = await pool.query(
     `SELECT id, uid, package_type, voucher_amount, remaining_balance,
             DATE_FORMAT(issued_date, '%Y-%m-%d') as issued_date,
@@ -69,18 +104,6 @@ async function getVouchers(uid) {
     [uid]
   );
 
-  // Auto-expire any vouchers past their expiry date
-  for (const row of rows) {
-    if (row.status === 1 && new Date(row.expiry_date) < new Date()) {
-      await pool.query(
-        'UPDATE voucherstab SET status = 2 WHERE id = ?',
-        [row.id]
-      );
-      row.status = 2;
-      row.status_label = 'Expired';
-    }
-  }
-
   return rows;
 }
 
@@ -92,47 +115,72 @@ async function getVouchers(uid) {
  * @returns {object} Redemption result
  */
 async function redeemVoucher(uid, voucherId, cashAmount) {
-  const [rows] = await pool.query(
-    `SELECT * FROM voucherstab
-     WHERE id = ? AND uid = ? AND status = 1 AND expiry_date >= NOW()`,
-    [voucherId, uid]
-  );
+  await ensureVoucherTable();
 
-  if (rows.length === 0) {
-    throw new Error('Voucher not found, expired, or already used');
-  }
-
-  const voucher = rows[0];
-  const remaining = Number(voucher.remaining_balance);
-
-  if (cashAmount <= 0) {
+  if (!Number.isFinite(Number(cashAmount)) || Number(cashAmount) <= 0) {
     throw new Error('Cash amount must be greater than 0');
   }
 
-  // Buy 1 Take 1: deduct from voucher what the member pays in cash
-  const voucherDeduction = Math.min(cashAmount, remaining);
-  const newBalance = remaining - voucherDeduction;
-  const newStatus = newBalance <= 0 ? 3 : 1; // 3 = fully used
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
 
-  await pool.query(
-    'UPDATE voucherstab SET remaining_balance = ?, status = ? WHERE id = ?',
-    [newBalance, newStatus, voucherId]
-  );
+    const [rows] = await conn.query(
+      `SELECT * FROM voucherstab
+       WHERE id = ? AND uid = ? AND status = 1 AND expiry_date >= NOW()
+       LIMIT 1
+       FOR UPDATE`,
+      [voucherId, uid]
+    );
 
-  return {
-    voucherId,
-    cashPaid: cashAmount,
-    voucherDeducted: voucherDeduction,
-    totalProductValue: cashAmount + voucherDeduction,
-    remainingBalance: newBalance,
-    fullyUsed: newStatus === 3,
-  };
+    if (rows.length === 0) {
+      throw new Error('Voucher not found, expired, or already used');
+    }
+
+    const voucher = rows[0];
+    const remaining = Number(voucher.remaining_balance || 0);
+    const cashPaid = Number(cashAmount);
+
+    // Buy 1 Take 1: cash paid equals voucher deduction up to remaining balance.
+    const voucherDeduction = Math.min(cashPaid, remaining);
+    const newBalance = remaining - voucherDeduction;
+    const newStatus = newBalance <= 0 ? 3 : 1;
+
+    await conn.query(
+      `UPDATE voucherstab
+          SET remaining_balance = ?,
+              status = ?,
+              redeemed_date = CASE WHEN ? = 3 THEN NOW() ELSE redeemed_date END
+        WHERE id = ? LIMIT 1`,
+      [newBalance, newStatus, newStatus, voucherId]
+    );
+
+    await conn.commit();
+
+    return {
+      voucherId,
+      cashPaid,
+      voucherDeducted: voucherDeduction,
+      totalProductValue: cashPaid + voucherDeduction,
+      remainingBalance: newBalance,
+      fullyUsed: newStatus === 3,
+    };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }
 
 /**
  * Get all vouchers for admin view
  */
 async function getAllVouchers(page = 1, perPage = 30) {
+  await ensureVoucherTable();
+
+  await pool.query('UPDATE voucherstab SET status = 2 WHERE status = 1 AND expiry_date < NOW()');
+
   const offset = (page - 1) * perPage;
 
   const [countRows] = await pool.query('SELECT COUNT(*) as total FROM voucherstab');
@@ -164,6 +212,7 @@ module.exports = {
   getVouchers,
   redeemVoucher,
   getAllVouchers,
+  ensureVoucherTable,
   VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,
 };

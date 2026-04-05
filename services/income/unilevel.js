@@ -75,12 +75,17 @@ async function updateIncomeTransDate(uid, incomeType) {
 }
 
 /**
- * Recursively calculate unilevel income
+ * Recursively calculate unilevel income.
+ *
+ * This intentionally mirrors production PHP `ctl_level` behavior:
+ * qualifying points are added to all level buckets when the ctl gate passes.
+ * Even though this is counterintuitive, it must match production output.
+ *
  * @param {number} parent - Parent UID
  * @param {number} level - Current level (1-10)
- * @param {Object} totals - Accumulator { lev1: 0, lev23: 0, lev45: 0, lev610: 0 }
+ * @param {{ ctlLevel: number, totals: { lev1: number, lev23: number, lev45: number, lev610: number } }} state
  */
-async function calculateUnilevel(parent, level, totals) {
+async function calculateUnilevel(parent, level, state) {
   if (level > 10) return;
 
   const [rows] = await pool.query(
@@ -89,21 +94,24 @@ async function calculateUnilevel(parent, level, totals) {
   );
 
   for (const row of rows) {
-    const points = await getTotalPoints(row.uid);
+    if (level >= 1 && level <= 10) {
+      const uidPurchases = await getTotalPoints(row.uid);
 
-    if (points > 0) {
-      if (level === 1) {
-        totals.lev1 += points;
-      } else if (level >= 2 && level <= 3) {
-        totals.lev23 += points;
-      } else if (level >= 4 && level <= 5) {
-        totals.lev45 += points;
-      } else if (level >= 6 && level <= 10) {
-        totals.lev610 += points;
+      if (uidPurchases > 0 && state.ctlLevel <= 10 && state.ctlLevel <= level) {
+        state.ctlLevel += 1;
+
+        state.totals.lev1 += uidPurchases;
+        state.totals.lev23 += uidPurchases;
+        state.totals.lev45 += uidPurchases;
+        state.totals.lev610 += uidPurchases;
+
+        if (state.ctlLevel >= level) {
+          state.ctlLevel = level;
+        }
       }
     }
 
-    await calculateUnilevel(row.uid, level + 1, totals);
+    await calculateUnilevel(row.uid, level + 1, state);
   }
 }
 
@@ -121,14 +129,17 @@ async function getUnilevel(uid) {
   const alreadyCalculated = await checkUnilevelTransDate(uid);
   if (alreadyCalculated) return 0;
 
-  const totals = { lev1: 0, lev23: 0, lev45: 0, lev610: 0 };
-  await calculateUnilevel(uid, 1, totals);
+  const state = {
+    ctlLevel: 0,
+    totals: { lev1: 0, lev23: 0, lev45: 0, lev610: 0 },
+  };
+  await calculateUnilevel(uid, 1, state);
 
   // Apply percentage rates
-  const unilevel1 = totals.lev1 * 0.05;    // 5%
-  const unilevel23 = totals.lev23 * 0.03;  // 3%
-  const unilevel45 = totals.lev45 * 0.02;  // 2%
-  const unilevel610 = totals.lev610 * 0.01; // 1%
+  const unilevel1 = state.totals.lev1 * 0.05;    // 5%
+  const unilevel23 = state.totals.lev23 * 0.03;  // 3%
+  const unilevel45 = state.totals.lev45 * 0.02;  // 2%
+  const unilevel610 = state.totals.lev610 * 0.01; // 1%
 
   const total = unilevel1 + unilevel23 + unilevel45 + unilevel610;
 

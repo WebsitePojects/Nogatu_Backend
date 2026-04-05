@@ -20,9 +20,10 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     let totalPaid = 0, totalFs = 0, totalCd = 0;
     for (const row of memberRows) {
-      if (row.codeid === 1) totalPaid += Number(row.cnt);
-      if (row.codeid === 2) totalFs += Number(row.cnt);
-      if (row.codeid === 3) totalCd += Number(row.cnt);
+      const codeid = Number(row.codeid || 0);
+      if (codeid === 1) totalPaid += Number(row.cnt);
+      if (codeid === 2) totalFs += Number(row.cnt);
+      if (codeid === 3) totalCd += Number(row.cnt);
     }
 
     // Total purchases (mirrors get_total_purchases)
@@ -38,6 +39,30 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     );
     const weeklyActivations = Number(weeklyRows[0]?.cnt || 0);
 
+    const [pendingEncashRows] = await pool.query(
+      `SELECT COUNT(*) as cnt FROM payouthistorytab
+       WHERE transactiontype = 10 AND cashstatus = 0`
+    );
+    const pendingEncashments = Number(pendingEncashRows[0]?.cnt || 0);
+
+    const [paidEncashRows] = await pool.query(
+      `SELECT COALESCE(SUM(encashment1), 0) as total FROM payouthistorytab
+       WHERE transactiontype = 10 AND cashstatus = 1`
+    );
+    const totalIncomePaidOut = Number(paidEncashRows[0]?.total || 0);
+
+    const [activeCdRows] = await pool.query(
+      `SELECT COUNT(*) as cnt FROM usertab
+       WHERE codeid = 3 AND cdstatus = 1`
+    );
+    const activeCdAccounts = Number(activeCdRows[0]?.cnt || 0);
+
+    const [monthRows] = await pool.query(
+      `SELECT COUNT(*) as cnt FROM usertab
+       WHERE MONTH(datereg) = MONTH(NOW()) AND YEAR(datereg) = YEAR(NOW())`
+    );
+    const newRegistrationsMonth = Number(monthRows[0]?.cnt || 0);
+
     res.json({
       totalAccounts: totalPaid + totalFs + totalCd,
       paidAccounts: totalPaid,
@@ -46,6 +71,10 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
       totalPurchases,
       weeklyActivations,
       totalEncashment: 0, // Hardcoded to 0 as in PHP
+      pendingEncashments,
+      totalIncomePaidOut,
+      activeCdAccounts,
+      newRegistrationsMonth,
     });
   } catch (err) {
     console.error('[Admin Dashboard] Error:', err);

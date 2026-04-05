@@ -5,8 +5,13 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
+
+function normalizeLegacyUsername(value) {
+  return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
+}
 
 /**
  * POST /api/auth/login
@@ -14,7 +19,7 @@ const { getAccountTypeName } = require('../utils/helpers');
  */
 router.post('/login', async (req, res) => {
   try {
-    const username = String(req.body.username || '').trim();
+    const username = normalizeLegacyUsername(req.body.username);
     const password = String(req.body.password || '');
 
     if (!username || !password) {
@@ -31,19 +36,39 @@ router.post('/login', async (req, res) => {
     );
 
     if (rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      return res.status(401).json({
+        error: 'Invalid username or password',
+        ...(process.env.NODE_ENV !== 'production' ? { debugCode: 'USER_NOT_FOUND' } : {}),
+      });
     }
 
     const user = rows[0];
+    const storedPassword = String(user.password || '');
 
     // Compare password — supports both bcrypt hashed and legacy plaintext
-    const isHashed = user.password && user.password.startsWith('$2');
+    const isHashed = storedPassword.startsWith('$2');
     let passwordMatch = false;
     if (isHashed) {
-      passwordMatch = await bcrypt.compare(password, user.password);
+      passwordMatch = await bcrypt.compare(password, storedPassword);
     } else {
-      // Legacy plaintext comparison — auto-upgrade to bcrypt on successful login
-      passwordMatch = (password === user.password);
+      // Legacy plaintext comparison — use DB-side compare first (mirrors PHP behavior)
+      const [plainRows] = await pool.query(
+        'SELECT uid FROM memberstab WHERE username = ? AND password = ? LIMIT 1',
+        [username, password]
+      );
+      passwordMatch = plainRows.length > 0 || password === storedPassword.trim();
+
+      // Legacy hash compatibility (for datasets migrated from older auth flows).
+      if (!passwordMatch && /^[a-f0-9]{32}$/i.test(storedPassword)) {
+        const md5 = crypto.createHash('md5').update(password).digest('hex');
+        passwordMatch = md5.toLowerCase() === storedPassword.toLowerCase();
+      }
+      if (!passwordMatch && /^[a-f0-9]{40}$/i.test(storedPassword)) {
+        const sha1 = crypto.createHash('sha1').update(password).digest('hex');
+        passwordMatch = sha1.toLowerCase() === storedPassword.toLowerCase();
+      }
+
+      // Auto-upgrade to bcrypt on successful legacy login.
       if (passwordMatch) {
         const hashed = await bcrypt.hash(password, 12);
         await pool.query('UPDATE memberstab SET password = ? WHERE uid = ?', [hashed, user.uid]);
@@ -51,7 +76,10 @@ router.post('/login', async (req, res) => {
     }
 
     if (!passwordMatch) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      return res.status(401).json({
+        error: 'Invalid username or password',
+        ...(process.env.NODE_ENV !== 'production' ? { debugCode: isHashed ? 'HASH_MISMATCH' : 'PLAINTEXT_MISMATCH' } : {}),
+      });
     }
 
     // Set session variables (mirrors PHP session exactly)

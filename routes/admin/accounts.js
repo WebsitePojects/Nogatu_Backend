@@ -8,19 +8,35 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName, ENTRY_TYPES } = require('../../utils/helpers');
-const { resolveTin, isValidTin } = require('../../utils/tin');
 
-let memberTinColumnReady = false;
+const PACKAGE_MAP = {
+  10: 'Bronze',
+  20: 'Silver',
+  30: 'Gold',
+  40: 'Platinum',
+  50: 'Garnet',
+  60: 'Diamond',
+};
 
-async function ensureMemberTinColumn() {
-  if (memberTinColumnReady) return;
+let tinColumnsChecked = false;
+let memberHasTinNoColumn = false;
 
-  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
-  if (columns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
+async function ensureMemberTinColumns() {
+  if (tinColumnsChecked) return;
+  try {
+    const [tinRows] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
+    if (tinRows.length === 0) {
+      await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL AFTER contactnos');
+      console.log('[Admin Accounts] Added memberstab.tin column');
+    }
+
+    const [tinNoRows] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tinno'");
+    memberHasTinNoColumn = tinNoRows.length > 0;
+
+    tinColumnsChecked = true;
+  } catch (err) {
+    console.error('[Admin Accounts] Failed ensuring TIN columns:', err.message);
   }
-
-  memberTinColumnReady = true;
 }
 
 /**
@@ -92,14 +108,16 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    await ensureMemberTinColumn();
-
+    await ensureMemberTinColumns();
     const uid = Number(req.params.uid);
+    const tinSelect = memberHasTinNoColumn
+      ? 'COALESCE(m.tin, m.tinno) AS tin, m.tinno'
+      : 'm.tin AS tin, NULL AS tinno';
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
               m.username, m.firstname, m.lastname, m.middlename,
-              m.address, m.contactnos, m.tin, m.payoutid, m.payoutdetails
+              m.address, m.contactnos, ${tinSelect}, m.payoutid, m.payoutdetails
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
       [uid]
@@ -109,11 +127,13 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    const account = rows[0];
+    const row = rows[0];
+    const resolvedTin = row.tin || row.tinno || null;
+
     res.json({
-      ...account,
-      tin: account.tin || null,
-      tinno: account.tin || null,
+      ...row,
+      tin: resolvedTin,
+      tinno: resolvedTin,
     });
   } catch (err) {
     console.error('[Admin Accounts] Get error:', err);
@@ -130,9 +150,40 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     await ensureMemberTinColumn();
 
+    await ensureMemberTinColumns();
     const uid = Number(req.params.uid);
     const { firstname, lastname, middlename, address, password,
-            payoutdetails, payoutoptions, contactnos } = req.body;
+            payoutdetails, payoutoptions, contactnos, tin, tinno } = req.body;
+
+    const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
+      || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
+
+    let normalizedTin = null;
+    if (hasTinField) {
+      normalizedTin = String(tin || tinno || '').trim();
+      if (normalizedTin && (normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin))) {
+        return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+      }
+    }
+
+    const setClauses = [
+      'firstname = ?',
+      'lastname = ?',
+      'middlename = ?',
+      'address = ?',
+      'payoutdetails = ?',
+      'payoutid = ?',
+      'contactnos = ?',
+    ];
+    const values = [
+      firstname,
+      lastname,
+      middlename,
+      address,
+      payoutdetails,
+      payoutoptions,
+      contactnos,
+    ];
 
     const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
       || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
@@ -172,7 +223,18 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       values.push(hashedPassword);
     }
 
+    if (hasTinField) {
+      setClauses.push('tin = ?');
+      values.push(normalizedTin || null);
+
+      if (memberHasTinNoColumn) {
+        setClauses.push('tinno = ?');
+        values.push(normalizedTin || null);
+      }
+    }
+
     values.push(uid);
+
     await pool.query(
       `UPDATE memberstab SET ${setClauses.join(', ')}
        WHERE uid = ? LIMIT 1`,
@@ -247,14 +309,20 @@ router.post('/change-password', adminAuth, adminRights([1, 3]), async (req, res)
   }
 });
 
-/**
- * GET /api/admin/accounts/:uid/income
- * Income transaction details for a member (transactiontype=1)
- * Mirrors PHP adminpanel/accounts-income-details.php
- */
-router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
+async function handleIncomeDetails(req, res) {
   try {
     const uid = Number(req.params.uid);
+    if (!Number.isFinite(uid) || uid <= 0) {
+      return res.status(400).json({ error: 'Invalid account reference' });
+    }
+
+    const txPage = Math.max(1, Number(req.query.txPage) || 1);
+    const txPerPage = Math.min(100, Math.max(1, Number(req.query.txPerPage) || 20));
+    const txOffset = (txPage - 1) * txPerPage;
+
+    const pairingPage = Math.max(1, Number(req.query.pairingPage) || 1);
+    const pairingPerPage = Math.min(100, Math.max(1, Number(req.query.pairingPerPage) || 20));
+    const pairingOffset = (pairingPage - 1) * pairingPerPage;
 
     // Member info
     const [memberRows] = await pool.query(
@@ -265,8 +333,8 @@ router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
     if (memberRows.length === 0) return res.status(404).json({ error: 'Account not found' });
     const member = memberRows[0];
 
-    // Income transactions (type 1 = income credit)
-    const [txRows] = await pool.query(
+    // Income transactions kept for backward compatibility with existing frontend.
+    const [incomeTxRows] = await pool.query(
       `SELECT pid, transdate, beginningbalance, endingbalance,
               income1, income2, income3, income4, income5, income6
        FROM payouthistorytab
@@ -275,19 +343,65 @@ router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
       [uid]
     );
 
+    // Full transaction history with pagination.
+    const [txCountRows] = await pool.query(
+      'SELECT COUNT(*) AS total FROM payouthistorytab WHERE uid = ?',
+      [uid]
+    );
+    const txTotal = Number(txCountRows[0]?.total || 0);
+
+    const [historyRows] = await pool.query(
+      `SELECT pid,
+              DATE_FORMAT(transdate, '%Y-%m-%d %H:%i') AS transdate,
+              DATE_FORMAT(cashtransdate, '%Y-%m-%d %H:%i') AS cashtransdate,
+              beginningbalance, endingbalance,
+              income1, income2, income3, income4, income5, income6,
+              encashment1, tax_1 AS tax, encashmentfee AS fee, cddeduction,
+              transactiontype, cashstatus
+       FROM payouthistorytab
+       WHERE uid = ?
+       ORDER BY pid DESC
+       LIMIT ?, ?`,
+      [uid, txOffset, txPerPage]
+    );
+
     // Cumulative income totals
     const [totalsRows] = await pool.query(
       `SELECT ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome6, ttlcashbalance
        FROM payouttotaltab WHERE uid = ? LIMIT 1`,
       [uid]
     );
-    const totals = totalsRows[0] || {};
+    const totals = totalsRows[0] || {
+      ttlincome1: 0,
+      ttlincome2: 0,
+      ttlincome3: 0,
+      ttlincome4: 0,
+      ttlincome5: 0,
+      ttlincome6: 0,
+      ttlcashbalance: 0,
+    };
 
-    // Direct referrals (sponsor tree)
+    // Direct referral contributors (paid accounts only).
     const [drefRows] = await pool.query(
-      `SELECT m.firstname, m.lastname, m.username, u.currentaccttype, u.datereg
+      `SELECT m.firstname, m.lastname, m.username,
+              u.currentaccttype, u.datereg, u.directreferral
        FROM usertab u INNER JOIN memberstab m ON m.uid = u.uid
-       WHERE u.drefid = ? ORDER BY u.datereg DESC`,
+       WHERE u.drefid = ? AND u.codeid = 1
+       ORDER BY u.datereg DESC`,
+      [uid]
+    );
+
+    // Upgrade referral contributors (transtype=1).
+    const [upgradeRows] = await pool.query(
+      `SELECT m.firstname, m.lastname, m.username, u.currentaccttype,
+              COALESCE(SUM(up.incentivepoints), 0) AS upgradeReferral,
+              DATE_FORMAT(MAX(up.transdate), '%Y-%m-%d %H:%i') AS lastUpgradeDate
+       FROM upgradetab up
+       INNER JOIN usertab u ON u.uid = up.uid
+       INNER JOIN memberstab m ON m.uid = u.uid
+       WHERE u.drefid = ? AND up.transtype = 1
+       GROUP BY up.uid, m.firstname, m.lastname, m.username, u.currentaccttype
+       ORDER BY MAX(up.transdate) DESC`,
       [uid]
     );
 
@@ -299,7 +413,7 @@ router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
       [uid]
     );
 
-    // Leadership binary downline L1–L3
+    // Leadership binary downline L1-L3.
     const [ldrsRows] = await pool.query(
       `SELECT m1.firstname, m1.lastname, m1.username, u1.currentaccttype, 'L1' AS lvl
        FROM usertab u1 INNER JOIN memberstab m1 ON m1.uid = u1.uid WHERE u1.refid = ?
@@ -318,7 +432,89 @@ router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
       [uid, uid, uid]
     );
 
-    const pkgMap = { 10: 'Bronze', 20: 'Silver', 30: 'Gold', 40: 'Platinum', 50: 'Garnet', 60: 'Diamond' };
+    // Pairing history records for audit/detail section.
+    const [pairingCountRows] = await pool.query(
+      'SELECT COUNT(*) AS total FROM pairingstab WHERE uid = ?',
+      [uid]
+    );
+    const pairingTotal = Number(pairingCountRows[0]?.total || 0);
+
+    const [pairingRows] = await pool.query(
+      `SELECT DATE_FORMAT(transdate, '%Y-%m-%d') AS transdate,
+              weeknumber,
+              \`left\`, \`right\`,
+              totalpoints, totalbpay,
+              totalleft, totalright,
+              totalpointsleft, totalpointsright
+       FROM pairingstab
+       WHERE uid = ?
+       ORDER BY transdate DESC, id DESC
+       LIMIT ?, ?`,
+      [uid, pairingOffset, pairingPerPage]
+    );
+
+    const directReferrals = drefRows.map(r => ({
+      name: `${r.firstname} ${r.lastname}`,
+      username: r.username,
+      pkg: PACKAGE_MAP[r.currentaccttype] || '',
+      datereg: r.datereg,
+      directReferralAmount: Number(r.directreferral || 0),
+    }));
+
+    const upgradeReferralContributors = upgradeRows.map(r => ({
+      name: `${r.firstname} ${r.lastname}`,
+      username: r.username,
+      pkg: PACKAGE_MAP[r.currentaccttype] || '',
+      upgradeReferralAmount: Number(r.upgradeReferral || 0),
+      lastUpgradeDate: r.lastUpgradeDate,
+    }));
+
+    const directReferralContributorTotal =
+      directReferrals.reduce((sum, r) => sum + Number(r.directReferralAmount || 0), 0) +
+      upgradeReferralContributors.reduce((sum, r) => sum + Number(r.upgradeReferralAmount || 0), 0);
+
+    const transactionHistory = historyRows.map(r => {
+      const incomeTotal =
+        Number(r.income1 || 0) +
+        Number(r.income2 || 0) +
+        Number(r.income3 || 0) +
+        Number(r.income4 || 0) +
+        Number(r.income5 || 0) +
+        Number(r.income6 || 0);
+      const deductions = Number(r.tax || 0) + Number(r.fee || 0) + Number(r.cddeduction || 0);
+
+      return {
+        pid: r.pid,
+        transdate: r.transdate,
+        cashtransdate: r.cashtransdate,
+        transactionType: Number(r.transactiontype || 0),
+        transactionTypeName:
+          Number(r.transactiontype || 0) === 1
+            ? 'Income'
+            : Number(r.transactiontype || 0) === 10
+              ? 'Encashment'
+              : 'Other',
+        status: Number(r.cashstatus || 0),
+        beginningbalance: Number(r.beginningbalance || 0),
+        endingbalance: Number(r.endingbalance || 0),
+        income1: Number(r.income1 || 0),
+        income2: Number(r.income2 || 0),
+        income3: Number(r.income3 || 0),
+        income4: Number(r.income4 || 0),
+        income5: Number(r.income5 || 0),
+        income6: Number(r.income6 || 0),
+        totalIncome: incomeTotal,
+        encashment: Number(r.encashment1 || 0),
+        tax: Number(r.tax || 0),
+        fee: Number(r.fee || 0),
+        cdDeduction: Number(r.cddeduction || 0),
+        deductions,
+        netAmount:
+          Number(r.transactiontype || 0) === 10
+            ? Number(r.encashment1 || 0)
+            : incomeTotal,
+      };
+    });
 
     res.json({
       member: {
@@ -326,45 +522,85 @@ router.get('/:uid/income', adminAuth, adminRights([1, 3]), async (req, res) => {
         username: member.username,
         fullname: `${member.firstname} ${member.lastname}`,
       },
-      totals,
-      transactions: txRows.map(r => ({
+      totals: {
+        ttlincome1: Number(totals.ttlincome1 || 0),
+        ttlincome2: Number(totals.ttlincome2 || 0),
+        ttlincome3: Number(totals.ttlincome3 || 0),
+        ttlincome4: Number(totals.ttlincome4 || 0),
+        ttlincome5: Number(totals.ttlincome5 || 0),
+        ttlincome6: Number(totals.ttlincome6 || 0),
+        ttlcashbalance: Number(totals.ttlcashbalance || 0),
+      },
+      // Backward-compatible key consumed by existing UI.
+      transactions: incomeTxRows.map(r => ({
         pid: r.pid,
         transdate: r.transdate,
-        beginningbalance: Number(r.beginningbalance),
-        endingbalance: Number(r.endingbalance),
-        income1: Number(r.income1),
-        income2: Number(r.income2),
-        income3: Number(r.income3),
-        income4: Number(r.income4),
-        income5: Number(r.income5),
-        income6: Number(r.income6),
-        total: Number(r.income1) + Number(r.income2) + Number(r.income3) +
-               Number(r.income4) + Number(r.income5) + Number(r.income6),
+         beginningbalance: Number(r.beginningbalance || 0),
+         endingbalance: Number(r.endingbalance || 0),
+         income1: Number(r.income1 || 0),
+         income2: Number(r.income2 || 0),
+         income3: Number(r.income3 || 0),
+         income4: Number(r.income4 || 0),
+         income5: Number(r.income5 || 0),
+         income6: Number(r.income6 || 0),
+         total: Number(r.income1 || 0) + Number(r.income2 || 0) + Number(r.income3 || 0) +
+           Number(r.income4 || 0) + Number(r.income5 || 0) + Number(r.income6 || 0),
       })),
-      directReferrals: drefRows.map(r => ({
-        name: `${r.firstname} ${r.lastname}`,
-        username: r.username,
-        pkg: pkgMap[r.currentaccttype] || '',
-        datereg: r.datereg,
-      })),
+      transactionHistory,
+      transactionPagination: {
+        page: txPage,
+        perPage: txPerPage,
+        total: txTotal,
+        totalPages: Math.max(1, Math.ceil(txTotal / txPerPage)),
+      },
+      directReferrals,
+      directReferralContributors: directReferrals,
+      upgradeReferralContributors,
+      directReferralComputedTotal: directReferralContributorTotal,
       binaryChildren: pairRows.map(r => ({
         name: `${r.firstname} ${r.lastname}`,
         username: r.username,
-        pkg: pkgMap[r.currentaccttype] || '',
-        side: r.position === 1 ? 'Left' : 'Right',
+        pkg: PACKAGE_MAP[r.currentaccttype] || '',
+        side: Number(r.position || 0) === 1 ? 'Left' : 'Right',
       })),
       leadershipDownline: ldrsRows.map(r => ({
         name: `${r.firstname} ${r.lastname}`,
         username: r.username,
-        pkg: pkgMap[r.currentaccttype] || '',
+        pkg: PACKAGE_MAP[r.currentaccttype] || '',
         lvl: r.lvl,
       })),
+      pairingRecords: pairingRows.map(r => ({
+        transdate: r.transdate,
+        weeknumber: Number(r.weeknumber || 0),
+        left: Number(r.left || 0),
+        right: Number(r.right || 0),
+        totalpoints: Number(r.totalpoints || 0),
+        totalbpay: Number(r.totalbpay || 0),
+        totalleft: Number(r.totalleft || 0),
+        totalright: Number(r.totalright || 0),
+        totalpointsleft: Number(r.totalpointsleft || 0),
+        totalpointsright: Number(r.totalpointsright || 0),
+      })),
+      pairingPagination: {
+        page: pairingPage,
+        perPage: pairingPerPage,
+        total: pairingTotal,
+        totalPages: Math.max(1, Math.ceil(pairingTotal / pairingPerPage)),
+      },
     });
   } catch (err) {
     console.error('[Admin Accounts] Income details error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
+
+/**
+ * GET /api/admin/accounts/:uid/income
+ * GET /api/admin/accounts/:uid/income-details
+ * Income transaction details for a member
+ */
+router.get('/:uid/income', adminAuth, adminRights([1, 3]), handleIncomeDetails);
+router.get('/:uid/income-details', adminAuth, adminRights([1, 3]), handleIncomeDetails);
 
 /**
  * GET /api/admin/accounts/:uid/cd

@@ -7,7 +7,6 @@ const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
 const { insertEncashment } = require('../services/income/insertIncome');
-const { pool } = require('../config/database');
 
 /**
  * GET /api/wallet
@@ -42,30 +41,36 @@ router.get('/', memberAuth, async (req, res) => {
 
 /**
  * POST /api/wallet/encash
- * Process encashment (minimum 500)
+ * Process encashment
  */
 router.post('/encash', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
     const amount = Number(req.body.amount);
 
-    if (!amount || isNaN(amount) || amount < 500) {
-      return res.status(400).json({ error: 'Minimum encashment is ₱500' });
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
 
-    // Get user info for CD deduction check
-    const [userRows] = await pool.query(
-      'SELECT codeid, cdstatus, cdamount, cdtotal FROM usertab WHERE uid = ?',
-      [uid]
-    );
+    const result = await insertEncashment(uid, amount);
 
-    const userInfo = userRows[0] || {};
-    const result = await insertEncashment(uid, amount, userInfo);
-
-    res.json({ success: true, ...result });
+    res.json({
+      success: true,
+      pid: result.pid,
+      cdDeduction: Number(result.cdDeduction || 0),
+      netReceivable: Number(result.netReceivable || 0),
+      newBalance: Number(result.newBalance || 0),
+      paymentOption: result.paymentOption || null,
+      paymentDetails: result.paymentDetails || null,
+      payoutDate: result.payoutDate || null,
+      ...result,
+    });
   } catch (err) {
     console.error('[Wallet] Encashment error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    if (err.message === 'Invalid encashment amount') {
+      return res.status(400).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

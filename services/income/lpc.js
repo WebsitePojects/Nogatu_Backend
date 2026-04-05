@@ -4,22 +4,23 @@
  *
  * Income Type 6 (income6)
  * - 10% of each downline member's previous month pairing
- * - Capped at 1000 per member
- * - Traverses entire downline recursively via drefid (sponsor tree)
+ * - Capped at 1000 per pairing record
+ * - Traverses direct children only via drefid (sponsor tree)
  * - Calculated ONCE PER MONTH — guarded by incometransdatetab incometype=6
  */
 const { pool } = require('../../config/database');
 const { previousMonthRange } = require('../../utils/helpers');
 
 /**
- * Get previous month pairing total for a specific user
+ * Get previous month pairing records for a specific user
  * Mirrors PHP get_lpcpairing()
  */
-async function getLpcPairing(uid) {
+async function getLpcPairingRecords(uid) {
   const { start, end } = previousMonthRange();
 
   const [rows] = await pool.query(
-    `SELECT SUM(totalpoints) as ttlpoints
+    `SELECT DATE_FORMAT(transdate, '%Y-%m-%d') as transdate,
+            totalpoints
      FROM pairingstab
      WHERE uid = ?
        AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
@@ -27,23 +28,20 @@ async function getLpcPairing(uid) {
     [uid, start, end]
   );
 
-  return Number(rows[0]?.ttlpoints || 0);
+  return rows;
 }
 
 /**
- * Recursively traverse downline via drefid to collect all member UIDs
+ * Get direct sponsor-tree children
  * Mirrors PHP get_numlevels() for LPC
  */
-async function getDownlineMembers(parent, members) {
+async function getDirectChildren(parent) {
   const [rows] = await pool.query(
     'SELECT uid FROM usertab WHERE drefid = ?',
     [parent]
   );
 
-  for (const row of rows) {
-    members.push(row.uid);
-    await getDownlineMembers(row.uid, members);
-  }
+  return rows.map((row) => row.uid);
 }
 
 /**
@@ -91,20 +89,31 @@ async function getLPC(uid) {
   const alreadyCalculated = await checkLpcTransDate(uid);
   if (alreadyCalculated) return 0;
 
-  const members = [];
-  await getDownlineMembers(uid, members);
+  const directChildren = await getDirectChildren(uid);
+  const pairingRecords = [];
+
+  for (const childUid of directChildren) {
+    const childRecords = await getLpcPairingRecords(childUid);
+    for (const record of childRecords) {
+      pairingRecords.push({
+        transdate: record.transdate,
+        totalpoints: Number(record.totalpoints || 0),
+      });
+    }
+  }
+
+  pairingRecords.sort((a, b) => {
+    if (a.transdate < b.transdate) return -1;
+    if (a.transdate > b.transdate) return 1;
+    return 0;
+  });
 
   let totalLpc = 0;
 
-  for (const memberUid of members) {
-    const pairingTotal = await getLpcPairing(memberUid);
-
-    if (pairingTotal > 0) {
-      // 10% commission, capped at 1000 per member
-      let lpc = pairingTotal * 0.1;
-      lpc = Math.min(lpc, 1000);
-      totalLpc += lpc;
-    }
+  for (const record of pairingRecords) {
+    let lpc = Number(record.totalpoints || 0) * 0.1;
+    if (lpc >= 1000) lpc = 1000;
+    totalLpc += lpc;
   }
 
   // Mark as calculated this month to prevent repeat on next page load

@@ -250,8 +250,8 @@ async function registerMember({
   try {
     await conn.beginTransaction();
 
-    const normalizedTin = normalizeTin(tin);
-    if (!isValidTin(normalizedTin)) {
+    const normalizedTin = String(tin || '').trim();
+    if (!normalizedTin || normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
 

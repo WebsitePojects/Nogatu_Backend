@@ -15,13 +15,20 @@ const { getPairingCounts } = require('../services/network');
 router.get('/', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = 50;
 
     const [reports, counts] = await Promise.all([
       getPairingReport(uid),
       getPairingCounts(uid),
     ]);
 
-    res.json({ reports, counts });
+    const total = reports.length;
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    const start = (page - 1) * perPage;
+    const pageReports = reports.slice(start, start + perPage);
+
+    res.json({ reports: pageReports, counts, page, totalPages, total });
   } catch (err) {
     console.error('[Pairing] Error:', err);
     res.status(500).json({ error: 'Internal server error' });

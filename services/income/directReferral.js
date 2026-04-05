@@ -28,7 +28,7 @@ async function getDREF(uid) {
 
   // Query all paid direct referrals (codeid = 1)
   const [rows] = await pool.query(
-    'SELECT uid, accttype, directreferral FROM usertab WHERE drefid = ? AND codeid = 1',
+    'SELECT uid, accttype, currentaccttype, directreferral FROM usertab WHERE drefid = ? AND codeid = 1',
     [uid]
   );
 
@@ -37,8 +37,9 @@ async function getDREF(uid) {
 
   for (const row of rows) {
     totalDref += Number(row.directreferral || 0);
-    if (countByType.hasOwnProperty(row.accttype)) {
-      countByType[row.accttype]++;
+    const acctType = Number(row.currentaccttype || row.accttype || 0);
+    if (countByType.hasOwnProperty(acctType)) {
+      countByType[acctType]++;
     }
   }
 

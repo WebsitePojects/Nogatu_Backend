@@ -48,6 +48,15 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+const legacyImageDir = path.resolve(__dirname, '../public_html/img');
+if (fs.existsSync(legacyImageDir)) {
+  app.use('/legacy-img', express.static(legacyImageDir));
+}
+
+const SESSION_TABLE = /^[A-Za-z0-9_]+$/.test(process.env.SESSION_TABLE || '')
+  ? process.env.SESSION_TABLE
+  : 'app_sessions';
+
 // ─── Session store (MySQL — prevents memory leaks) ────────────
 const sessionStore = new MySQLStore({
   expiration: 24 * 60 * 60 * 1000,  // 24 hours in ms
@@ -55,7 +64,7 @@ const sessionStore = new MySQLStore({
   clearExpired: true,                 // auto-deletes expired sessions
   checkExpirationInterval: 15 * 60 * 1000, // clean up every 15 minutes
   schema: {
-    tableName: 'sessions',
+    tableName: SESSION_TABLE,
     columnNames: {
       session_id: 'session_id',
       expires: 'expires',
@@ -64,13 +73,87 @@ const sessionStore = new MySQLStore({
   },
 }, pool);
 
+async function ensureSessionsTable() {
+  const [tables] = await pool.query(`SHOW TABLES LIKE '${SESSION_TABLE}'`);
+  if (tables.length > 0) {
+    console.log(`[Server] Session table ready: ${SESSION_TABLE}`);
+    return;
+  }
+
+  const createSessionsTableSql = `
+    CREATE TABLE IF NOT EXISTS ${SESSION_TABLE} (
+      session_id varchar(128) COLLATE utf8mb4_bin NOT NULL,
+      expires int(11) unsigned NOT NULL,
+      data mediumtext COLLATE utf8mb4_bin,
+      PRIMARY KEY (session_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+  `;
+
+  try {
+    await pool.query(createSessionsTableSql);
+    console.log(`[Server] Session table ready: ${SESSION_TABLE}`);
+  } catch (error) {
+    if (error.code === 'ER_TABLESPACE_EXISTS') {
+      console.error(`[Server] Session table create failed for ${SESSION_TABLE} due to tablespace conflict.`);
+      console.error('[Server] Set SESSION_TABLE in .env.development to a new table name (example: app_sessions_v2).');
+      throw error;
+    }
+
+    throw error;
+  }
+}
+
+async function logAuthTableSnapshot() {
+  try {
+    const [[memberRows], [adminRows]] = await Promise.all([
+      pool.query('SELECT COUNT(*) AS total FROM memberstab').then(([rows]) => rows),
+      pool.query('SELECT COUNT(*) AS total FROM accesstab').then(([rows]) => rows),
+    ]);
+
+    console.log(`[Server] Auth snapshot: memberstab=${memberRows.total}, accesstab=${adminRows.total}`);
+
+    if (Number(memberRows.total) === 0 || Number(adminRows.total) === 0) {
+      console.warn('[Server] Warning: auth tables appear empty. Verify DB_NAME/credentials for this environment.');
+    }
+  } catch (error) {
+    console.warn('[Server] Auth snapshot unavailable:', error.message);
+  }
+}
+
+async function ensurePasswordColumns() {
+  const [memberCols] = await pool.query(
+    "SHOW COLUMNS FROM memberstab LIKE 'password'"
+  );
+  if (memberCols.length > 0) {
+    const memberType = String(memberCols[0].Type || '').toLowerCase();
+    if (!memberType.includes('varchar(255)')) {
+      await pool.query('ALTER TABLE memberstab MODIFY COLUMN password VARCHAR(255) NULL');
+      console.log('[Server] Updated memberstab.password to VARCHAR(255)');
+    }
+  }
+
+  const [adminCols] = await pool.query(
+    "SHOW COLUMNS FROM accesstab LIKE 'password'"
+  );
+  if (adminCols.length > 0) {
+    const adminType = String(adminCols[0].Type || '').toLowerCase();
+    if (!adminType.includes('varchar(255)')) {
+      await pool.query('ALTER TABLE accesstab MODIFY COLUMN password VARCHAR(255) NULL');
+      console.log('[Server] Updated accesstab.password to VARCHAR(255)');
+    }
+  }
+}
+
 // Validate session secret
+if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
+  throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
 if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
   throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
 }
 
 // Session config
 app.use(session({
+  secret: String(process.env.SESSION_SECRET),
   secret: String(process.env.SESSION_SECRET),
   store: sessionStore,
   resave: false,
@@ -111,7 +194,6 @@ app.use('/api/news', require('./routes/news'));
 app.use('/api/stats', require('./routes/stats'));
 app.use('/api/vouchers', require('./routes/vouchers'));
 app.use('/api/ranking', require('./routes/ranking'));
-app.use('/api/contact', require('./routes/contact'));
 
 // Admin routes
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -124,7 +206,6 @@ app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
 app.use('/api/admin/news', require('./routes/admin/news'));
 app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
 app.use('/api/admin/rankings', require('./routes/admin/rankings'));
-app.use('/api/admin/messages', require('./routes/admin/messages'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {
@@ -143,6 +224,15 @@ app.use((err, req, res, next) => {
 // ─── Start ───────────────────────────────────────────────────
 async function start() {
   await testConnection();
+  await ensurePasswordColumns();
+  await logAuthTableSnapshot();
+  await ensureSessionsTable();
+
+  // Wait for store internals to be ready before accepting requests.
+  if (typeof sessionStore.onReady === 'function') {
+    await sessionStore.onReady();
+  }
+
   const server = app.listen(PORT, () => {
     console.log(`[Server] NOGATU Alliance running on http://localhost:${PORT}`);
     console.log(`[Server] API available at http://localhost:${PORT}/api`);
