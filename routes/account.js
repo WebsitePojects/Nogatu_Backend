@@ -8,17 +8,21 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 
-let memberTinColumnReady = false;
+let memberTinColumnsReady = false;
+let memberHasTinNoColumn = false;
 
-async function ensureMemberTinColumn() {
-  if (memberTinColumnReady) return;
+async function ensureMemberTinColumns() {
+  if (memberTinColumnsReady) return;
 
   const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
   if (columns.length === 0) {
     await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
   }
 
-  memberTinColumnReady = true;
+  const [tinNoColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tinno'");
+  memberHasTinNoColumn = tinNoColumns.length > 0;
+
+  memberTinColumnsReady = true;
 }
 
 /**
@@ -27,15 +31,18 @@ async function ensureMemberTinColumn() {
  */
 router.get('/', memberAuth, async (req, res) => {
   try {
-    await ensureMemberTinColumn();
+    await ensureMemberTinColumns();
 
     const uid = req.session.uid;
+    const tinSelect = memberHasTinNoColumn
+      ? 'COALESCE(m.tin, m.tinno) AS tin, m.tinno'
+      : 'm.tin AS tin, NULL AS tinno';
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
               m.uid as mUid, m.username, m.password, m.firstname, m.lastname,
               m.middlename, m.address, m.contactnos, m.payoutid, m.payoutdetails,
-              m.email, m.fbaccount, m.gender, m.dob, m.tin
+              m.email, m.fbaccount, m.gender, m.dob, ${tinSelect}
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
       [uid]
@@ -46,6 +53,7 @@ router.get('/', memberAuth, async (req, res) => {
     }
 
     const user = rows[0];
+    const resolvedTin = user.tin || user.tinno || null;
     res.json({
       uid: user.uid,
       username: user.username,
@@ -56,7 +64,8 @@ router.get('/', memberAuth, async (req, res) => {
       address: user.address,
       contactnos: user.contactnos,
       email: user.email,
-      tin: user.tin,
+      tin: resolvedTin,
+      tinno: resolvedTin,
       payoutid: user.payoutid,
       payoutdetails: user.payoutdetails,
       accttype: user.currentaccttype,
@@ -76,26 +85,53 @@ router.get('/', memberAuth, async (req, res) => {
  */
 router.put('/', memberAuth, async (req, res) => {
   try {
-    const uid = req.session.uid;
-    const { address, password, payoutdetails, payoutoptions, contactnos } = req.body;
+    await ensureMemberTinColumns();
 
-    // Build update query — only update password if provided
+    const uid = req.session.uid;
+    const { address, password, payoutdetails, payoutoptions, contactnos, tin, tinno } = req.body;
+
+    const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
+      || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
+
+    let normalizedTin = null;
+    if (hasTinField) {
+      normalizedTin = String(tin || tinno || '').trim();
+      if (normalizedTin && (normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin))) {
+        return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+      }
+    }
+
+    const setClauses = [
+      'address = ?',
+      'payoutdetails = ?',
+      'payoutid = ?',
+      'contactnos = ?',
+    ];
+    const values = [address, payoutdetails, payoutoptions, contactnos];
+
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);
-      await pool.query(
-        `UPDATE memberstab SET address = ?, password = ?,
-         payoutdetails = ?, payoutid = ?, contactnos = ?
-         WHERE uid = ? LIMIT 1`,
-        [address, hashedPassword, payoutdetails, payoutoptions, contactnos, uid]
-      );
-    } else {
-      await pool.query(
-        `UPDATE memberstab SET address = ?,
-         payoutdetails = ?, payoutid = ?, contactnos = ?
-         WHERE uid = ? LIMIT 1`,
-        [address, payoutdetails, payoutoptions, contactnos, uid]
-      );
+      setClauses.push('password = ?');
+      values.push(hashedPassword);
     }
+
+    if (hasTinField) {
+      setClauses.push('tin = ?');
+      values.push(normalizedTin || null);
+
+      if (memberHasTinNoColumn) {
+        setClauses.push('tinno = ?');
+        values.push(normalizedTin || null);
+      }
+    }
+
+    values.push(uid);
+
+    await pool.query(
+      `UPDATE memberstab SET ${setClauses.join(', ')}
+       WHERE uid = ? LIMIT 1`,
+      values
+    );
 
     const [result] = await pool.query(
       'SELECT uid FROM memberstab WHERE uid = ?', [uid]
