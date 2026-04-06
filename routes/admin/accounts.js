@@ -148,8 +148,6 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    await ensureMemberTinColumn();
-
     await ensureMemberTinColumns();
     const uid = Number(req.params.uid);
     const { firstname, lastname, middlename, address, password,
@@ -185,33 +183,6 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       contactnos,
     ];
 
-    const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
-      || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
-    const normalizedTin = resolveTin(req.body);
-
-    if (hasTinField && normalizedTin && !isValidTin(normalizedTin)) {
-      return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
-    }
-
-    const setClauses = [
-      'firstname = ?',
-      'lastname = ?',
-      'middlename = ?',
-      'address = ?',
-      'payoutdetails = ?',
-      'payoutid = ?',
-      'contactnos = ?',
-    ];
-    const values = [
-      firstname,
-      lastname,
-      middlename,
-      address,
-      payoutdetails,
-      payoutoptions,
-      contactnos,
-    ];
-
     if (hasTinField) {
       setClauses.push('tin = ?');
       values.push(normalizedTin || null);
@@ -223,14 +194,9 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       values.push(hashedPassword);
     }
 
-    if (hasTinField) {
-      setClauses.push('tin = ?');
+    if (hasTinField && memberHasTinNoColumn) {
+      setClauses.push('tinno = ?');
       values.push(normalizedTin || null);
-
-      if (memberHasTinNoColumn) {
-        setClauses.push('tinno = ?');
-        values.push(normalizedTin || null);
-      }
     }
 
     values.push(uid);

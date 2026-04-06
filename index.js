@@ -147,13 +147,10 @@ async function ensurePasswordColumns() {
 // Validate session secret
 if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
   throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
-if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
-  throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
 }
 
 // Session config
 app.use(session({
-  secret: String(process.env.SESSION_SECRET),
   secret: String(process.env.SESSION_SECRET),
   store: sessionStore,
   resave: false,
