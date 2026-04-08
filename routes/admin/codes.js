@@ -50,8 +50,8 @@ router.get('/', adminAuth, async (req, res) => {
     const offset = (page - 1) * perPage;
     const q = (req.query.q || '').trim();
 
-    // Cashier (rights=2) can only manage transferable released codes.
-    let whereSql = adminRight === 2 ? 'WHERE codestatus = 1' : 'WHERE codestatus <= 2';
+    // Cashier (rights=2) can manage transfer/release-ready codes only.
+    let whereSql = adminRight === 2 ? 'WHERE codestatus <= 1' : 'WHERE codestatus <= 2';
     const whereParams = [];
     if (q) {
       whereSql += ' AND code LIKE ?';
@@ -129,7 +129,7 @@ router.get('/lookup-account', adminAuth, adminRights([1, 2, 3]), async (req, res
  * POST /api/admin/codes/release
  * Release codes for distribution
  */
-router.post('/release', adminAuth, adminRights([1, 3]), async (req, res) => {
+router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
     const { codes: selectedCodes } = req.body;
     let released = 0;

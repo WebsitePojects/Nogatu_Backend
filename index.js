@@ -144,6 +144,20 @@ async function ensurePasswordColumns() {
   }
 }
 
+async function ensureDevelopmentAdminPasswords() {
+  if (process.env.NODE_ENV === 'production') return;
+
+  const devAdminPassword = String(process.env.DEV_ADMIN_PASSWORD || '1');
+  if (!devAdminPassword) return;
+
+  const [result] = await pool.query(
+    'UPDATE accesstab SET password = ? WHERE password IS NULL OR password <> ?',
+    [devAdminPassword, devAdminPassword]
+  );
+
+  console.log(`[Server] Development admin passwords normalized to DEV_ADMIN_PASSWORD (${result.affectedRows} row(s) updated).`);
+}
+
 // Validate session secret
 if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
   throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
@@ -191,6 +205,9 @@ app.use('/api/news', require('./routes/news'));
 app.use('/api/stats', require('./routes/stats'));
 app.use('/api/vouchers', require('./routes/vouchers'));
 app.use('/api/ranking', require('./routes/ranking'));
+app.use('/api/leaderboard', require('./routes/leaderboard'));
+app.use('/api/global-bonus', require('./routes/globalBonus'));
+app.use('/api/contact', require('./routes/contact'));
 
 // Admin routes
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -202,7 +219,11 @@ app.use('/api/admin/redeem', require('./routes/admin/redeem'));
 app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
 app.use('/api/admin/news', require('./routes/admin/news'));
 app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
+app.use('/api/admin/voucher-management', require('./routes/admin/voucherManagement'));
 app.use('/api/admin/rankings', require('./routes/admin/rankings'));
+app.use('/api/admin/global-bonus', require('./routes/admin/globalBonus'));
+app.use('/api/admin/messages', require('./routes/admin/messages'));
+app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {
@@ -222,6 +243,7 @@ app.use((err, req, res, next) => {
 async function start() {
   await testConnection();
   await ensurePasswordColumns();
+  await ensureDevelopmentAdminPasswords();
   await logAuthTableSnapshot();
   await ensureSessionsTable();
 

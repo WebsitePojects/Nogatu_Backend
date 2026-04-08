@@ -64,7 +64,8 @@ router.post('/login', async (req, res) => {
         passwordMatch = sha1.toLowerCase() === storedPassword.toLowerCase();
       }
 
-      if (passwordMatch) {
+      // Keep plaintext admin passwords in development when requested.
+      if (passwordMatch && process.env.NODE_ENV === 'production') {
         const hashed = await bcrypt.hash(password, 12);
         await pool.query('UPDATE accesstab SET password = ? WHERE username = ?', [hashed, admin.username]);
       }
