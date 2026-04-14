@@ -48,9 +48,17 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const legacyImageDir = path.resolve(__dirname, '../public_html/img');
-if (fs.existsSync(legacyImageDir)) {
+const legacyImageCandidates = [
+  path.resolve(__dirname, '../public_html/img'),
+  path.resolve(__dirname, '../public_html(Original_Code)/img'),
+  path.resolve(__dirname, '../reference_system/public_html(latest_production_code)/img'),
+];
+const legacyImageDir = legacyImageCandidates.find((dir) => fs.existsSync(dir));
+if (legacyImageDir) {
   app.use('/legacy-img', express.static(legacyImageDir));
+  console.log(`[Server] Serving legacy images from: ${legacyImageDir}`);
+} else {
+  console.warn('[Server] Legacy image directory not found. /legacy-img route is disabled.');
 }
 
 const SESSION_TABLE = /^[A-Za-z0-9_]+$/.test(process.env.SESSION_TABLE || '')

@@ -29,6 +29,15 @@ const PACKAGE_LABELS = {
   60: 'Diamond',
 };
 
+const RANK_REFRESH_MAX_AGE_MINUTES = 15;
+
+async function ensureIndex(tableName, indexName, alterSql) {
+  const [rows] = await pool.query(`SHOW INDEX FROM ${tableName} WHERE Key_name = ?`, [indexName]);
+  if (rows.length === 0) {
+    await pool.query(alterSql);
+  }
+}
+
 async function ensureRankingTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS rankingstab (
@@ -37,6 +46,8 @@ async function ensureRankingTable() {
       current_rank INT NOT NULL DEFAULT 0,
       rank_level INT NOT NULL DEFAULT 0,
       binary_points_total FLOAT NOT NULL DEFAULT 0,
+      basis_points FLOAT NOT NULL DEFAULT 0,
+      basis_label VARCHAR(120) DEFAULT NULL,
       left_qualified_count INT NOT NULL DEFAULT 0,
       right_qualified_count INT NOT NULL DEFAULT 0,
       rank_date DATETIME DEFAULT NULL,
@@ -44,16 +55,57 @@ async function ensureRankingTable() {
       incentive_status INT NOT NULL DEFAULT 0,
       reward_status INT NOT NULL DEFAULT 0,
       reward_claimed_date DATETIME DEFAULT NULL,
+      last_calculated_at DATETIME DEFAULT NULL,
       PRIMARY KEY (id),
       UNIQUE KEY uq_uid (uid),
       KEY idx_current_rank (current_rank),
       KEY idx_rank_level (rank_level)
     ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
   );
+
+  const [cols] = await pool.query('SHOW COLUMNS FROM rankingstab');
+  const columnSet = new Set(cols.map((col) => String(col.Field || '').toLowerCase()));
+
+  if (!columnSet.has('basis_points')) {
+    await pool.query('ALTER TABLE rankingstab ADD COLUMN basis_points FLOAT NOT NULL DEFAULT 0 AFTER binary_points_total');
+  }
+  if (!columnSet.has('basis_label')) {
+    await pool.query('ALTER TABLE rankingstab ADD COLUMN basis_label VARCHAR(120) DEFAULT NULL AFTER basis_points');
+  }
+  if (!columnSet.has('last_calculated_at')) {
+    await pool.query('ALTER TABLE rankingstab ADD COLUMN last_calculated_at DATETIME DEFAULT NULL AFTER reward_claimed_date');
+  }
+
+  await ensureIndex('rankingstab', 'idx_basis_points', 'ALTER TABLE rankingstab ADD INDEX idx_basis_points (basis_points)');
+  await ensureIndex('rankingstab', 'idx_last_calculated_at', 'ALTER TABLE rankingstab ADD INDEX idx_last_calculated_at (last_calculated_at)');
+  await ensureIndex('pairingstab', 'idx_uid_transdate_id', 'ALTER TABLE pairingstab ADD INDEX idx_uid_transdate_id (uid, transdate, id)');
+  await ensureIndex('pairingstab', 'idx_uid_totalbpay', 'ALTER TABLE pairingstab ADD INDEX idx_uid_totalbpay (uid, totalbpay)');
+  await ensureIndex('usertab', 'idx_refid_position_uid', 'ALTER TABLE usertab ADD INDEX idx_refid_position_uid (refid, position, uid)');
+  await ensureIndex('usertab', 'idx_codeid_uid_mainid', 'ALTER TABLE usertab ADD INDEX idx_codeid_uid_mainid (codeid, uid, mainid)');
 }
 
 function toNumber(value) {
   return Number(value || 0);
+}
+
+function shouldRefreshRankState(row) {
+  if (!row) return true;
+
+  const dbBasisPoints = toNumber(row.db_basis_points);
+  const liveBasisPoints = toNumber(row.live_basis_points);
+  if (Math.abs(dbBasisPoints - liveBasisPoints) > 0.001) return true;
+
+  if (!row.last_calculated_at) return true;
+
+  const lastCalculatedAt = new Date(row.last_calculated_at);
+  if (Number.isNaN(lastCalculatedAt.getTime())) return true;
+
+  const ageMs = Date.now() - lastCalculatedAt.getTime();
+  if (ageMs > RANK_REFRESH_MAX_AGE_MINUTES * 60 * 1000) return true;
+
+  if (toNumber(row.current_rank) > 0 && !(row.rank_date || row.qualified_date)) return true;
+
+  return false;
 }
 
 function parseRankRow(row) {
@@ -83,6 +135,26 @@ async function getTotalPairingPoints(uid) {
     [uid]
   );
   return Number(rows[0]?.ttlpoints || 0);
+}
+
+async function getRankingBasis(uid) {
+  const [rows] = await pool.query(
+    `SELECT COALESCE(MAX(totalpointsleft), 0) AS max_left_points,
+            COALESCE(MAX(totalpointsright), 0) AS max_right_points
+       FROM pairingstab
+      WHERE uid = ?`,
+    [uid]
+  );
+
+  const row = rows[0] || {};
+  const leftPoints = toNumber(row.max_left_points);
+  const rightPoints = toNumber(row.max_right_points);
+  const basisPoints = leftPoints + rightPoints;
+
+  return {
+    basisPoints,
+    basisLabel: 'Combined binary leg points',
+  };
 }
 
 async function getLatestPairingSnapshot(uid) {
@@ -256,25 +328,40 @@ async function upsertRankState(uid, payload) {
   await pool.query(
     `INSERT INTO rankingstab (
        uid, current_rank, rank_level, binary_points_total,
+       basis_points, basis_label,
        left_qualified_count, right_qualified_count,
        rank_date, qualified_date, incentive_status, reward_status
      )
-     VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), 0, 0)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+             CASE WHEN ? > 0 THEN NOW() ELSE NULL END,
+             CASE WHEN ? > 0 THEN NOW() ELSE NULL END,
+             0, 0)
      ON DUPLICATE KEY UPDATE
        current_rank = VALUES(current_rank),
        rank_level = VALUES(rank_level),
        binary_points_total = VALUES(binary_points_total),
+       basis_points = VALUES(basis_points),
+       basis_label = VALUES(basis_label),
        left_qualified_count = VALUES(left_qualified_count),
        right_qualified_count = VALUES(right_qualified_count),
        rank_date = IF(VALUES(current_rank) > current_rank, NOW(), rank_date),
-       qualified_date = IF(VALUES(current_rank) > current_rank, NOW(), qualified_date)`,
+       qualified_date = CASE
+         WHEN VALUES(current_rank) <= 0 AND current_rank <= 0 THEN NULL
+         WHEN VALUES(current_rank) > current_rank THEN NOW()
+         ELSE qualified_date
+       END,
+       last_calculated_at = NOW()`,
     [
       uid,
       payload.currentRank,
       payload.currentRank,
       payload.binaryPoints,
+      payload.basisPoints,
+      payload.basisLabel,
       payload.leftQualifiedCount,
       payload.rightQualifiedCount,
+      payload.currentRank,
+      payload.currentRank,
     ]
   );
 }
@@ -299,7 +386,8 @@ async function getRankProgress(uid) {
   await ensureRankingTable();
 
   const pairing = await getLatestPairingSnapshot(uid);
-  const totalPoints = pairing.binaryPoints;
+  const basis = await getRankingBasis(uid);
+  const totalPoints = basis.basisPoints;
   const currentState = await getRankState(uid);
   const currentRank = currentState.rank;
 
@@ -319,6 +407,8 @@ async function getRankProgress(uid) {
   await upsertRankState(uid, {
     currentRank: effectiveRank,
     binaryPoints: totalPoints,
+    basisPoints: basis.basisPoints,
+    basisLabel: basis.basisLabel,
     leftQualifiedCount: legForS1.leftQualifiedCount,
     rightQualifiedCount: legForS1.rightQualifiedCount,
   });
@@ -357,6 +447,9 @@ async function getRankProgress(uid) {
     currentRankLabel: RANK_REQUIREMENTS[effectiveRank]?.label || 'Unranked',
     currentRankColor: RANK_REQUIREMENTS[effectiveRank]?.color || '#6B7280',
     binaryPoints: totalPoints,
+    basisPoints: basis.basisPoints,
+    basisLabel: basis.basisLabel,
+    qualifiedDate: finalState.rankDate,
     totalPoints,
     left: {
       count: pairing.leftCount,
@@ -404,27 +497,41 @@ async function getAllRankings(page = 1, perPage = 30) {
             m.firstname, m.lastname, m.username,
             COALESCE(r.current_rank, 0) AS current_rank,
             COALESCE(r.rank_level, 0) AS rank_level,
+            COALESCE(r.basis_points, 0) AS db_basis_points,
+            r.basis_label,
             r.rank_date, r.qualified_date,
             COALESCE(r.incentive_status, 0) AS incentive_status,
             COALESCE(r.reward_status, 0) AS reward_status,
-            COALESCE((
-              SELECT p.totalbpay
-              FROM pairingstab p
-              WHERE p.uid = u.uid
-              ORDER BY p.transdate DESC, p.id DESC
-              LIMIT 1
-            ), 0) AS binaryPoints
+            r.last_calculated_at,
+            COALESCE(stats.max_left_points, 0) AS max_left_points,
+            COALESCE(stats.max_right_points, 0) AS max_right_points,
+            (COALESCE(stats.max_left_points, 0) + COALESCE(stats.max_right_points, 0)) AS live_basis_points
      FROM usertab u
      INNER JOIN memberstab m ON m.uid = u.uid
      LEFT JOIN rankingstab r ON r.uid = u.uid
+     LEFT JOIN (
+       SELECT uid,
+              COALESCE(MAX(totalpointsleft), 0) AS max_left_points,
+              COALESCE(MAX(totalpointsright), 0) AS max_right_points
+         FROM pairingstab
+        GROUP BY uid
+     ) stats ON stats.uid = u.uid
      WHERE u.codeid = 1 AND u.uid = u.mainid
-     ORDER BY binaryPoints DESC, u.uid ASC
+     ORDER BY live_basis_points DESC, u.uid ASC
      LIMIT ?, ?`,
     [offset, size]
   );
 
-  const rankings = rows.map((r, idx) => {
-    const rank = Math.max(toNumber(r.current_rank), toNumber(r.rank_level));
+  const hydratedRows = await Promise.all(rows.map(async (r, idx) => {
+    const needsRefresh = shouldRefreshRankState(r);
+    const progress = needsRefresh ? await getRankProgress(r.uid) : null;
+    const storedRank = Math.max(toNumber(r.current_rank), toNumber(r.rank_level));
+    const basisPoints = progress ? toNumber(progress.basisPoints) : toNumber(r.live_basis_points);
+    const effectiveRank = progress ? toNumber(progress.currentRank) : storedRank;
+    const qualifiedDate = effectiveRank > 0
+      ? (progress?.qualifiedDate || r.qualified_date || r.rank_date || null)
+      : null;
+
     return {
       uid: toNumber(r.uid),
       firstname: r.firstname,
@@ -432,23 +539,25 @@ async function getAllRankings(page = 1, perPage = 30) {
       username: r.username,
       packageType: toNumber(r.currentaccttype),
       packageLabel: PACKAGE_LABELS[toNumber(r.currentaccttype)] || 'Unknown',
-      binaryPoints: toNumber(r.binaryPoints),
-      current_rank: rank,
-      supervisorLevel: rank,
-      rankLabel: RANK_REQUIREMENTS[rank]?.label || 'Unranked',
-      rankColor: RANK_REQUIREMENTS[rank]?.color || '#6B7280',
-      incentives: RANK_INCENTIVES[rank] || 'N/A',
-      rank_date: r.rank_date || r.qualified_date,
-      qualifiedDate: r.qualified_date || r.rank_date,
-      incentive_status: toNumber(r.incentive_status),
-      reward_status: toNumber(r.reward_status),
-      rewardStatus: toNumber(r.reward_status),
+      basisPoints,
+      basisLabel: progress?.basisLabel || r.basis_label || 'Combined binary leg points',
+      binaryPoints: basisPoints,
+      current_rank: effectiveRank,
+      supervisorLevel: effectiveRank,
+      rankLabel: RANK_REQUIREMENTS[effectiveRank]?.label || 'Unranked',
+      rankColor: RANK_REQUIREMENTS[effectiveRank]?.color || '#6B7280',
+      incentives: RANK_INCENTIVES[effectiveRank] || 'N/A',
+      rank_date: qualifiedDate,
+      qualifiedDate,
+      incentive_status: progress ? toNumber(progress.incentiveStatus) : toNumber(r.incentive_status),
+      reward_status: progress ? toNumber(progress.rewardStatus) : toNumber(r.reward_status),
+      rewardStatus: progress ? toNumber(progress.rewardStatus) : toNumber(r.reward_status),
       position: offset + idx + 1,
     };
-  });
+  }));
 
   return {
-    rankings,
+    rankings: hydratedRows,
     total,
     page: currentPage,
     totalPages: Math.max(1, Math.ceil(total / size)),

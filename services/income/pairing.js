@@ -316,7 +316,7 @@ async function getPairingReport(uid) {
     `SELECT id, uid, DATE_FORMAT(transdate, '%Y-%m-%d') as transdate,
             totalleft, totalpointsleft, totalright, totalpointsright,
             \`left\`, \`right\`, totalpoints, totalbpay
-     FROM pairingstab WHERE uid = ? ORDER BY id DESC`,
+     FROM pairingstab WHERE uid = ? ORDER BY transdate DESC, id DESC`,
     [uid]
   );
 
@@ -351,7 +351,8 @@ async function savePairingReport(uid, reports) {
                 \`right\` = ?,
                 totalpoints = ?,
                 totalbpay = ?
-          WHERE id = ?`,
+          WHERE uid = ?
+            AND DATE_FORMAT(transdate, '%Y-%m-%d') = ?`,
         [
           transDate,
           report.totalleft,
@@ -363,7 +364,8 @@ async function savePairingReport(uid, reports) {
           report.right,
           report.totalpoints,
           report.totalbpay,
-          existing[0].id,
+          uid,
+          transDate,
         ]
       );
       continue;
@@ -372,10 +374,10 @@ async function savePairingReport(uid, reports) {
     try {
       await pool.query(
         `INSERT INTO pairingstab
-         (id, uid, transdate, totalleft, totalpointsleft, totalright, totalpointsright,
+         (uid, transdate, totalleft, totalpointsleft, totalright, totalpointsright,
           weeknumber, \`left\`, \`right\`, totalpoints, totalbpay)
          VALUES
-         (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           uid,
           transDate,
