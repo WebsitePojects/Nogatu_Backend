@@ -18,6 +18,7 @@ const { getLeadershipBonus } = require('./leadership');
 const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('./unilevel');
 const { getLPC, checkLpcTransDate } = require('./lpc');
 const { insertIncome } = require('./insertIncome');
+const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
 
 // Match current production behavior: Unilevel and LPC are feature-flagged off.
 const ENABLE_UNILEVEL_PAYOUT = false;
@@ -49,14 +50,8 @@ async function calculateAndStoreIncome(uid, accttype) {
     const beginningBalance = Number(stored.ttlcashbalance || 0);
 
     // Pairing income eligibility mirrors production ewallet.php rules.
-    const [memberRows] = await pool.query(
-      'SELECT codeid, cdstatus FROM usertab WHERE uid = ? LIMIT 1',
-      [uid]
-    );
-    const member = memberRows[0] || {};
-    const canEarnPairing =
-      Number(member.codeid) === 1 ||
-      (Number(member.codeid) === 3 && Number(member.cdstatus) === 2);
+    const member = await getEffectiveAccountState(uid);
+    const canEarnPairing = countsForPairingSource(member);
 
     // ── Continuous income (deduplication via Math.max) ───────────────
     const drefResult = await getDREF(uid);

@@ -9,6 +9,7 @@
  */
 const { pool } = require('../../config/database');
 const { getISOWeek } = require('../../utils/helpers');
+const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
 
 // Weekly pairing caps by account type
 const PAIRING_CAPS = {
@@ -24,10 +25,10 @@ function normalizeToDay(dateValue) {
   if (!dateValue) return null;
   const day = String(dateValue).slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
-  return `${day} 00:00:00`;
+  return day + ' 00:00:00';
 }
 
-async function getUpgradeAccount(uid) {
+async function getUpgradeAccounts(uid) {
   const [rows] = await pool.query(
     `SELECT uid,
             DATE_FORMAT(transdate, '%Y-%m-%d') as transdate,
@@ -35,16 +36,43 @@ async function getUpgradeAccount(uid) {
             transtype
        FROM upgradetab
       WHERE transtype = 1 AND uid = ?
-      LIMIT 1`,
+      ORDER BY transdate ASC, id ASC`,
     [uid]
   );
 
-  return rows[0] || null;
+  return rows;
+}
+
+async function appendUpgradePairingBonus(uid, side, leftPoints, rightPoints, allDates) {
+  const upgrades = await getUpgradeAccounts(uid);
+  if (!upgrades || upgrades.length === 0) {
+    return;
+  }
+
+  for (const upgrade of upgrades) {
+    const upgradeDate = normalizeToDay(upgrade.transdate);
+    if (upgradeDate) {
+      allDates.add(upgradeDate);
+    }
+
+    const upgradeEntry = {
+      uid: upgrade.uid,
+      points: Number(upgrade.binarypoints || 0),
+      date: upgradeDate,
+      codeid: Number(upgrade.transtype || 0),
+    };
+
+    if (side === 'left') {
+      leftPoints.push(upgradeEntry);
+    } else {
+      rightPoints.push(upgradeEntry);
+    }
+  }
 }
 
 /**
  * Recursively traverse binary tree to collect binary points by leg.
- * Only PD accounts (codeid=1) are counted — all tiers contribute to pairing.
+ * Pairing source eligibility mirrors the live PHP effective-state rules.
  */
 async function getNumLevels(
   parent,
@@ -57,27 +85,33 @@ async function getNumLevels(
   totals
 ) {
   const [rows] = await pool.query(
-    `SELECT uid, refid, position, codeid, accttype, currentaccttype, binarypoints,
+    `SELECT uid, refid, drefid, position, codeid, accttype, currentaccttype,
+            cdamount, cdtotal, cdstatus, binarypoints,
             DATE_FORMAT(datereg, '%Y-%m-%d %H:%i:%s') as datereg
        FROM usertab
       WHERE refid = ?`,
     [parent]
   );
 
-  for (const row of rows) {
+  for (const baseRow of rows) {
+    const row = await getEffectiveAccountState(baseRow.uid, baseRow);
+    if (!row) {
+      continue;
+    }
+
     const side = level === 1
       ? (Number(row.position) === 1 ? 'left' : 'right')
       : (sideMap[parent] || 'right');
     sideMap[row.uid] = side;
 
-    const isPD = Number(row.codeid) === 1;
+    const isPairingSource = countsForPairingSource(row);
     const baseDate = normalizeToDay(row.datereg);
 
-    if (isPD && baseDate) {
+    if (isPairingSource && baseDate) {
       allDates.add(baseDate);
     }
 
-    if (isPD) {
+    if (isPairingSource) {
       const pointEntry = {
         uid: row.uid,
         points: Number(row.binarypoints || 0),
@@ -95,26 +129,8 @@ async function getNumLevels(
         totals.totalpointsright += pointEntry.points;
       }
 
-      // Upgrade points are added as extra same-leg entries when account was upgraded.
       if (Number(row.accttype || 0) < Number(row.currentaccttype || 0)) {
-        const upgrade = await getUpgradeAccount(row.uid);
-        if (upgrade) {
-          const upgradeDate = normalizeToDay(upgrade.transdate);
-          if (upgradeDate) {
-            allDates.add(upgradeDate);
-            const upgradeEntry = {
-              uid: upgrade.uid,
-              points: Number(upgrade.binarypoints || 0),
-              date: upgradeDate,
-              codeid: Number(upgrade.transtype || 0),
-            };
-            if (side === 'left') {
-              leftPoints.push(upgradeEntry);
-            } else {
-              rightPoints.push(upgradeEntry);
-            }
-          }
-        }
+        await appendUpgradePairingBonus(row.uid, side, leftPoints, rightPoints, allDates);
       }
     }
 
@@ -135,7 +151,7 @@ async function getNumLevels(
  * Calculate total pairing amount with weekly caps
  */
 function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals) {
-  const sortedDates = [...allDates].sort();
+  const sortedDates = Array.from(allDates).sort();
   const maxPay = PAIRING_CAPS[accttype] || 10000;
   let lcounter = 0;
   let rcounter = 0;
@@ -151,14 +167,14 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
   for (const date of sortedDates) {
     let leftToday = 0;
     for (const lp of leftPoints) {
-      if (lp.date === date && Number(lp.codeid) === 1) {
+      if (lp.date === date && (Number(lp.codeid) === 1 || Number(lp.codeid) === 3)) {
         leftToday += Number(lp.points || 0);
       }
     }
 
     let rightToday = 0;
     for (const rp of rightPoints) {
-      if (rp.date === date && Number(rp.codeid) === 1) {
+      if (rp.date === date && (Number(rp.codeid) === 1 || Number(rp.codeid) === 3)) {
         rightToday += Number(rp.points || 0);
       }
     }
@@ -220,7 +236,6 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
         }
       }
     } else {
-      // New week reset mirrors production logic.
       newbpay = 0;
       ttlbpayTemp = 0;
       weekBpay = 0;
@@ -257,7 +272,7 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
     }
   }
 
-  return { totalPay: ttlbpay, dailyReports };
+  return { totalPay: ttlbpay, dailyReports: dailyReports };
 }
 
 /**
@@ -292,18 +307,22 @@ async function getPairing(uid, accttype) {
     };
   }
 
-  const leftPts  = leftPoints.reduce((s, p) => s + p.points, 0);
-  const rightPts = rightPoints.reduce((s, p) => s + p.points, 0);
+  const leftPts = leftPoints.reduce(function sumPoints(total, point) {
+    return total + Number(point.points || 0);
+  }, 0);
+  const rightPts = rightPoints.reduce(function sumPoints(total, point) {
+    return total + Number(point.points || 0);
+  }, 0);
   const pairedPts = Math.min(leftPts, rightPts);
   const pairingResult = totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals);
 
   return {
     totalPay: pairingResult.totalPay,
-    leftCount:  leftPoints.length,
-    leftPts,
-    rightCount: rightPoints.length,
-    rightPts,
-    pairedPts,
+    leftCount: totals.totalleft,
+    leftPts: leftPts,
+    rightCount: totals.totalright,
+    rightPts: rightPts,
+    pairedPts: pairedPts,
     dailyReports: pairingResult.dailyReports,
   };
 }
@@ -394,7 +413,6 @@ async function savePairingReport(uid, reports) {
       );
     } catch (err) {
       if (err && err.code === 'ER_DUP_ENTRY') {
-        // Fallback for environments with unique uid constraint on pairingstab.
         await pool.query(
           `UPDATE pairingstab
               SET transdate = ?,

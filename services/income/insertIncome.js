@@ -8,6 +8,7 @@
  */
 const { pool } = require('../../config/database');
 const { nowMySQL } = require('../../utils/helpers');
+const { getEffectiveAccountState } = require('../accountState');
 
 const PAYOUT_OPTION_LABELS = {
   1: 'Pickup',
@@ -131,7 +132,8 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
        FOR UPDATE`,
       [uid]
     );
-    const profile = { ...(userInfo || {}), ...(profileRows[0] || {}) };
+    const rawProfile = { ...(userInfo || {}), ...(profileRows[0] || {}) };
+    const profile = await getEffectiveAccountState(uid, rawProfile, conn) || rawProfile;
 
     // Calculate deductions
     const tax = encashmentAmount * 0.10; // 10% tax
@@ -141,7 +143,8 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
     let cdDeduction = 0;
     if (
       Number(profile.codeid) === 3 &&
-      (Number(profile.cdstatus) === 1 || Number(profile.cdamount || 0) > Number(profile.cdtotal || 0))
+      Number(profile.cdstatus) === 1 &&
+      Number(profile.cdamount || 0) > Number(profile.cdtotal || 0)
     ) {
       const cdAmount = Number(profile.cdamount || 0);
       const cdTotal = Number(profile.cdtotal || 0);
