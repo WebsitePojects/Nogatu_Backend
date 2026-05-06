@@ -194,6 +194,7 @@ app.use('/api/ranking', require('./routes/ranking'));
 app.use('/api/global-bonus', require('./routes/globalBonus'));
 app.use('/api/leaderboard', require('./routes/leaderboard'));
 app.use('/api/contact', require('./routes/contact'));
+app.use('/api/applications', require('./routes/applications').router);
 
 // Admin routes
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -208,6 +209,7 @@ app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
 app.use('/api/admin/rankings', require('./routes/admin/rankings'));
 app.use('/api/admin/global-bonus', require('./routes/admin/globalBonus'));
 app.use('/api/admin/messages', require('./routes/admin/messages'));
+app.use('/api/admin/applications', require('./routes/admin/applications'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {
