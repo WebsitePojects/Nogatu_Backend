@@ -31,6 +31,7 @@ const MySQLStore = require('express-mysql-session')(session);
 const cors = require('cors');
 const helmet = require('helmet');
 const { testConnection, pool } = require('./config/database');
+const { requestId } = require('./utils/security');
 
 const rateLimit = require('express-rate-limit');
 const app = express();
@@ -47,6 +48,11 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  req.requestId = requestId(req);
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
 
 const legacyImageCandidates = [
   path.resolve(__dirname, '../public_html/img'),
@@ -216,6 +222,8 @@ app.use('/api/ranking', require('./routes/ranking'));
 app.use('/api/leaderboard', require('./routes/leaderboard'));
 app.use('/api/global-bonus', require('./routes/globalBonus'));
 app.use('/api/contact', require('./routes/contact'));
+app.use('/api/support', require('./routes/support'));
+app.use('/api/events', require('./routes/events'));
 app.use('/api/applications', require('./routes/applications').router);
 
 // Admin routes

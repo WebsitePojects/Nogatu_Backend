@@ -8,9 +8,14 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
+const { writeAuditLog } = require('../services/audit');
 
 function normalizeLegacyUsername(value) {
   return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
+}
+
+function hashResetToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
 }
 
 /**
@@ -27,7 +32,7 @@ router.post('/login', async (req, res) => {
     }
 
     const [rows] = await pool.query(
-      `SELECT u.uid, u.mainid, u.accttype, u.currentaccttype, u.cdstatus,
+      `SELECT u.uid, u.public_uid, u.mainid, u.accttype, u.currentaccttype, u.cdstatus,
               u.codeid, DATE_FORMAT(u.datereg, '%Y-%m-%d') as datereg, u.position,
               m.uid as mUid, m.username, m.password, m.firstname, m.lastname
        FROM memberstab m, usertab u
@@ -84,6 +89,7 @@ router.post('/login', async (req, res) => {
 
     // Set session variables (mirrors PHP session exactly)
     req.session.uid = user.uid;
+    req.session.publicUid = user.public_uid || null;
     req.session.username = user.username;
     req.session.accountname = `${user.firstname} ${user.lastname}`;
     req.session.shortname = user.firstname;
@@ -105,6 +111,7 @@ router.post('/login', async (req, res) => {
       success: true,
       user: {
         uid: user.uid,
+        publicUid: user.public_uid || null,
         username: user.username,
         accountname: `${user.firstname} ${user.lastname}`,
         shortname: user.firstname,
@@ -134,6 +141,130 @@ router.post('/logout', (req, res) => {
 });
 
 /**
+ * POST /api/auth/forgot-password
+ * Always returns 200 to avoid email/username enumeration.
+ */
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const identifier = String(req.body.email || req.body.username || '').trim();
+    if (!identifier) {
+      return res.json({ success: true, message: 'If the account exists, reset instructions will be sent.' });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT uid, username, email, firstname, lastname
+       FROM memberstab
+       WHERE email = ? OR username = ?
+       LIMIT 1`,
+      [identifier, normalizeLegacyUsername(identifier)]
+    );
+
+    if (rows.length > 0) {
+      const member = rows[0];
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashResetToken(rawToken);
+      await pool.query(
+        `INSERT INTO password_reset_tokenstab
+         (member_uid, token_hash, expires_at, request_ip)
+         VALUES (?, ?, DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 MINUTE), ?)`,
+        [member.uid, tokenHash, req.ip || null]
+      );
+
+      await writeAuditLog({
+        req,
+        actorUid: member.uid,
+        actorRole: 'member',
+        action: 'auth.password_reset.request',
+        targetUid: member.uid,
+        targetTable: 'password_reset_tokenstab',
+        afterState: { username: member.username },
+      });
+
+      // Email provider wiring is environment-specific. In development we return
+      // the token so the local reset flow can be tested without a mail gateway.
+      if (process.env.NODE_ENV !== 'production') {
+        return res.json({
+          success: true,
+          message: 'If the account exists, reset instructions will be sent.',
+          debugResetToken: rawToken,
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'If the account exists, reset instructions will be sent.' });
+  } catch (err) {
+    console.error('[Auth] Forgot password error:', err);
+    if (err.code === 'ER_NO_SUCH_TABLE') {
+      return res.status(503).json({ error: 'Password reset is not ready yet. Please run database migrations.' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/auth/reset-password
+ */
+router.post('/reset-password', async (req, res) => {
+  let conn;
+  try {
+    const token = String(req.body.token || '').trim();
+    const newPassword = String(req.body.newPassword || req.body.password || '');
+    const confirmPassword = String(req.body.confirmPassword || req.body.confirm || newPassword);
+
+    if (!token || !newPassword || newPassword !== confirmPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'Enter a matching new password with at least 8 characters.' });
+    }
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const [tokenRows] = await conn.query(
+      `SELECT id, member_uid
+       FROM password_reset_tokenstab
+       WHERE token_hash = ?
+         AND used_at IS NULL
+         AND expires_at > CURRENT_TIMESTAMP(6)
+       LIMIT 1
+       FOR UPDATE`,
+      [hashResetToken(token)]
+    );
+
+    if (tokenRows.length === 0) {
+      await conn.rollback();
+      return res.status(400).json({ error: 'Reset link is invalid or expired.' });
+    }
+
+    const tokenRow = tokenRows[0];
+    const hashed = await bcrypt.hash(newPassword, 12);
+    await conn.query('UPDATE memberstab SET password = ? WHERE uid = ? LIMIT 1', [hashed, tokenRow.member_uid]);
+    await conn.query('UPDATE password_reset_tokenstab SET used_at = CURRENT_TIMESTAMP(6) WHERE id = ? LIMIT 1', [tokenRow.id]);
+    await conn.query('DELETE FROM app_sessions WHERE data LIKE ?', [`%"uid":${Number(tokenRow.member_uid)}%`]).catch(() => {});
+
+    await writeAuditLog(conn, {
+      req,
+      actorUid: tokenRow.member_uid,
+      actorRole: 'member',
+      action: 'auth.password_reset.complete',
+      targetUid: tokenRow.member_uid,
+      targetTable: 'memberstab',
+      targetId: String(tokenRow.member_uid),
+    });
+
+    await conn.commit();
+    res.json({ success: true });
+  } catch (err) {
+    if (conn) await conn.rollback();
+    console.error('[Auth] Reset password error:', err);
+    if (err.code === 'ER_NO_SUCH_TABLE') {
+      return res.status(503).json({ error: 'Password reset is not ready yet. Please run database migrations.' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+/**
  * GET /api/auth/session
  * Check current session status
  */
@@ -143,6 +274,7 @@ router.get('/session', (req, res) => {
       authenticated: true,
       user: {
         uid: req.session.uid,
+        publicUid: req.session.publicUid || null,
         username: req.session.username,
         accountname: req.session.accountname,
         shortname: req.session.shortname,

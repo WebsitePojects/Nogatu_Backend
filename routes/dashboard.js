@@ -118,6 +118,14 @@ router.get('/', memberAuth, async (req, res) => {
       cashBalance: ttlcashbalance,
       maintenanceStatus,
       maintenancePoints,
+      unilevelMaintenance: {
+        requiredPoints: 200,
+        currentPoints: maintenancePoints,
+        neededPoints: Math.max(0, 200 - maintenancePoints),
+        eligible: maintenancePoints >= 200,
+        receivableAmount: maintenancePoints >= 200 ? ttlincome4 : 0,
+        blockedAmount: maintenancePoints >= 200 ? 0 : ttlincome4,
+      },
       directReferrals: drefByType,
       leftAccounts,
       leftPoints,
@@ -128,6 +136,161 @@ router.get('/', memberAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('[Dashboard] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/breakdown/:metric', memberAuth, async (req, res) => {
+  try {
+    const uid = req.session.uid;
+    const metric = String(req.params.metric || '').trim().toLowerCase();
+    const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 50));
+
+    const response = {
+      metric,
+      asOf: new Date().toISOString(),
+      total: 0,
+      formula: '',
+      rows: [],
+    };
+
+    if (['total-cash-incentives', 'totalcashincentives'].includes(metric)) {
+      const [rows] = await pool.query(
+        `SELECT pid, income1, income2, income3, income5, transdate, processid
+         FROM payouthistorytab
+         WHERE uid = ? AND transactiontype = 1
+         ORDER BY transdate DESC, pid DESC
+         LIMIT ?`,
+        [uid, limit]
+      );
+      response.formula = 'Direct Referral + Sales Volume (Pairing) + Leadership Bonus + Hi-Five Bonus';
+      response.rows = rows.map((row) => ({
+        pid: row.pid,
+        directReferral: Number(row.income1 || 0),
+        salesVolume: Number(row.income2 || 0),
+        leadershipBonus: Number(row.income3 || 0),
+        hiFiveBonus: Number(row.income5 || 0),
+        total: Number(row.income1 || 0) + Number(row.income2 || 0) + Number(row.income3 || 0) + Number(row.income5 || 0),
+        transdate: row.transdate,
+        processKey: row.processid,
+      }));
+      response.total = response.rows.reduce((sum, row) => sum + row.total, 0);
+    } else if (['current-cash-balance', 'cashbalance'].includes(metric)) {
+      const [rows] = await pool.query(
+        `SELECT ttlcashbalance, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome6, transdate
+         FROM payouttotaltab
+         WHERE uid = ?
+         LIMIT 1`,
+        [uid]
+      );
+      const row = rows[0] || {};
+      response.formula = 'Legacy balance from payouttotaltab, protected by transaction locks during new encashments.';
+      response.total = Number(row.ttlcashbalance || 0);
+      response.rows = [row];
+    } else if (['direct-referral', 'directreferral'].includes(metric)) {
+      const [rows] = await pool.query(
+        `SELECT ph.pid, ph.income1 AS amount, ph.transdate, u.uid AS referred_uid,
+                m.username, m.firstname, m.lastname
+         FROM payouthistorytab ph
+         LEFT JOIN usertab u ON u.drefid = ph.uid
+         LEFT JOIN memberstab m ON m.uid = u.uid
+         WHERE ph.uid = ? AND ph.income1 > 0
+         ORDER BY ph.transdate DESC, ph.pid DESC
+         LIMIT ?`,
+        [uid, limit]
+      );
+      response.formula = 'Direct referral income rows from payouthistorytab where income1 > 0.';
+      response.rows = rows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
+      response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
+    } else if (['sales-volume', 'pairing', 'pairing-balance', 'salesvolume'].includes(metric)) {
+      const [rows] = await pool.query(
+        `SELECT id, totalleft, totalright, totalpointsleft, totalpointsright,
+                \`left\` AS left_balance, \`right\` AS right_balance, paircount, pairamount, flushout, transdate
+         FROM pairingstab
+         WHERE uid = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+        [uid, limit]
+      );
+      response.formula = 'Pairing rows from pairingstab; balance is absolute left/right carry difference.';
+      response.rows = rows.map((row) => ({
+        ...row,
+        totalleft: Number(row.totalleft || 0),
+        totalright: Number(row.totalright || 0),
+        totalpointsleft: Number(row.totalpointsleft || 0),
+        totalpointsright: Number(row.totalpointsright || 0),
+        left_balance: Number(row.left_balance || 0),
+        right_balance: Number(row.right_balance || 0),
+        paircount: Number(row.paircount || 0),
+        pairamount: Number(row.pairamount || 0),
+        flushout: Number(row.flushout || 0),
+      }));
+      response.total = response.rows.reduce((sum, row) => sum + row.pairamount, 0);
+    } else if (['uni-level', 'unilevel'].includes(metric)) {
+      const { start, end } = currentMonthRange();
+      const [maintRows] = await pool.query(
+        `SELECT SUM(incentivepoints1) as ttlpoints
+         FROM repurchasetab
+         WHERE uid = ? AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+           AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ? AND producttype >= 100`,
+        [uid, start, end]
+      );
+      const [incomeRows] = await pool.query(
+        `SELECT pid, income4 AS amount, transdate, processid
+         FROM payouthistorytab
+         WHERE uid = ? AND income4 > 0
+         ORDER BY transdate DESC, pid DESC
+         LIMIT ?`,
+        [uid, limit]
+      );
+      const points = Number(maintRows[0]?.ttlpoints || 0);
+      response.formula = 'Unilevel requires at least 200 product points in the current month.';
+      response.eligibility = {
+        requiredPoints: 200,
+        currentPoints: points,
+        neededPoints: Math.max(0, 200 - points),
+        eligible: points >= 200,
+      };
+      response.rows = incomeRows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
+      response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
+    } else if (['leadership-bonus', 'hifive-bonus', 'hi-five-bonus', 'ranking-bonus', 'lpc'].includes(metric)) {
+      const incomeColumn = metric.includes('leadership') ? 'income3'
+        : metric.includes('ranking') || metric.includes('lpc') ? 'income6'
+          : 'income5';
+      const [rows] = await pool.query(
+        `SELECT pid, ${incomeColumn} AS amount, transdate, processid
+         FROM payouthistorytab
+         WHERE uid = ? AND ${incomeColumn} > 0
+         ORDER BY transdate DESC, pid DESC
+         LIMIT ?`,
+        [uid, limit]
+      );
+      response.formula = `${incomeColumn} rows from payouthistorytab with positive amounts.`;
+      response.rows = rows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
+      response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
+    } else if (['left-accounts', 'right-accounts'].includes(metric)) {
+      const leg = metric.startsWith('left') ? 'left' : 'right';
+      const position = leg === 'left' ? 1 : 2;
+      const [rows] = await pool.query(
+        `SELECT u.uid, u.public_uid, u.currentaccttype, u.binarypoints, u.datereg,
+                m.username, m.firstname, m.lastname
+         FROM usertab u
+         LEFT JOIN memberstab m ON m.uid = u.uid
+         WHERE u.refid = ? AND u.position = ?
+         ORDER BY u.id ASC
+         LIMIT ?`,
+        [uid, position, limit]
+      );
+      response.formula = `${leg} direct binary placement rows under the current member.`;
+      response.rows = rows;
+      response.total = rows.length;
+    } else {
+      return res.status(404).json({ error: 'Unknown dashboard metric.' });
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error('[Dashboard] Breakdown error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
-const { insertEncashment } = require('../services/income/insertIncome');
+const { insertEncashment, getEncashmentPreview } = require('../services/income/insertIncome');
 
 /**
  * GET /api/wallet
@@ -40,6 +40,46 @@ router.get('/', memberAuth, async (req, res) => {
 });
 
 /**
+ * POST /api/wallet/preview-encash
+ * Validate payout readiness and show all deductions before submit.
+ */
+router.post('/preview-encash', memberAuth, async (req, res) => {
+  try {
+    const uid = req.session.uid;
+    const amount = Number(req.body.amount);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
+    }
+
+    const preview = await getEncashmentPreview(uid, amount);
+    if (!preview.payout.ok) {
+      return res.status(422).json({
+        error: preview.payout.message,
+        code: preview.payout.code,
+        preview,
+      });
+    }
+
+    if (!preview.sufficientBalance) {
+      return res.status(422).json({
+        error: 'Insufficient cash balance for this encashment amount.',
+        code: 'INSUFFICIENT_BALANCE',
+        preview,
+      });
+    }
+
+    res.json({ success: true, preview });
+  } catch (err) {
+    console.error('[Wallet] Encashment preview error:', err);
+    if (err.message === 'Invalid encashment amount') {
+      return res.status(400).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
  * POST /api/wallet/encash
  * Process encashment
  */
@@ -52,12 +92,16 @@ router.post('/encash', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
 
-    const result = await insertEncashment(uid, amount);
+    const result = await insertEncashment(uid, amount, null, {
+      req,
+      requestId: req.requestId || req.headers['x-request-id'],
+    });
 
     res.json({
       success: true,
       pid: result.pid,
       cdDeduction: Number(result.cdDeduction || 0),
+      maintenanceFee: Number(result.maintenanceFee || 0),
       netReceivable: Number(result.netReceivable || 0),
       newBalance: Number(result.newBalance || 0),
       paymentOption: result.paymentOption || null,
@@ -69,6 +113,9 @@ router.post('/encash', memberAuth, async (req, res) => {
     console.error('[Wallet] Encashment error:', err);
     if (err.message === 'Invalid encashment amount') {
       return res.status(400).json({ error: err.message });
+    }
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message, code: err.code });
     }
     res.status(500).json({ error: 'Internal server error' });
   }

@@ -9,6 +9,7 @@ const { pool } = require('../config/database');
 const { sanitizeAlphaNum, getOffsetTimestamp } = require('../utils/helpers');
 const { normalizeTin, isValidTin } = require('../utils/tin');
 const { issueVoucher } = require('./voucher');
+const { createPublicId, createReferralSlug, createProcessKey } = require('../utils/security');
 
 let memberTinColumnReady = false;
 
@@ -242,7 +243,7 @@ async function getNextCountId() {
  */
 async function registerMember({
   activationCode, sponsorUid, placementUid, username, password,
-  firstname, lastname, middlename, tin, position
+  firstname, lastname, middlename, tin, email, position
 }) {
   await ensureMemberTinColumn();
 
@@ -322,6 +323,51 @@ async function registerMember({
        VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)`,
       [newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename, normalizedTin]
     );
+
+    if (email) {
+      await conn.query(
+        'UPDATE memberstab SET email = ? WHERE uid = ? LIMIT 1',
+        [String(email).trim().slice(0, 180), newUid]
+      ).catch(() => {});
+    }
+
+    await conn.query(
+      'UPDATE usertab SET public_uid = ?, referral_slug = ? WHERE uid = ? LIMIT 1',
+      [createPublicId(), createReferralSlug(8), newUid]
+    ).catch(() => {});
+
+    await conn.query(
+      `INSERT IGNORE INTO binary_tree_closuretab (ancestor_uid, descendant_uid, depth, leg)
+       VALUES (?, ?, 0, 'self')`,
+      [newUid, newUid]
+    ).catch(() => {});
+
+    await conn.query(
+      `INSERT IGNORE INTO binary_tree_closuretab (ancestor_uid, descendant_uid, depth, leg)
+       SELECT ancestor_uid, ?, depth + 1,
+              CASE WHEN ancestor_uid = ? THEN ? ELSE leg END
+       FROM binary_tree_closuretab
+       WHERE descendant_uid = ?`,
+      [newUid, placementUid, Number(position) === 1 ? 'left' : 'right', placementUid]
+    ).catch(() => {});
+
+    await conn.query(
+      `INSERT INTO binary_point_eventstab
+       (event_uid, source_member_uid, owner_uid, parent_uid, leg, event_type,
+        package_type, point_value, reference_key, event_ts)
+       VALUES (?, ?, ?, ?, ?, 'registration', ?, ?, ?, CURRENT_TIMESTAMP(6))
+       ON DUPLICATE KEY UPDATE event_uid = event_uid`,
+      [
+        createPublicId(),
+        newUid,
+        sponsorUid,
+        placementUid,
+        Number(position) === 1 ? 'left' : 'right',
+        String(codeData.producttype || ''),
+        Number(codeData.binarypoints || 0),
+        createProcessKey(['binary_point', 'registration', activationCode, newUid]),
+      ]
+    ).catch(() => {});
 
     // 9. Issue voucher for new member (DOC2 §4.1)
     try {

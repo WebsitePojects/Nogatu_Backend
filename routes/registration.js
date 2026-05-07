@@ -9,6 +9,8 @@ const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const registrationService = require('../services/registration');
 const { resolveTin, isValidTin } = require('../utils/tin');
+const { createReferralSlug, normalizeReferralSlug, createPublicId } = require('../utils/security');
+const { writeAuditLog } = require('../services/audit');
 
 async function ensureReferralInvitesTable() {
   await pool.query(
@@ -25,6 +27,67 @@ async function ensureReferralInvitesTable() {
       KEY idx_sponsor_active (sponsor_uid, active)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
   );
+}
+
+async function ensurePublicIdentityColumns() {
+  const [publicUidCols] = await pool.query("SHOW COLUMNS FROM usertab LIKE 'public_uid'");
+  if (publicUidCols.length === 0) {
+    await pool.query('ALTER TABLE usertab ADD COLUMN public_uid CHAR(36) NULL');
+  }
+  const [slugCols] = await pool.query("SHOW COLUMNS FROM usertab LIKE 'referral_slug'");
+  if (slugCols.length === 0) {
+    await pool.query('ALTER TABLE usertab ADD COLUMN referral_slug VARCHAR(32) NULL');
+  }
+}
+
+async function ensureReferralSlug(uid) {
+  await ensurePublicIdentityColumns();
+  const [rows] = await pool.query('SELECT public_uid, referral_slug FROM usertab WHERE uid = ? LIMIT 1', [uid]);
+  if (rows.length === 0) return null;
+  let publicUid = rows[0].public_uid;
+  let slug = rows[0].referral_slug;
+
+  if (!publicUid) publicUid = createPublicId();
+  if (!slug) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      slug = createReferralSlug(8);
+      const [existing] = await pool.query('SELECT uid FROM usertab WHERE referral_slug = ? LIMIT 1', [slug]);
+      if (existing.length === 0) break;
+    }
+  }
+
+  await pool.query(
+    'UPDATE usertab SET public_uid = ?, referral_slug = ? WHERE uid = ? LIMIT 1',
+    [publicUid, slug, uid]
+  );
+  return { publicUid, slug };
+}
+
+async function findBalancedPlacement(rootUid, preferredPosition = 0) {
+  const queue = [Number(rootUid)];
+  const visited = new Set();
+
+  while (queue.length > 0 && visited.size < 5000) {
+    const placementUid = queue.shift();
+    if (!placementUid || visited.has(placementUid)) continue;
+    visited.add(placementUid);
+
+    const [children] = await pool.query(
+      'SELECT uid, position FROM usertab WHERE refid = ? ORDER BY position ASC, id ASC',
+      [placementUid]
+    );
+    const left = children.find((row) => Number(row.position) === 1);
+    const right = children.find((row) => Number(row.position) === 2);
+
+    if (preferredPosition === 1 && !left) return { placementUid, position: 1 };
+    if (preferredPosition === 2 && !right) return { placementUid, position: 2 };
+    if (!left) return { placementUid, position: 1 };
+    if (!right) return { placementUid, position: 2 };
+
+    for (const child of children) queue.push(Number(child.uid));
+  }
+
+  throw new Error('No available placement position was found for this referral.');
 }
 
 /**
@@ -156,6 +219,27 @@ router.get('/referral-invite', memberAuth, async (req, res) => {
   }
 });
 
+router.get('/referral-link', memberAuth, async (req, res) => {
+  try {
+    const identity = await ensureReferralSlug(Number(req.session.uid));
+    if (!identity) return res.status(404).json({ error: 'Sponsor account not found.' });
+
+    const [settingsRows] = await pool.query(
+      'SELECT placement_mode FROM sponsor_placement_settingstab WHERE sponsor_uid = ? LIMIT 1',
+      [req.session.uid]
+    ).catch(() => [[]]);
+
+    res.json({
+      slug: identity.slug,
+      publicUid: identity.publicUid,
+      placementMode: settingsRows[0]?.placement_mode || 'balanced',
+    });
+  } catch (err) {
+    console.error('[Registration] referral link error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 /**
  * POST /api/registration/referral-invite
  * Regenerates a referral invite tied to the sponsor's next open binary position.
@@ -194,6 +278,32 @@ router.post('/referral-invite', memberAuth, async (req, res) => {
 
 router.get('/referral/:token', async (req, res) => {
   try {
+    await ensurePublicIdentityColumns();
+    const slug = normalizeReferralSlug(req.params.token || '');
+    if (slug) {
+      const [slugRows] = await pool.query(
+        `SELECT u.uid AS sponsor_uid, u.public_uid AS sponsor_public_uid, u.referral_slug,
+                m.username AS sponsor_username
+         FROM usertab u
+         INNER JOIN memberstab m ON m.uid = u.uid
+         WHERE u.referral_slug = ?
+         LIMIT 1`,
+        [slug]
+      );
+      if (slugRows.length > 0) {
+        return res.json({
+          invite: {
+            token: slug,
+            referral_slug: slug,
+            sponsor_uid: slugRows[0].sponsor_uid,
+            sponsor_public_uid: slugRows[0].sponsor_public_uid,
+            sponsor_username: slugRows[0].sponsor_username,
+            reusable: true,
+          },
+        });
+      }
+    }
+
     await ensureReferralInvitesTable();
     const [rows] = await pool.query(
       `SELECT ri.token, ri.sponsor_uid, ri.placement_uid, ri.position, m.username AS sponsor_username
@@ -214,11 +324,11 @@ router.post('/public-register', async (req, res) => {
   try {
     await ensureReferralInvitesTable();
     const {
-      token, activationCode, username, password,
-      firstname, lastname, middlename
+      token, slug, activationCode, username, password,
+      firstname, lastname, middlename, tin, email, deviceFingerprint
     } = req.body;
 
-    if (!token || !activationCode || !username || !password || !firstname || !lastname) {
+    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -228,15 +338,41 @@ router.post('/public-register', async (req, res) => {
       return res.status(400).json({ error: 'Password must be 6-50 characters' });
     }
 
-    const [rows] = await pool.query(
-      `SELECT sponsor_uid, placement_uid, position
-       FROM referral_invitestab
-       WHERE token = ? AND active = 1 LIMIT 1`,
-      [token]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
+    let invite;
+    let reusableSlug = false;
+    if (slug) {
+      const normalizedSlug = normalizeReferralSlug(slug);
+      const [sponsorRows] = await pool.query(
+        'SELECT uid, referral_slug FROM usertab WHERE referral_slug = ? LIMIT 1',
+        [normalizedSlug]
+      );
+      if (sponsorRows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
 
-    const invite = rows[0];
+      const [settingsRows] = await pool.query(
+        'SELECT placement_mode FROM sponsor_placement_settingstab WHERE sponsor_uid = ? LIMIT 1',
+        [sponsorRows[0].uid]
+      ).catch(() => [[]]);
+      const placementMode = settingsRows[0]?.placement_mode || 'balanced';
+      const preferredPosition = placementMode === 'left' ? 1 : placementMode === 'right' ? 2 : 0;
+      const placement = await findBalancedPlacement(Number(sponsorRows[0].uid), preferredPosition);
+      invite = {
+        sponsor_uid: Number(sponsorRows[0].uid),
+        placement_uid: placement.placementUid,
+        position: placement.position,
+        referral_slug: normalizedSlug,
+      };
+      reusableSlug = true;
+    } else {
+      const [rows] = await pool.query(
+        `SELECT sponsor_uid, placement_uid, position
+         FROM referral_invitestab
+         WHERE token = ? AND active = 1 LIMIT 1`,
+        [token]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
+      invite = rows[0];
+    }
+
     const result = await registrationService.registerMember({
       activationCode,
       sponsorUid: Number(invite.sponsor_uid),
@@ -246,10 +382,43 @@ router.post('/public-register', async (req, res) => {
       firstname,
       lastname,
       middlename,
+      tin,
+      email,
       position: Number(invite.position),
     });
 
-    await pool.query('UPDATE referral_invitestab SET active = 0 WHERE token = ? LIMIT 1', [token]);
+    if (!reusableSlug) {
+      await pool.query('UPDATE referral_invitestab SET active = 0 WHERE token = ? LIMIT 1', [token]);
+    }
+
+    await ensureReferralSlug(Number(result.uid)).catch(() => {});
+    await pool.query(
+      `INSERT INTO public_registration_audittab
+       (registration_uid, sponsor_uid, new_member_uid, referral_slug, activation_code,
+        registration_ip, device_fingerprint, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'completed')`,
+      [
+        createPublicId(),
+        Number(invite.sponsor_uid),
+        Number(result.uid),
+        invite.referral_slug || String(token || '').slice(0, 32),
+        activationCode,
+        req.ip || null,
+        String(deviceFingerprint || '').slice(0, 256) || null,
+      ]
+    ).catch(() => {});
+
+    await writeAuditLog({
+      req,
+      actorUid: Number(invite.sponsor_uid),
+      actorRole: 'member',
+      action: 'registration.public_register',
+      targetUid: Number(result.uid),
+      targetTable: 'usertab',
+      targetId: String(result.uid),
+      afterState: { placementUid: invite.placement_uid, position: invite.position },
+    }).catch(() => {});
+
     res.json(result);
   } catch (err) {
     console.error('[Registration] Public registration error:', err);

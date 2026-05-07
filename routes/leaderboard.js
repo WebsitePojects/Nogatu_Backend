@@ -136,8 +136,39 @@ router.get('/', memberAuth, async (req, res) => {
       row.supervisorRankLabel = rank > 0 ? `Supervisor ${rank}` : 'Unranked';
     }
 
+    let rankDefinitions = [];
+    try {
+      const [definitionRows] = await pool.query(
+        `SELECT rank_code, rank_name, points_required, left_rank_required, right_rank_required,
+                incentive_summary, cash_incentive, sort_order
+         FROM rank_definitionstab
+         WHERE is_active = 1
+         ORDER BY sort_order ASC`
+      );
+      rankDefinitions = definitionRows.map((rank) => ({
+        ...rank,
+        points_required: Number(rank.points_required || 0),
+        cash_incentive: Number(rank.cash_incentive || 0),
+      }));
+    } catch (definitionErr) {
+      if (definitionErr.code !== 'ER_NO_SUCH_TABLE') throw definitionErr;
+      rankDefinitions = [
+        { rank_code: 'supervisor_1', rank_name: 'Supervisor 1', points_required: 10000, incentive_summary: 'D.P Motorcycle, 5,000 Cash, White T-shirt' },
+        { rank_code: 'supervisor_2', rank_name: 'Supervisor 2', points_required: 20000, incentive_summary: 'Laptop, 10,000 Cash, White Polo Shirt' },
+        { rank_code: 'supervisor_3', rank_name: 'Supervisor 3', points_required: 40000, incentive_summary: 'International Asian Travel, 20,000 Cash, White polo shirt with red collar, Silver Pin' },
+        { rank_code: 'manager_1', rank_name: 'Manager 1', points_required: 60000, incentive_summary: 'D.P Car Sedan, 30,000 Cash, Red T-Shirt' },
+        { rank_code: 'manager_2', rank_name: 'Manager 2', points_required: 100000, incentive_summary: 'D.P Car SUV, 50,000 Cash, Red Polo Shirt' },
+        { rank_code: 'manager_3', rank_name: 'Manager 3', points_required: 200000, incentive_summary: 'D.P Condo Unit, 100,000 Cash, Red Polo Shirt with Black Collar, Gold Pin' },
+        { rank_code: 'director_1', rank_name: 'Director 1', points_required: 600000, incentive_summary: 'Sedan Full Payment, 200,000 Cash, Black Shirt' },
+        { rank_code: 'director_2', rank_name: 'Director 2', points_required: 1000000, incentive_summary: 'SUV Full Payment, 300,000 Cash, Black Polo Shirt' },
+        { rank_code: 'director_3', rank_name: 'Director 3', points_required: 1600000, incentive_summary: 'Condo Fully Paid, 500,000 Cash, Black Polo Shirt, Black Jacket, Ring' },
+        { rank_code: 'ambassador', rank_name: 'AMBASSADOR', points_required: 2000000, incentive_summary: '1,000,000 Cash, Yellow Polo Shirt, White Jacket, 1 Pin and a Ring, US travel for 2, One point for global bonus' },
+      ];
+    }
+
     res.json({
       leaderboard,
+      rankDefinitions,
       userRank,
       userPoints,
       userSupervisorRank: Number(userProgress.currentRank || 0),
