@@ -5,33 +5,22 @@
 const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
-const { checkH5Bonus, getDrefPurchase, insertRedeem, PRODUCT_TYPE_TO_KEY } = require('../services/income/hifiveBonus');
-
-const PRODUCT_NAMES = {
-  bl: 'Barley', gl: 'Glutathione', glc: 'Gluta w/ Collagen',
-  cm: 'Coffee Mix', cd: 'Chocolate Drink', mgt: 'Mangosteen',
-  vz: 'Vitamin Zinc', cmm: 'Max Coffee', bkc: 'Black Coffee',
-};
+const {
+  buildHiFiveStatus,
+  insertProductRedeem,
+  submitPackageClaim,
+} = require('../services/income/hifiveBonus');
 
 /**
  * GET /api/hifive
- * Get Hi-Five bonus status for all products
+ * Get Hi-Five package + product status
  */
 router.get('/', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
-    const bonuses = await checkH5Bonus(uid);
-    const purchases = await getDrefPurchase(uid);
+    const status = await buildHiFiveStatus(uid);
 
-    const products = Object.entries(PRODUCT_NAMES).map(([key, name]) => ({
-      key,
-      name,
-      bonus: bonuses[key] || 0,
-      purchases: purchases[key] || 0,
-      redeemable: Math.max(0, Math.floor((purchases[key] || 0) / 5) - (bonuses[key] || 0)),
-    }));
-
-    res.json({ products });
+    res.json(status);
   } catch (err) {
     console.error('[HiFive] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -45,14 +34,51 @@ router.get('/', memberAuth, async (req, res) => {
 router.post('/redeem', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
-    const { bonusType, quantity } = req.body;
+    const { claimType = 'product', bonusType, quantity } = req.body;
+    const claimQty = Math.max(1, Number(quantity) || 1);
+    const status = await buildHiFiveStatus(uid);
 
-    if (!bonusType || !quantity || quantity < 1) {
+    if (!bonusType || claimQty < 1) {
       return res.status(400).json({ error: 'Invalid redemption request' });
     }
 
-    await insertRedeem(uid, bonusType, quantity);
-    res.json({ success: true });
+    if (claimType === 'package') {
+      const packageStatus = status.packageBonus.packages.find((item) => item.key === bonusType);
+      if (!packageStatus) {
+        return res.status(400).json({ error: 'Invalid package Hi-Five type.' });
+      }
+
+      if (claimQty > packageStatus.availableClaims) {
+        return res.status(422).json({ error: 'Requested package claim exceeds your available Hi-Five package claims.' });
+      }
+
+      await submitPackageClaim(uid, bonusType, claimQty);
+      return res.json({
+        success: true,
+        message: `${packageStatus.name} package Hi-Five claim submitted for review.`,
+      });
+    }
+
+    const productStatus = status.productBonus.products.find((item) => item.key === bonusType);
+    if (!productStatus) {
+      return res.status(400).json({ error: 'Invalid product Hi-Five type.' });
+    }
+
+    if (!status.productBonus.eligible) {
+      return res.status(422).json({
+        error: `You need ${status.productBonus.pointsNeeded} more maintenance point(s) to redeem Hi-Five products.`,
+      });
+    }
+
+    if (claimQty > productStatus.availableClaims) {
+      return res.status(422).json({ error: 'Requested product redemption exceeds your available Hi-Five product claims.' });
+    }
+
+    await insertProductRedeem(uid, bonusType, claimQty);
+    return res.json({
+      success: true,
+      message: `${productStatus.name} product Hi-Five redemption submitted successfully.`,
+    });
   } catch (err) {
     console.error('[HiFive] Redeem error:', err);
     res.status(500).json({ error: err.message });
