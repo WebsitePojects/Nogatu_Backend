@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const { pool } = require('../../config/database');
-const { ACCOUNT_TYPES, previousMonthRange } = require('../../utils/helpers');
+const { ACCOUNT_TYPES, PRODUCT_TYPES, previousMonthRange, nowMySQL } = require('../../utils/helpers');
+const { writeAuditLog } = require('../audit');
+const { createProcessKey, createPublicId } = require('../../utils/security');
 
 const PRODUCT_COLS = {
   bl: 'prod0',
@@ -259,7 +261,11 @@ async function getDirectReferralPackageCounts(uid) {
 }
 
 async function getPackageRewardAmounts() {
-  const [rows] = await pool.query(
+  return getPackageRewardAmountsFromConn(pool);
+}
+
+async function getPackageRewardAmountsFromConn(conn) {
+  const [rows] = await conn.query(
     `SELECT producttype, MAX(productamount) AS amount
      FROM codestab
      WHERE producttype IN (10, 20, 30, 40, 50, 60)
@@ -275,6 +281,324 @@ async function getPackageRewardAmounts() {
   }
 
   return rewardAmounts;
+}
+
+function getClaimStatusLabel(status) {
+  switch (status) {
+    case 'pending_review':
+      return 'Pending Review';
+    case 'approved':
+      return 'Approved';
+    case 'paid':
+      return 'Paid';
+    case 'forfeited':
+      return 'Rejected';
+    default:
+      return status;
+  }
+}
+
+function formatPackageClaimRow(row, rewardAmounts = {}) {
+  const packageKey = String(row.package_or_product || '').toLowerCase();
+  const packageRule = PACKAGE_RULES_BY_KEY[packageKey];
+  const qualifyingCount = Number(row.qualifying_count || 0);
+  const rewardAmount = Number(rewardAmounts[packageKey] || 0);
+  const totalPayout = qualifyingCount * rewardAmount;
+
+  return {
+    id: Number(row.id),
+    qualificationUid: row.qualification_uid,
+    memberUid: Number(row.member_uid),
+    username: row.username,
+    fullname: fullName(row),
+    packageKey,
+    packageCode: packageRule?.code || null,
+    packageName: packageRule?.name || PRODUCT_TYPES[packageRule?.code] || packageKey,
+    qualifyingCount,
+    rewardAmount,
+    totalPayout,
+    status: row.status,
+    statusLabel: getClaimStatusLabel(row.status),
+    suspiciousFlags: row.suspicious_flags || null,
+    adminNotes: row.admin_notes || '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function listPackageClaims({ page = 1, perPage = 30, status = '', startDate = '', endDate = '' } = {}) {
+  if (!(await hasHiFiveQualificationTable())) {
+    return { records: [], total: 0, page: 1, totalPages: 0 };
+  }
+
+  const safePage = Math.max(1, Number(page) || 1);
+  const safePerPage = Math.min(100, Math.max(1, Number(perPage) || 30));
+  const offset = (safePage - 1) * safePerPage;
+  const safeStatus = String(status || '').trim();
+
+  const where = [`hq.hifive_type = 'package'`];
+  const params = [];
+
+  if (safeStatus) {
+    where.push('hq.status = ?');
+    params.push(safeStatus);
+  }
+  if (startDate) {
+    where.push("DATE_FORMAT(hq.created_at, '%Y-%m-%d') >= ?");
+    params.push(startDate);
+  }
+  if (endDate) {
+    where.push("DATE_FORMAT(hq.created_at, '%Y-%m-%d') <= ?");
+    params.push(endDate);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const [[countRow], rewardAmounts] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*) AS total
+       FROM hifive_qualificationstab hq
+       LEFT JOIN memberstab m ON m.uid = hq.member_uid
+       ${whereSql}`,
+      params
+    ).then(([rows]) => rows),
+    getPackageRewardAmounts(),
+  ]);
+
+  const [rows] = await pool.query(
+    `SELECT hq.*, m.username, m.firstname, m.lastname
+     FROM hifive_qualificationstab hq
+     LEFT JOIN memberstab m ON m.uid = hq.member_uid
+     ${whereSql}
+     ORDER BY hq.created_at DESC, hq.id DESC
+     LIMIT ?, ?`,
+    [...params, offset, safePerPage]
+  );
+
+  const total = Number(countRow.total || 0);
+  return {
+    records: rows.map((row) => formatPackageClaimRow(row, rewardAmounts)),
+    total,
+    page: safePage,
+    totalPages: Math.ceil(total / safePerPage),
+  };
+}
+
+async function approvePackageClaim(qualificationUid, { adminUid = null, adminNotes = '', req = null } = {}) {
+  if (!(await hasHiFiveQualificationTable())) {
+    throw new Error('Package Hi-Five claims are not ready because the qualification table is missing.');
+  }
+
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    const [claimRows] = await conn.query(
+      `SELECT hq.*, m.username, m.firstname, m.lastname
+       FROM hifive_qualificationstab hq
+       LEFT JOIN memberstab m ON m.uid = hq.member_uid
+       WHERE hq.qualification_uid = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [qualificationUid]
+    );
+
+    if (claimRows.length === 0) {
+      throw new Error('Package claim not found.');
+    }
+
+    const claim = claimRows[0];
+    if (claim.hifive_type !== 'package') {
+      throw new Error('Claim is not a package Hi-Five claim.');
+    }
+    if (claim.status !== 'pending_review') {
+      throw new Error('Claim has already been processed.');
+    }
+
+    const rewardAmounts = await getPackageRewardAmountsFromConn(conn);
+    const formattedClaim = formatPackageClaimRow(claim, rewardAmounts);
+    if (!(formattedClaim.packageKey in rewardAmounts) || formattedClaim.rewardAmount <= 0) {
+      throw new Error('Unable to resolve package reward amount for this claim.');
+    }
+
+    const [walletRows] = await conn.query(
+      'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [claim.member_uid]
+    );
+
+    const beginningBalance = Number(walletRows[0]?.ttlcashbalance || 0);
+    const endingBalance = beginningBalance + formattedClaim.totalPayout;
+    const now = nowMySQL();
+    const processKey = createProcessKey(['hifive', 'package-claim', qualificationUid]);
+
+    await conn.query(
+      `INSERT INTO payouthistorytab
+       (pid, uid, mainid, beginningbalance, endingbalance, cashbalance,
+        income1, income2, income3, income4, income5, income6,
+        income7, income8, income9, income10,
+        encashment1, tax_1, encashment2, tax_2, encashmentfee, cddeduction,
+        cashstatus, transdate, transactiontype, stockistid, processid)
+       VALUES (NULL, ?, NULL, ?, ?, 0,
+        0, 0, 0, 0, ?, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0,
+        0, ?, 1, 0, ?)`,
+      [
+        claim.member_uid,
+        beginningBalance,
+        endingBalance,
+        formattedClaim.totalPayout,
+        now,
+        processKey,
+      ]
+    );
+
+    await conn.query(
+      `INSERT INTO payouttotaltab
+       (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
+        ttlcashbalance, ttlpointsbalance, transdate)
+       VALUES (?, NULL, 0, 0, 0, 0, ?, 0, 0, ?, 0, ?)
+       ON DUPLICATE KEY UPDATE
+        ttlincome5 = ttlincome5 + VALUES(ttlincome5),
+        ttlcashbalance = VALUES(ttlcashbalance),
+        transdate = VALUES(transdate)`,
+      [claim.member_uid, formattedClaim.totalPayout, endingBalance, now]
+    );
+
+    try {
+      await conn.query(
+        `INSERT INTO income_eventstab
+         (event_uid, process_key, beneficiary_uid, income_type, source_ref_uid, source_ref_type,
+          gross_amount, tax_deduction, processing_fee, cd_deduction, maintenance_fee,
+          net_amount, status, credited_at)
+         VALUES (?, ?, ?, 'hifive_package', ?, 'hifive_qualificationstab',
+          ?, 0, 0, 0, 0, ?, 'credited', CURRENT_TIMESTAMP(6))`,
+        [
+          createPublicId(),
+          processKey,
+          claim.member_uid,
+          qualificationUid,
+          formattedClaim.totalPayout,
+          formattedClaim.totalPayout,
+        ]
+      );
+    } catch (ledgerError) {
+      if (ledgerError.code !== 'ER_NO_SUCH_TABLE') {
+        throw ledgerError;
+      }
+    }
+
+    await conn.query(
+      `UPDATE hifive_qualificationstab
+       SET status = 'paid',
+           admin_notes = ?,
+           updated_at = CURRENT_TIMESTAMP(6)
+       WHERE qualification_uid = ?
+       LIMIT 1`,
+      [String(adminNotes || '').trim() || 'Approved and paid by admin', qualificationUid]
+    );
+
+    await writeAuditLog(conn, {
+      req,
+      actorUid: adminUid,
+      actorRole: 'admin',
+      action: 'hifive.package_claim.approve',
+      targetUid: claim.member_uid,
+      targetTable: 'hifive_qualificationstab',
+      targetId: qualificationUid,
+      beforeState: {
+        status: claim.status,
+        totalPayout: formattedClaim.totalPayout,
+        balanceBefore: beginningBalance,
+      },
+      afterState: {
+        status: 'paid',
+        totalPayout: formattedClaim.totalPayout,
+        balanceAfter: endingBalance,
+        packageKey: formattedClaim.packageKey,
+      },
+    });
+
+    await conn.commit();
+    return {
+      success: true,
+      claim: {
+        ...formattedClaim,
+        status: 'paid',
+        statusLabel: getClaimStatusLabel('paid'),
+        adminNotes: String(adminNotes || '').trim() || 'Approved and paid by admin',
+      },
+      creditedAmount: formattedClaim.totalPayout,
+    };
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+async function rejectPackageClaim(qualificationUid, { adminUid = null, adminNotes = '', req = null } = {}) {
+  if (!(await hasHiFiveQualificationTable())) {
+    throw new Error('Package Hi-Five claims are not ready because the qualification table is missing.');
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [claimRows] = await conn.query(
+      `SELECT *
+       FROM hifive_qualificationstab
+       WHERE qualification_uid = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [qualificationUid]
+    );
+
+    if (claimRows.length === 0) {
+      throw new Error('Package claim not found.');
+    }
+
+    const claim = claimRows[0];
+    if (claim.hifive_type !== 'package') {
+      throw new Error('Claim is not a package Hi-Five claim.');
+    }
+    if (claim.status !== 'pending_review') {
+      throw new Error('Claim has already been processed.');
+    }
+
+    const note = String(adminNotes || '').trim() || 'Rejected by admin';
+    await conn.query(
+      `UPDATE hifive_qualificationstab
+       SET status = 'forfeited',
+           admin_notes = ?,
+           updated_at = CURRENT_TIMESTAMP(6)
+       WHERE qualification_uid = ?
+       LIMIT 1`,
+      [note, qualificationUid]
+    );
+
+    await writeAuditLog(conn, {
+      req,
+      actorUid: adminUid,
+      actorRole: 'admin',
+      action: 'hifive.package_claim.reject',
+      targetUid: claim.member_uid,
+      targetTable: 'hifive_qualificationstab',
+      targetId: qualificationUid,
+      beforeState: { status: claim.status },
+      afterState: { status: 'forfeited', adminNotes: note },
+    });
+
+    await conn.commit();
+    return { success: true, status: 'forfeited', statusLabel: getClaimStatusLabel('forfeited') };
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
 }
 
 async function getPackageClaimedSets(uid) {
@@ -429,4 +753,8 @@ module.exports = {
   buildHiFiveStatus,
   insertProductRedeem,
   submitPackageClaim,
+  listPackageClaims,
+  approvePackageClaim,
+  rejectPackageClaim,
+  formatPackageClaimRow,
 };

@@ -233,6 +233,7 @@ app.use('/api/admin/accounts', require('./routes/admin/accounts'));
 app.use('/api/admin/codes', require('./routes/admin/codes'));
 app.use('/api/admin/encashment', require('./routes/admin/encashment'));
 app.use('/api/admin/redeem', require('./routes/admin/redeem'));
+app.use('/api/admin/hifive', require('./routes/admin/hifive'));
 app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
 app.use('/api/admin/news', require('./routes/admin/news'));
 app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
