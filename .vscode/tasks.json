@@ -14,6 +14,17 @@
 			"label": "inspect-auth-formats-2",
 			"type": "shell",
 			"command": "node -e \"console.log('hello2')\""
+		},
+		{
+			"label": "start-backend-dev",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"dev"
+			],
+			"isBackground": true,
+			"problemMatcher": []
 		}
 	]
 }
