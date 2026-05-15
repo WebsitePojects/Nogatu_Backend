@@ -71,11 +71,12 @@ router.get('/', memberAuth, async (req, res) => {
     const offset = (page - 1) * perPage;
 
     const [totalRows, reports, counts] = await Promise.all([
-      pool.query('SELECT COUNT(*) AS total FROM pairingstab WHERE uid = ?', [uid]).then(([rows]) => rows),
+      pool.query('SELECT COUNT(*) AS total FROM pairingstab WHERE uid = ? AND totalpoints >= 1', [uid]).then(([rows]) => rows),
       pool.query(
         `SELECT *
          FROM pairingstab
          WHERE uid = ?
+           AND totalpoints >= 1
          ORDER BY id DESC
          LIMIT ? OFFSET ?`,
         [uid, perPage, offset]

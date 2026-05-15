@@ -24,11 +24,11 @@ router.get('/', memberAuth, async (req, res) => {
 /**
  * POST /api/vouchers/redeem
  * Redeem a voucher with cash top-up for product purchase
- * Body: { voucherId?, cashAmount, productName? }
+ * Body: { voucherId?, cashAmount, productKey?, productCode?, productName? }
  */
 router.post('/redeem', memberAuth, async (req, res) => {
   try {
-    const { voucherId, cashAmount, productName } = req.body;
+    const { voucherId, cashAmount, productKey, productCode, productName } = req.body;
     const parsedCashAmount = Number(cashAmount);
 
     if (!Number.isFinite(parsedCashAmount) || parsedCashAmount <= 0) {
@@ -46,6 +46,8 @@ router.post('/redeem', memberAuth, async (req, res) => {
     const safeProductName = typeof productName === 'string' ? productName.trim() : '';
 
     const result = await redeemVoucher(req.session.uid, parsedVoucherId, parsedCashAmount, {
+      productKey,
+      productCode,
       productName: safeProductName,
     });
     res.json({ success: true, ...result });

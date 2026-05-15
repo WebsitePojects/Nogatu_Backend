@@ -253,9 +253,13 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
       };
       response.rows = incomeRows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
       response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
-    } else if (['leadership-bonus', 'hifive-bonus', 'hi-five-bonus', 'ranking-bonus', 'lpc'].includes(metric)) {
+    } else if (metric === 'lpc') {
+      response.formula = 'LPC is disabled for launch; legacy income6 is reserved for Ranking Bonus.';
+      response.rows = [];
+      response.total = 0;
+    } else if (['leadership-bonus', 'hifive-bonus', 'hi-five-bonus', 'ranking-bonus'].includes(metric)) {
       const incomeColumn = metric.includes('leadership') ? 'income3'
-        : metric.includes('ranking') || metric.includes('lpc') ? 'income6'
+        : metric.includes('ranking') ? 'income6'
           : 'income5';
       const [rows] = await pool.query(
         `SELECT pid, ${incomeColumn} AS amount, transdate, processid

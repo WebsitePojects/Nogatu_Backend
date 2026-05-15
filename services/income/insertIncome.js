@@ -52,6 +52,7 @@ function getNextPayoutDate(baseDate = new Date()) {
  * @param {number} uid - User ID
  * @param {Object} income - Income breakdown object
  *   { dref, paircash, leadership, unilevel, hifive, lpc, beginningbalance, endingbalance }
+ *   income6 is reserved for Ranking Bonus fulfillment; calculateAndStoreIncome sends lpc=0.
  */
 async function insertIncome(uid, income) {
   const {

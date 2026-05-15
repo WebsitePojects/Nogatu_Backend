@@ -176,7 +176,8 @@ router.get('/:pid/details', adminAuth, adminRights([1, 3]), async (req, res) => 
       leadership: Number(row.income3 || 0),
       unilevel: Number(row.income4 || 0),
       hifive: Number(row.income5 || 0),
-      lpc: Number(row.income6 || 0),
+      rankingBonus: Number(row.income6 || 0),
+      legacyIncome6: Number(row.income6 || 0),
     };
 
     const payoutId = Number(row.paymentoptions || row.payoutid || 0);

@@ -11,6 +11,7 @@ const registrationService = require('../services/registration');
 const { resolveTin, isValidTin } = require('../utils/tin');
 const { createReferralSlug, normalizeReferralSlug, createPublicId } = require('../utils/security');
 const { writeAuditLog } = require('../services/audit');
+const { recommendPlacementForSponsor } = require('../services/placementRecommendation');
 
 async function ensureReferralInvitesTable() {
   await pool.query(
@@ -63,31 +64,19 @@ async function ensureReferralSlug(uid) {
   return { publicUid, slug };
 }
 
-async function findBalancedPlacement(rootUid, preferredPosition = 0) {
-  const queue = [Number(rootUid)];
-  const visited = new Set();
+async function buildPlacementPreview(sponsorUid, conn = pool) {
+  const placement = await recommendPlacementForSponsor(Number(sponsorUid), conn);
+  const [rows] = await conn.query(
+    'SELECT username FROM memberstab WHERE uid = ? LIMIT 1',
+    [placement.placementUid]
+  );
 
-  while (queue.length > 0 && visited.size < 5000) {
-    const placementUid = queue.shift();
-    if (!placementUid || visited.has(placementUid)) continue;
-    visited.add(placementUid);
-
-    const [children] = await pool.query(
-      'SELECT uid, position FROM usertab WHERE refid = ? ORDER BY position ASC, id ASC',
-      [placementUid]
-    );
-    const left = children.find((row) => Number(row.position) === 1);
-    const right = children.find((row) => Number(row.position) === 2);
-
-    if (preferredPosition === 1 && !left) return { placementUid, position: 1 };
-    if (preferredPosition === 2 && !right) return { placementUid, position: 2 };
-    if (!left) return { placementUid, position: 1 };
-    if (!right) return { placementUid, position: 2 };
-
-    for (const child of children) queue.push(Number(child.uid));
-  }
-
-  throw new Error('No available placement position was found for this referral.');
+  return {
+    ...placement,
+    placementUsername: rows[0]?.username || null,
+    positionLabel: Number(placement.position) === 1 ? 'Left' : 'Right',
+    note: 'System auto-assigns placement on the weak leg to help generate guaranteed binary points.',
+  };
 }
 
 /**
@@ -163,6 +152,16 @@ router.get('/available-position', memberAuth, async (req, res) => {
   }
 });
 
+router.get('/default-placement', memberAuth, async (req, res) => {
+  try {
+    const placement = await buildPlacementPreview(Number(req.session.uid));
+    res.json({ placement });
+  } catch (err) {
+    console.error('[Registration] Default placement error:', err);
+    res.status(500).json({ error: 'Unable to load the recommended placement right now.' });
+  }
+});
+
 /**
  * GET /api/registration/check-duplicate-name?firstname=XXX&lastname=XXX
  * Check for one-name duplicates (DOC2 §4.4)
@@ -223,16 +222,13 @@ router.get('/referral-link', memberAuth, async (req, res) => {
   try {
     const identity = await ensureReferralSlug(Number(req.session.uid));
     if (!identity) return res.status(404).json({ error: 'Sponsor account not found.' });
-
-    const [settingsRows] = await pool.query(
-      'SELECT placement_mode FROM sponsor_placement_settingstab WHERE sponsor_uid = ? LIMIT 1',
-      [req.session.uid]
-    ).catch(() => [[]]);
+    const placement = await buildPlacementPreview(Number(req.session.uid));
 
     res.json({
       slug: identity.slug,
       publicUid: identity.publicUid,
-      placementMode: settingsRows[0]?.placement_mode || 'balanced',
+      placementMode: 'weak-leg',
+      placement,
     });
   } catch (err) {
     console.error('[Registration] referral link error:', err);
@@ -248,15 +244,20 @@ router.post('/referral-invite', memberAuth, async (req, res) => {
   try {
     await ensureReferralInvitesTable();
     const sponsorUid = Number(req.session.uid);
-    const placementUid = Number(req.body?.placementUid || sponsorUid);
+    const placementUid = Number(req.body?.placementUid || 0);
     const requestedPosition = Number(req.body?.position || 0);
+    const placement = (placementUid && [1, 2].includes(requestedPosition))
+      ? {
+          placementUid,
+          position: requestedPosition,
+          positionLabel: requestedPosition === 1 ? 'Left' : 'Right',
+          side: requestedPosition === 1 ? 'left' : 'right',
+          strategy: 'manual',
+          note: 'Manual placement was selected for this referral invite.',
+        }
+      : await buildPlacementPreview(sponsorUid);
 
-    const position = requestedPosition || await registrationService.getAvailablePosition(placementUid);
-    if (![1, 2].includes(position)) {
-      return res.status(400).json({ error: 'No available placement position for this referral invite.' });
-    }
-
-    const occupied = await registrationService.checkPlacement(placementUid, position);
+    const occupied = await registrationService.checkPlacement(placement.placementUid, placement.position);
     if (occupied) {
       return res.status(400).json({ error: 'Selected placement position is already taken.' });
     }
@@ -266,10 +267,18 @@ router.post('/referral-invite', memberAuth, async (req, res) => {
     await pool.query(
       `INSERT INTO referral_invitestab (sponsor_uid, placement_uid, position, token, active, created_at)
        VALUES (?, ?, ?, ?, 1, NOW())`,
-      [sponsorUid, placementUid, position, token]
+      [sponsorUid, placement.placementUid, placement.position, token]
     );
 
-    res.json({ invite: { token, sponsor_uid: sponsorUid, placement_uid: placementUid, position } });
+    res.json({
+      invite: {
+        token,
+        sponsor_uid: sponsorUid,
+        placement_uid: placement.placementUid,
+        position: placement.position,
+        placement,
+      },
+    });
   } catch (err) {
     console.error('[Registration] Referral invite create error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -328,7 +337,7 @@ router.post('/public-register', async (req, res) => {
       firstname, lastname, middlename, tin, email, deviceFingerprint
     } = req.body;
 
-    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname) {
+    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname || !email) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -347,14 +356,7 @@ router.post('/public-register', async (req, res) => {
         [normalizedSlug]
       );
       if (sponsorRows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
-
-      const [settingsRows] = await pool.query(
-        'SELECT placement_mode FROM sponsor_placement_settingstab WHERE sponsor_uid = ? LIMIT 1',
-        [sponsorRows[0].uid]
-      ).catch(() => [[]]);
-      const placementMode = settingsRows[0]?.placement_mode || 'balanced';
-      const preferredPosition = placementMode === 'left' ? 1 : placementMode === 'right' ? 2 : 0;
-      const placement = await findBalancedPlacement(Number(sponsorRows[0].uid), preferredPosition);
+      const placement = await buildPlacementPreview(Number(sponsorRows[0].uid));
       invite = {
         sponsor_uid: Number(sponsorRows[0].uid),
         placement_uid: placement.placementUid,
@@ -434,13 +436,13 @@ router.post('/register', memberAuth, async (req, res) => {
   try {
     const {
       activationCode, placementUid, username, password,
-      firstname, lastname, middlename, position, tin, tinno
+      firstname, lastname, middlename, position, tin, tinno, email
     } = req.body;
 
     const rawTin = String(tin || tinno || '').trim();
 
     // Input validation
-    if (!activationCode || !username || !password || !firstname || !lastname || !placementUid || !rawTin) {
+    if (!activationCode || !username || !password || !firstname || !lastname || !rawTin || !email) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -457,17 +459,22 @@ router.post('/register', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
     }
 
+    const recommendedPlacement = !placementUid
+      ? await buildPlacementPreview(Number(req.session.uid))
+      : null;
+
     const result = await registrationService.registerMember({
       activationCode,
       sponsorUid: req.session.uid,
-      placementUid: Number(placementUid),
+      placementUid: recommendedPlacement ? Number(recommendedPlacement.placementUid) : Number(placementUid),
       username,
       password,
       firstname,
       lastname,
       middlename,
       tin: rawTin,
-      position: Number(position),
+      email,
+      position: recommendedPlacement ? Number(recommendedPlacement.position) : Number(position),
     });
 
     res.json(result);

@@ -3,6 +3,8 @@ const { pool } = require('../../config/database');
 const { ACCOUNT_TYPES, PRODUCT_TYPES, previousMonthRange, nowMySQL } = require('../../utils/helpers');
 const { writeAuditLog } = require('../audit');
 const { createProcessKey, createPublicId } = require('../../utils/security');
+const { getEffectiveAccountState } = require('../accountState');
+const { countsForDirectReferralSource } = require('./directReferral');
 
 const PRODUCT_COLS = {
   bl: 'prod0',
@@ -77,22 +79,58 @@ function normalizeCountMap(keys) {
   return Object.fromEntries(keys.map((key) => [key, 0]));
 }
 
-function buildProductSummary({ purchasesByKey, claimedByKey, maintenancePoints, threshold = 200, contributorsByKey = {} }) {
+function summarizeProductReferralRows(rows = []) {
+  const qualifyingReferralsByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
+  const rawPurchasesByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
+  const contributorsByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
+
+  for (const row of rows) {
+    const key = PRODUCT_TYPE_TO_KEY[row.producttype];
+    if (!key) continue;
+
+    rawPurchasesByKey[key] += Number(row.cnt || 0);
+    qualifyingReferralsByKey[key] += 1;
+    contributorsByKey[key] = contributorsByKey[key] || [];
+    contributorsByKey[key].push({
+      uid: Number(row.referralUid),
+      username: row.username,
+      fullName: fullName(row),
+      count: Number(row.cnt || 0),
+      lastTransdate: row.lastTransdate,
+    });
+  }
+
+  return { qualifyingReferralsByKey, rawPurchasesByKey, contributorsByKey };
+}
+
+function buildProductSummary({
+  qualifyingReferralsByKey,
+  rawPurchasesByKey,
+  purchasesByKey,
+  claimedByKey,
+  maintenancePoints,
+  threshold = 200,
+  contributorsByKey = {},
+}) {
   const eligible = maintenancePoints >= threshold;
   const pointsNeeded = Math.max(0, threshold - maintenancePoints);
+  const qualifyingCounts = qualifyingReferralsByKey || purchasesByKey || {};
+  const rawCounts = rawPurchasesByKey || purchasesByKey || {};
 
   const products = Object.entries(PRODUCT_METADATA).map(([key, meta]) => {
-    const purchases = Number(purchasesByKey[key] || 0);
+    const qualifyingReferrals = Number(qualifyingCounts[key] || 0);
+    const purchases = Number(rawCounts[key] || 0);
     const claimed = Number(claimedByKey[key] || 0);
-    const qualifiedSets = Math.floor(purchases / 5);
+    const qualifiedSets = Math.floor(qualifyingReferrals / 5);
     const availableClaims = eligible ? Math.max(0, qualifiedSets - claimed) : 0;
-    const remainder = purchases % 5;
+    const remainder = qualifyingReferrals % 5;
 
     return {
       key,
       code: meta.code,
       name: meta.name,
       purchasePoints: meta.purchasePoints,
+      qualifyingDirectReferrals: qualifyingReferrals,
       directReferralPurchases: purchases,
       qualifiedSets,
       claimedSets: claimed,
@@ -187,25 +225,7 @@ async function getDirectReferralProductPurchases(uid) {
     [uid]
   );
 
-  const purchasesByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
-  const contributorsByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
-
-  for (const row of rows) {
-    const key = PRODUCT_TYPE_TO_KEY[row.producttype];
-    if (!key) continue;
-
-    purchasesByKey[key] += Number(row.cnt || 0);
-    contributorsByKey[key] = contributorsByKey[key] || [];
-    contributorsByKey[key].push({
-      uid: Number(row.referralUid),
-      username: row.username,
-      fullName: fullName(row),
-      count: Number(row.cnt || 0),
-      lastTransdate: row.lastTransdate,
-    });
-  }
-
-  return { purchasesByKey, contributorsByKey };
+  return summarizeProductReferralRows(rows);
 }
 
 async function getMaintenanceProductPoints(uid) {
@@ -224,11 +244,28 @@ async function getMaintenanceProductPoints(uid) {
   return Number(rows[0]?.ttlpoints || 0);
 }
 
+async function getAllDirectReferralCount(uid) {
+  const [rows] = await pool.query(
+    `SELECT COUNT(*) AS total
+       FROM usertab
+      WHERE drefid = ?`,
+    [uid]
+  );
+
+  return Number(rows[0]?.total || 0);
+}
+
 async function getDirectReferralPackageCounts(uid) {
   const [rows] = await pool.query(
     `SELECT
         child.uid,
         COALESCE(NULLIF(child.currentaccttype, 0), child.accttype) AS packageCode,
+        child.accttype,
+        child.currentaccttype,
+        child.codeid,
+        child.cdamount,
+        child.cdtotal,
+        child.cdstatus,
         child.datereg,
         m.username,
         m.firstname,
@@ -243,7 +280,12 @@ async function getDirectReferralPackageCounts(uid) {
   const contributorsByPackage = normalizeCountMap(PACKAGE_RULES.map((rule) => rule.key));
 
   for (const row of rows) {
-    const rule = PACKAGE_RULES_BY_CODE[Number(row.packageCode)];
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    if (!countsForDirectReferralSource(effectiveRow)) {
+      continue;
+    }
+
+    const rule = PACKAGE_RULES_BY_CODE[Number(effectiveRow.currentaccttype || row.packageCode)];
     if (!rule) continue;
 
     counts[rule.key] += 1;
@@ -628,7 +670,7 @@ async function getPackageClaimedSets(uid) {
 }
 
 async function buildHiFiveStatus(uid) {
-  const [productClaimedByKey, directReferralProducts, maintenancePoints, directReferralPackages, rewardAmounts, packageClaimedSets] =
+  const [productClaimedByKey, directReferralProducts, maintenancePoints, directReferralPackages, rewardAmounts, packageClaimedSets, directReferralCount] =
     await Promise.all([
       checkH5Bonus(uid),
       getDirectReferralProductPurchases(uid),
@@ -636,10 +678,12 @@ async function buildHiFiveStatus(uid) {
       getDirectReferralPackageCounts(uid),
       getPackageRewardAmounts(),
       getPackageClaimedSets(uid),
+      getAllDirectReferralCount(uid),
     ]);
 
   const productBonus = buildProductSummary({
-    purchasesByKey: directReferralProducts.purchasesByKey,
+    qualifyingReferralsByKey: directReferralProducts.qualifyingReferralsByKey,
+    rawPurchasesByKey: directReferralProducts.rawPurchasesByKey,
     claimedByKey: productClaimedByKey,
     maintenancePoints,
     contributorsByKey: directReferralProducts.contributorsByKey,
@@ -654,7 +698,7 @@ async function buildHiFiveStatus(uid) {
 
   return {
     summary: {
-      directReferralCount: Object.values(directReferralPackages.counts).reduce((sum, count) => sum + Number(count || 0), 0),
+      directReferralCount,
       maintenancePoints,
       maintenanceThreshold: 200,
       productEligible: productBonus.eligible,
@@ -742,6 +786,7 @@ module.exports = {
   PRODUCT_TYPE_TO_KEY,
   PRODUCT_METADATA,
   PACKAGE_RULES,
+  summarizeProductReferralRows,
   checkH5Bonus,
   getDirectReferralProductPurchases,
   getMaintenanceProductPoints,

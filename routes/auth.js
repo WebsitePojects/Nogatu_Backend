@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
 const { writeAuditLog } = require('../services/audit');
+const { normalizeEmail, isValidEmail } = require('../utils/email');
 
 function normalizeLegacyUsername(value) {
   return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
@@ -87,6 +88,13 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    await new Promise((resolve, reject) => {
+      req.session.regenerate((sessionErr) => {
+        if (sessionErr) reject(sessionErr);
+        else resolve();
+      });
+    });
+
     // Set session variables (mirrors PHP session exactly)
     req.session.uid = user.uid;
     req.session.publicUid = user.public_uid || null;
@@ -99,6 +107,9 @@ router.post('/login', async (req, res) => {
     req.session.codeid = user.codeid;
     req.session.cdstatus = user.cdstatus;
     req.session.position = user.position;
+    delete req.session.adminid;
+    delete req.session.adminname;
+    delete req.session.adminrights;
 
     await new Promise((resolve, reject) => {
       req.session.save((saveErr) => {
@@ -146,17 +157,17 @@ router.post('/logout', (req, res) => {
  */
 router.post('/forgot-password', async (req, res) => {
   try {
-    const identifier = String(req.body.email || req.body.username || '').trim();
-    if (!identifier) {
-      return res.json({ success: true, message: 'If the account exists, reset instructions will be sent.' });
+    const email = normalizeEmail(req.body.email);
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: 'Enter the email address saved on your account.' });
     }
 
     const [rows] = await pool.query(
       `SELECT uid, username, email, firstname, lastname
        FROM memberstab
-       WHERE email = ? OR username = ?
+       WHERE email = ?
        LIMIT 1`,
-      [identifier, normalizeLegacyUsername(identifier)]
+      [email]
     );
 
     if (rows.length > 0) {
