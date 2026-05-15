@@ -1,100 +1,146 @@
 const { pool } = require('../config/database');
+const { listRankableEventsForMember } = require('./rankingRace');
+const { getRankProgress, getRankDefinitions } = require('./ranking');
+
+function toNumber(value) {
+  return Number(value || 0);
+}
 
 async function getRankingExplanation(uid) {
   const memberUid = Number(uid);
 
   try {
-    const [grossRows] = await pool.query(
-      `SELECT
-         COALESCE(SUM(bpe.point_value), 0) AS gross_points,
-         COUNT(*) AS event_count,
-         MIN(bpe.event_ts) AS first_event_ts,
-         MAX(bpe.event_ts) AS last_event_ts
-       FROM binary_tree_closuretab c
-       INNER JOIN binary_point_eventstab bpe ON bpe.source_member_uid = c.descendant_uid
-       WHERE c.ancestor_uid = ?
-         AND c.depth > 0
-         AND bpe.deleted_at IS NULL`,
-      [memberUid]
-    );
+    const [progress, rankDefinitions, rankableEvents, consumptionRows] = await Promise.all([
+      getRankProgress(memberUid),
+      getRankDefinitions(),
+      listRankableEventsForMember(memberUid),
+      pool.query(
+        `SELECT
+            rpc.consumption_uid,
+            rpc.consumed_member_uid,
+            rpc.consuming_member_uid,
+            rpc.points_consumed,
+            rpc.source_event_id,
+            rpc.source_event_ts,
+            rpc.source_leg,
+            rpc.source_process_id,
+            rpc.consumed_at,
+            rpc.explanation,
+            ra.achievement_uid,
+            ra.achieved_at,
+            ra.status AS achievement_status,
+            rd.rank_code,
+            rd.rank_name,
+            rd.sort_order,
+            src.username AS source_member_username
+         FROM rank_point_consumptiontab rpc
+         LEFT JOIN rank_achievementstab ra ON ra.achievement_uid = rpc.consuming_rank_uid
+         LEFT JOIN rank_definitionstab rd ON rd.definition_uid = ra.rank_definition_uid
+         LEFT JOIN memberstab src ON src.uid = rpc.consumed_member_uid
+         WHERE rpc.consuming_member_uid = ?
+         ORDER BY rpc.consumed_at ASC, rpc.id ASC`,
+        [memberUid]
+      ),
+    ]);
 
-    const [consumptionRows] = await pool.query(
-      `SELECT rpc.consumption_uid, rpc.consumed_member_uid, rpc.consuming_member_uid,
-              rpc.points_consumed, rpc.consumed_at, rpc.explanation,
-              rd.rank_code, rd.rank_name,
-              m.username AS consuming_username
-       FROM rank_point_consumptiontab rpc
-       LEFT JOIN rank_achievementstab ra ON ra.achievement_uid = rpc.consuming_rank_uid
-       LEFT JOIN rank_definitionstab rd ON rd.definition_uid = ra.rank_definition_uid
-       LEFT JOIN memberstab m ON m.uid = rpc.consuming_member_uid
-       WHERE rpc.consumed_member_uid = ?
-       ORDER BY rpc.consumed_at DESC, rpc.id DESC
-       LIMIT 100`,
-      [memberUid]
-    );
+    const ledgerRows = consumptionRows[0] || [];
+    const grossRankablePoints = toNumber(progress.grossRankablePoints);
+    const consumedPoints = toNumber(progress.consumedPoints);
+    const remainingRankablePoints = toNumber(progress.remainingRankablePoints);
+    const sortedEvents = [...rankableEvents].sort((a, b) => String(a.sourceEventTs || '').localeCompare(String(b.sourceEventTs || '')));
+    const firstEventTs = sortedEvents[0]?.sourceEventTs || null;
+    const lastEventTs = sortedEvents.at(-1)?.sourceEventTs || null;
+    const rankDefinitionMap = new Map(rankDefinitions.map((definition) => [String(definition.rank_code || '').toLowerCase(), definition]));
 
-    const [rankRows] = await pool.query(
-      `SELECT rank_code, rank_name, points_required, left_rank_required, right_rank_required,
-              incentive_summary, cash_incentive, sort_order
-       FROM rank_definitionstab
-       WHERE is_active = 1
-       ORDER BY sort_order ASC`,
-    );
-
-    const grossPoints = Number(grossRows[0]?.gross_points || 0);
-    const consumedPoints = consumptionRows.reduce((sum, row) => sum + Number(row.points_consumed || 0), 0);
-    const remainingRankablePoints = Math.max(0, grossPoints - consumedPoints);
+    const nextRanks = rankDefinitions.map((rank) => ({
+      ...rank,
+      points_required: toNumber(rank.points_required),
+      cash_incentive: toNumber(rank.cash_incentive),
+      progressPercent: toNumber(rank.points_required) > 0
+        ? Math.min(100, Math.round((remainingRankablePoints / toNumber(rank.points_required)) * 10000) / 100)
+        : 0,
+    }));
 
     return {
-      source: 'binary_point_eventstab',
-      grossPoints,
+      source: 'repurchasetab + binary_tree_closuretab',
+      basisLabel: progress.basisLabel || 'Repurchase points',
+      grossRankablePoints,
       consumedPoints,
       remainingRankablePoints,
-      eventCount: Number(grossRows[0]?.event_count || 0),
-      firstEventTs: grossRows[0]?.first_event_ts || null,
-      lastEventTs: grossRows[0]?.last_event_ts || null,
-      nextRanks: rankRows.map((rank) => ({
-        ...rank,
-        points_required: Number(rank.points_required || 0),
-        cash_incentive: Number(rank.cash_incentive || 0),
-        progressPercent: Number(rank.points_required || 0) > 0
-          ? Math.min(100, Math.round((remainingRankablePoints / Number(rank.points_required)) * 10000) / 100)
-          : 0,
-      })),
-      consumptionRows: consumptionRows.map((row) => ({
+      grossPoints: grossRankablePoints,
+      eventCount: rankableEvents.length,
+      firstEventTs,
+      lastEventTs,
+      currentRank: progress.currentRank,
+      currentRankLabel: progress.currentRankLabel,
+      nextRank: progress.nextRank,
+      nextRankLabel: progress.nextRankLabel,
+      nextRankRequirement: progress.nextRankRequirement,
+      leftRequirementMet: progress.leftRequirementMet,
+      rightRequirementMet: progress.rightRequirementMet,
+      achievements: progress.achievements || [],
+      nextRanks,
+      consumptionEvents: ledgerRows.map((row) => {
+        const definition = rankDefinitionMap.get(String(row.rank_code || '').toLowerCase()) || null;
+        return {
+          consumptionUid: row.consumption_uid,
+          achievementUid: row.achievement_uid,
+          awardRank: toNumber(definition?.rank),
+          awardRankCode: row.rank_code,
+          awardRankName: row.rank_name,
+          sourceMemberUid: toNumber(row.consumed_member_uid),
+          sourceMemberUsername: row.source_member_username,
+          sourceEventId: toNumber(row.source_event_id),
+          sourceEventTs: row.source_event_ts,
+          sourceLeg: row.source_leg || 'unknown',
+          sourceProcessId: row.source_process_id || null,
+          pointsConsumed: toNumber(row.points_consumed),
+          consumedAt: row.consumed_at,
+          achievementStatus: row.achievement_status,
+          explanation: row.explanation,
+        };
+      }),
+      consumptionRows: ledgerRows.map((row) => ({
         consumptionUid: row.consumption_uid,
-        consumingMemberUid: row.consuming_member_uid,
-        consumingUsername: row.consuming_username,
+        sourceMemberUid: toNumber(row.consumed_member_uid),
+        sourceEventTs: row.source_event_ts,
+        sourceLeg: row.source_leg || 'unknown',
         rankCode: row.rank_code,
         rankName: row.rank_name,
-        pointsConsumed: Number(row.points_consumed || 0),
+        pointsConsumed: toNumber(row.points_consumed),
         consumedAt: row.consumed_at,
         explanation: row.explanation,
       })),
-      explanation: 'Gross rank points come from eligible binary point events in your downline. If an upline wins a rank race first, the affected points remain visible here as consumed points with the upline, rank, timestamp, and explanation.',
+      explanation: 'Ranking bonus now reads repurchase points from your own account plus your full binary downline. When a rank is awarded, only the exact points used for that rank are consumed and stored in this ledger.',
       asOf: new Date().toISOString(),
     };
   } catch (error) {
     if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
 
     const [fallbackRows] = await pool.query(
-      `SELECT totalpointsleft, totalpointsright, transdate
-       FROM pairingstab
+      `SELECT COALESCE(SUM(incentivepoints1), 0) AS gross_points,
+              MIN(transdate) AS first_event_ts,
+              MAX(transdate) AS last_event_ts
+       FROM repurchasetab
        WHERE uid = ?
-       ORDER BY id DESC
        LIMIT 1`,
       [memberUid]
     );
     const fallback = fallbackRows[0] || {};
-    const grossPoints = Number(fallback.totalpointsleft || 0) + Number(fallback.totalpointsright || 0);
+    const grossPoints = toNumber(fallback.gross_points);
     return {
-      source: 'pairingstab_fallback',
+      source: 'repurchasetab_fallback',
+      basisLabel: 'Repurchase points',
+      grossRankablePoints: grossPoints,
       grossPoints,
       consumedPoints: 0,
       remainingRankablePoints: grossPoints,
       eventCount: 0,
+      consumptionEvents: [],
       consumptionRows: [],
-      explanation: 'Ranking ledger tables are not migrated yet, so this fallback uses the latest pairing snapshot. Run database migrations to enable full consumption transparency.',
+      firstEventTs: fallback.first_event_ts || null,
+      lastEventTs: fallback.last_event_ts || null,
+      explanation: 'Ranking ledger tables are not migrated yet, so this fallback uses repurchase points. Run database migrations to enable full consumption transparency.',
       asOf: new Date().toISOString(),
     };
   }

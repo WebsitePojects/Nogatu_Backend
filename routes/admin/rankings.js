@@ -29,9 +29,16 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 router.put('/:uid/process', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const uid = Number(req.params.uid);
-    const success = await processIncentive(uid);
-    if (success) {
-      res.json({ success: true, message: 'Incentive marked as claimed' });
+    const result = await processIncentive(uid, {
+      req,
+      adminUid: req.session.adminid,
+    });
+    if (result.success) {
+      res.json({
+        success: true,
+        message: 'Next pending ranking bonus claim released',
+        ...result,
+      });
     } else {
       res.status(400).json({ error: 'No pending incentive found' });
     }

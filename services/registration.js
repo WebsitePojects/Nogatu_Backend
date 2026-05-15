@@ -10,6 +10,7 @@ const { sanitizeAlphaNum, getOffsetTimestamp } = require('../utils/helpers');
 const { normalizeTin, isValidTin } = require('../utils/tin');
 const { issueVoucher } = require('./voucher');
 const { createPublicId, createReferralSlug, createProcessKey } = require('../utils/security');
+const { normalizeEmail, isValidEmail } = require('../utils/email');
 
 let memberTinColumnReady = false;
 
@@ -19,6 +20,13 @@ async function ensureMemberTinColumn() {
   const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
   if (columns.length === 0) {
     await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
+  }
+
+  const [emailColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'email'");
+  if (emailColumns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN email VARCHAR(180) DEFAULT NULL');
+  } else if (!String(emailColumns[0].Type || '').toLowerCase().includes('180')) {
+    await pool.query('ALTER TABLE memberstab MODIFY COLUMN email VARCHAR(180) DEFAULT NULL');
   }
 
   memberTinColumnReady = true;
@@ -237,6 +245,47 @@ async function getNextCountId() {
   return (rows.length > 0 ? Number(rows[0].id) : 0) + 1;
 }
 
+function deriveRegistrationCdState(codeData) {
+  if (Number(codeData?.codetype) === 3) {
+    return {
+      cdAmount: Number(codeData?.productamount || 0),
+      cdTotal: 0,
+      cdStatus: 1,
+    };
+  }
+
+  return {
+    cdAmount: 0,
+    cdTotal: 0,
+    cdStatus: 0,
+  };
+}
+
+async function consumeActivationCodeForRegistration(conn, { activationCode, sponsorUid }) {
+  const [codeRows] = await conn.query(
+    `SELECT * FROM codestab WHERE code = ? AND uid = ? AND codestatus = 1
+     AND producttype >= 1 AND producttype <= 100
+     LIMIT 1`,
+    [activationCode, sponsorUid]
+  );
+  if (codeRows.length === 0) throw new Error('Invalid or used activation code');
+  const codeData = codeRows[0];
+
+  const [updateResult] = await conn.query(
+    `UPDATE codestab
+        SET dateused = NOW(), codestatus = 2
+      WHERE code = ? AND uid = ? AND codestatus = 1
+      LIMIT 1`,
+    [activationCode, sponsorUid]
+  );
+
+  if (Number(updateResult?.affectedRows || 0) !== 1) {
+    throw new Error('Invalid or used activation code');
+  }
+
+  return codeData;
+}
+
 /**
  * Register a new member account
  * Mirrors the full registration flow from new-account-registration.php
@@ -252,18 +301,19 @@ async function registerMember({
     await conn.beginTransaction();
 
     const normalizedTin = String(tin || '').trim();
+    const normalizedEmail = normalizeEmail(email);
     if (!normalizedTin || normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
+    if (!isValidEmail(normalizedEmail)) {
+      throw new Error('A valid email address is required.');
+    }
 
     // 1. Validate activation code
-    const [codeRows] = await conn.query(
-      `SELECT * FROM codestab WHERE code = ? AND codestatus = 1
-       AND producttype >= 1 AND producttype <= 100`,
-      [activationCode]
-    );
-    if (codeRows.length === 0) throw new Error('Invalid or used activation code');
-    const codeData = codeRows[0];
+    const codeData = await consumeActivationCodeForRegistration(conn, {
+      activationCode,
+      sponsorUid,
+    });
 
     // 2. Check username uniqueness
     const [existingUser] = await conn.query(
@@ -271,6 +321,12 @@ async function registerMember({
       [sanitizeAlphaNum(username)]
     );
     if (existingUser.length > 0) throw new Error('Username already taken');
+
+    const [existingEmail] = await conn.query(
+      'SELECT uid FROM memberstab WHERE email = ? LIMIT 1',
+      [normalizedEmail]
+    );
+    if (existingEmail.length > 0) throw new Error('Email address is already being used by another account');
 
     // 3. Check placement availability
     const [placementCheck] = await conn.query(
@@ -284,23 +340,11 @@ async function registerMember({
     const newCountId = await getNextCountId();
 
     // 5. Calculate CD amount/total if codetype == 3
-    let cdAmount = 0, cdTotal = 0, cdStatus = 0;
-    if (codeData.codetype === 3) {
-      cdAmount = codeData.productamount;
-      cdTotal = codeData.productamount;
-      cdStatus = 1;
-    }
+    const { cdAmount, cdTotal, cdStatus } = deriveRegistrationCdState(codeData);
 
     const now = getOffsetTimestamp();
 
-    // 6. Update code status
-    await conn.query(
-      `UPDATE codestab SET dateused = NOW(), codestatus = 2, uid = ?
-       WHERE code = ? LIMIT 1`,
-      [newUid, activationCode]
-    );
-
-    // 7. Insert into usertab
+    // 6. Insert into usertab
     await conn.query(
       `INSERT INTO usertab (id, uid, refid, drefid, mainid, stockistid,
        accttype, currentaccttype, packageid, codeid, activationcode,
@@ -316,20 +360,13 @@ async function registerMember({
        codeData.incentivepoints, cdAmount, cdTotal, cdStatus, codeData.profitsharing, sponsorUid]
     );
 
-    // 8. Insert into memberstab (hash password with bcrypt)
+    // 7. Insert into memberstab (hash password with bcrypt)
     const hashedPassword = await bcrypt.hash(password, 12);
     await conn.query(
-      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin)
-       VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)`,
-      [newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename, normalizedTin]
+      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newCountId, newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename, normalizedTin, normalizedEmail.slice(0, 180)]
     );
-
-    if (email) {
-      await conn.query(
-        'UPDATE memberstab SET email = ? WHERE uid = ? LIMIT 1',
-        [String(email).trim().slice(0, 180), newUid]
-      ).catch(() => {});
-    }
 
     await conn.query(
       'UPDATE usertab SET public_uid = ?, referral_slug = ? WHERE uid = ? LIMIT 1',
@@ -409,6 +446,8 @@ module.exports = {
   normalizeName,
   generateUID,
   getNextCountId,
+  deriveRegistrationCdState,
+  consumeActivationCodeForRegistration,
   registerMember,
   ensureMemberTinColumn,
 };

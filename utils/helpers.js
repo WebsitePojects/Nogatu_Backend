@@ -12,6 +12,15 @@ const ACCOUNT_TYPES = {
   60: 'Diamond',
 };
 
+const PACKAGE_BINARY_POINTS = {
+  10: 250,
+  20: 500,
+  30: 1000,
+  40: 2500,
+  50: 5000,
+  60: 15000,
+};
+
 // Product type to name mapping
 const PRODUCT_TYPES = {
   10: 'Bronze Entry Package',
@@ -120,6 +129,7 @@ function getISOWeek(dateStr) {
 
 module.exports = {
   ACCOUNT_TYPES,
+  PACKAGE_BINARY_POINTS,
   PRODUCT_TYPES,
   CODE_PREFIXES,
   PAYOUT_OPTIONS,

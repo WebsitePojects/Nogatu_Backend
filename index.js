@@ -54,7 +54,9 @@ app.use((req, res, next) => {
   next();
 });
 
+const frontendLegacyImageDir = path.resolve(__dirname, '../Nogatu_Frontend/public/legacy-img');
 const legacyImageCandidates = [
+  frontendLegacyImageDir,
   path.resolve(__dirname, '../public_html/img'),
   path.resolve(__dirname, '../public_html(Original_Code)/img'),
   path.resolve(__dirname, '../reference_system/public_html(latest_production_code)/img'),
@@ -62,7 +64,8 @@ const legacyImageCandidates = [
 const legacyImageDir = legacyImageCandidates.find((dir) => fs.existsSync(dir));
 if (legacyImageDir) {
   app.use('/legacy-img', express.static(legacyImageDir));
-  console.log(`[Server] Serving legacy images from: ${legacyImageDir}`);
+  const sourceLabel = legacyImageDir === frontendLegacyImageDir ? 'frontend legacy-img assets' : 'legacy fallback images';
+  console.log(`[Server] Serving ${sourceLabel} from: ${legacyImageDir}`);
 } else {
   console.warn('[Server] Legacy image directory not found. /legacy-img route is disabled.');
 }

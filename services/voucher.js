@@ -91,6 +91,36 @@ const PACKAGE_AMOUNTS = {
   60: 150000,
 };
 
+const VOUCHER_PRODUCT_CATALOG = {
+  bl: { code: 100, name: 'Barley Juice', incentivePoints: 50 },
+  gl: { code: 101, name: 'Nogatu Glow', incentivePoints: 45 },
+  glc: { code: 102, name: 'Collagen Vitamin C', incentivePoints: 40 },
+  cm: { code: 103, name: 'Coffee Mix', incentivePoints: 40 },
+  cd: { code: 104, name: 'Chocolate Drink Mix', incentivePoints: 45 },
+  mgt: { code: 105, name: 'Mangosteen Coffee', incentivePoints: 30 },
+  vz: { code: 106, name: 'Vitamin Zinc', incentivePoints: 40 },
+  cmm: { code: 107, name: 'MAX Coffee Mix', incentivePoints: 100 },
+  bkc: { code: 108, name: 'Black Coffee', incentivePoints: 10 },
+};
+
+const VOUCHER_PRODUCT_BY_CODE = Object.fromEntries(
+  Object.values(VOUCHER_PRODUCT_CATALOG).map((product) => [product.code, product])
+);
+
+function normalizeVoucherProductSelection(options = {}) {
+  const productKey = String(options.productKey || '').trim().toLowerCase();
+  if (productKey && VOUCHER_PRODUCT_CATALOG[productKey]) {
+    return VOUCHER_PRODUCT_CATALOG[productKey];
+  }
+
+  const productCode = Number(options.productCode || 0);
+  if (productCode > 0 && VOUCHER_PRODUCT_BY_CODE[productCode]) {
+    return VOUCHER_PRODUCT_BY_CODE[productCode];
+  }
+
+  return null;
+}
+
 /**
  * Issue a voucher for a new member at registration
  * @param {object} conn - DB connection (for use within transaction)
@@ -167,6 +197,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
 
   const selectedVoucherId = Number(voucherId || 0);
   const cashPaid = Number(cashAmount);
+  const selectedProduct = normalizeVoucherProductSelection(options);
   const lockKey = `nogatu_income_calc_${memberUid}`;
 
   const conn = await pool.getConnection();
@@ -259,6 +290,15 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       [memberUid, resolvedVoucherId, cashPaid, voucherDeduction, cashPaid + voucherDeduction]
     );
 
+    if (selectedProduct) {
+      const voucherReferenceCode = `VCHR-${resolvedVoucherId}-${Date.now()}`;
+      await conn.query(
+        `INSERT INTO repurchasetab (id, uid, producttype, code, transtype, codeid, incentivepoints1, transdate)
+         VALUES (NULL, ?, ?, ?, 1, 1, ?, NOW())`,
+        [memberUid, selectedProduct.code, voucherReferenceCode, selectedProduct.incentivePoints]
+      );
+    }
+
     await conn.commit();
     txStarted = false;
 
@@ -271,6 +311,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       remainingBalance: newBalance,
       walletBalance: newWalletBalance,
       fullyUsed: newStatus === 3,
+      productType: selectedProduct?.code || null,
       ...(safeProductName ? { productName: safeProductName } : {}),
     };
   } catch (err) {
@@ -563,6 +604,7 @@ module.exports = {
   grantVouchersToExistingMembers,
   ensureVoucherTable,
   ensureVoucherTxTable,
+  normalizeVoucherProductSelection,
   VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,
 };

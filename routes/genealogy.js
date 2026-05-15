@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { getGenealogyTree, isInNetwork, getNetworkList, getNetworkMembersDetailed } = require('../services/network');
+const { getGenealogyTree, isInNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
 
 function packageColor(accttype) {
   const key = Number(accttype || 0);
@@ -44,7 +44,7 @@ async function getChildNodes(parentUid) {
     username: row.username,
     packageType: packageColor(row.currentaccttype),
     position: Number(row.position) === 1 ? 'left' : 'right',
-    binaryPoints: Number(row.binarypoints || 0),
+    binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
     leftChildCount: Number(row.leftChildCount || 0),
     rightChildCount: Number(row.rightChildCount || 0),
     hasMoreLeft: Number(row.leftChildCount || 0) > 0,

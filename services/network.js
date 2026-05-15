@@ -5,7 +5,13 @@
  * Handles binary tree traversal, genealogy building, and network validation
  */
 const { pool } = require('../config/database');
-const { getAccountTypeName } = require('../utils/helpers');
+const { getAccountTypeName, PACKAGE_BINARY_POINTS } = require('../utils/helpers');
+
+function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
+  const numericStored = Number(storedBinaryPoints || 0);
+  if (numericStored > 0) return numericStored;
+  return Number(PACKAGE_BINARY_POINTS[Number(currentaccttype || 0)] || 0);
+}
 
 /**
  * Get all downline UIDs recursively via refid (binary tree)
@@ -41,7 +47,7 @@ async function getNetworkMembersDetailed(rootUid, maxDepth = 10) {
       depth: Number(row.depth || 0),
       leg: row.leg || null,
       position: Number(row.position || 0),
-      binaryPoints: Number(row.binarypoints || 0),
+      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
       datereg: row.datereg,
     }));
   } catch (error) {
@@ -90,7 +96,7 @@ async function _traverseNetworkDetailed(parent, list, depth, maxDepth, leg) {
       depth,
       leg: rowLeg,
       position: Number(row.position || 0),
-      binaryPoints: Number(row.binarypoints || 0),
+      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
       datereg: row.datereg,
     });
     await _traverseNetworkDetailed(row.uid, list, depth + 1, maxDepth, rowLeg);
@@ -110,7 +116,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
   const [rows] = await pool.query(
     `SELECT m.uid, m.firstname, m.lastname, m.middlename, m.username,
             u.uid as uUid, u.refid, u.drefid, u.accttype, u.currentaccttype,
-            u.position, u.codeid, u.datereg, u.public_uid
+            u.position, u.codeid, u.datereg, u.public_uid, u.binarypoints
      FROM memberstab m, usertab u
      WHERE m.uid = u.uid AND u.uid = ?`,
     [uid]
@@ -131,6 +137,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
     codeid: row.codeid,
     datereg: row.datereg,
     position: row.position,
+    binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
     left: null,
     right: null,
     hasLeftSlot: true,
@@ -245,4 +252,5 @@ module.exports = {
   isInNetwork,
   getDirectReferrals,
   getPairingCounts,
+  resolveGenealogyPoints,
 };
