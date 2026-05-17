@@ -13,6 +13,15 @@ const ACCOUNT_TYPES = {
 };
 
 const PACKAGE_BINARY_POINTS = {
+  10: 1,
+  20: 2,
+  30: 4,
+  40: 10,
+  50: 20,
+  60: 60,
+};
+
+const PACKAGE_BINARY_VALUES = {
   10: 250,
   20: 500,
   30: 1000,
@@ -29,15 +38,16 @@ const PRODUCT_TYPES = {
   40: 'Platinum Entry Package',
   50: 'Garnet Entry Package',
   60: 'Diamond Entry Package',
-  100: 'Barley',
-  101: 'Glutathione',
-  102: 'Gluta w/ Collagen',
-  103: 'Coffee Mix',
-  104: 'Chocolate Drink',
-  105: 'Mangosteen',
-  106: 'Vitamin Zinc',
-  107: 'Max Coffee',
+  100: 'Nogatu Barley Juice',
+  101: 'Nogatu Glow',
+  102: 'Nogatu Collagen Vitamin C',
+  103: 'Nogatu Coffee Mix',
+  104: 'Chocolate Drink Mix',
+  105: 'Mangosteen Coffee Mix',
+  106: 'Vitamin C',
+  107: 'Max Fuel Coffee Drink Mix',
   108: 'Black Coffee',
+  109: 'Berry NAD+',
 };
 
 // Code type prefix mapping
@@ -130,6 +140,7 @@ function getISOWeek(dateStr) {
 module.exports = {
   ACCOUNT_TYPES,
   PACKAGE_BINARY_POINTS,
+  PACKAGE_BINARY_VALUES,
   PRODUCT_TYPES,
   CODE_PREFIXES,
   PAYOUT_OPTIONS,

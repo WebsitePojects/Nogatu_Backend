@@ -92,15 +92,16 @@ const PACKAGE_AMOUNTS = {
 };
 
 const VOUCHER_PRODUCT_CATALOG = {
-  bl: { code: 100, name: 'Barley Juice', incentivePoints: 50 },
+  bl: { code: 100, name: 'Nogatu Barley Juice', incentivePoints: 50 },
   gl: { code: 101, name: 'Nogatu Glow', incentivePoints: 45 },
   glc: { code: 102, name: 'Collagen Vitamin C', incentivePoints: 40 },
-  cm: { code: 103, name: 'Coffee Mix', incentivePoints: 40 },
+  cm: { code: 103, name: 'Nogatu Coffee Mix', incentivePoints: 40 },
   cd: { code: 104, name: 'Chocolate Drink Mix', incentivePoints: 45 },
-  mgt: { code: 105, name: 'Mangosteen Coffee', incentivePoints: 30 },
-  vz: { code: 106, name: 'Vitamin Zinc', incentivePoints: 40 },
-  cmm: { code: 107, name: 'MAX Coffee Mix', incentivePoints: 100 },
+  mgt: { code: 105, name: 'Mangosteen Coffee Mix', incentivePoints: 30 },
+  vc: { code: 106, name: 'Vitamin C', incentivePoints: 40 },
+  cmm: { code: 107, name: 'Max Fuel Coffee Drink Mix', incentivePoints: 100 },
   bkc: { code: 108, name: 'Black Coffee', incentivePoints: 10 },
+  bnad: { code: 109, name: 'Berry NAD+', incentivePoints: 35 },
 };
 
 const VOUCHER_PRODUCT_BY_CODE = Object.fromEntries(

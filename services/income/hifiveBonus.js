@@ -31,14 +31,14 @@ const PRODUCT_TYPE_TO_KEY = {
 };
 
 const PRODUCT_METADATA = {
-  bl: { code: 100, name: 'Nogatu Barley', purchasePoints: 50 },
-  gl: { code: 101, name: 'Glutathione', purchasePoints: 45 },
-  glc: { code: 102, name: 'Glutathione with Collagen', purchasePoints: 40 },
+  bl: { code: 100, name: 'Nogatu Barley Juice', purchasePoints: 50 },
+  gl: { code: 101, name: 'Nogatu Glow', purchasePoints: 45 },
+  glc: { code: 102, name: 'Nogatu Collagen Vitamin C', purchasePoints: 40 },
   cm: { code: 103, name: 'Nogatu Coffee Mix', purchasePoints: 40 },
-  cd: { code: 104, name: 'Chocolate Drink', purchasePoints: 45 },
-  mgt: { code: 105, name: 'Nogatu Mangosteen', purchasePoints: 30 },
-  vz: { code: 106, name: 'Vitamin Zinc', purchasePoints: 40 },
-  cmm: { code: 107, name: 'MAX Coffee Mix', purchasePoints: 100 },
+  cd: { code: 104, name: 'Chocolate Drink Mix', purchasePoints: 45 },
+  mgt: { code: 105, name: 'Mangosteen Coffee Mix', purchasePoints: 30 },
+  vz: { code: 106, name: 'Vitamin C', purchasePoints: 40 },
+  cmm: { code: 107, name: 'Max Fuel Coffee Drink Mix', purchasePoints: 100 },
   bkc: { code: 108, name: 'Black Coffee', purchasePoints: 10 },
 };
 

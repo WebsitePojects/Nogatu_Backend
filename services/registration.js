@@ -6,11 +6,13 @@
  */
 const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
-const { sanitizeAlphaNum, getOffsetTimestamp } = require('../utils/helpers');
+const { sanitizeAlphaNum, getOffsetTimestamp, ACCOUNT_TYPES, CODE_PREFIXES, PRODUCT_TYPES } = require('../utils/helpers');
 const { normalizeTin, isValidTin } = require('../utils/tin');
 const { issueVoucher } = require('./voucher');
 const { createPublicId, createReferralSlug, createProcessKey } = require('../utils/security');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
+const { evaluateDuplicateIdentity, normalizeContactNo, normalizeDob } = require('./identityIntegrity');
+const { appendPlacementAudit, appendActivationCodeUsage } = require('./registrationAudit');
 
 let memberTinColumnReady = false;
 
@@ -29,7 +31,64 @@ async function ensureMemberTinColumn() {
     await pool.query('ALTER TABLE memberstab MODIFY COLUMN email VARCHAR(180) DEFAULT NULL');
   }
 
+  const [contactColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'contactnos'");
+  if (contactColumns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN contactnos VARCHAR(30) DEFAULT NULL');
+  } else if (!String(contactColumns[0].Type || '').toLowerCase().includes('30')) {
+    await pool.query('ALTER TABLE memberstab MODIFY COLUMN contactnos VARCHAR(30) DEFAULT NULL');
+  }
+
+  const [dobColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'dob'");
+  if (dobColumns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN dob VARCHAR(30) DEFAULT NULL');
+  } else if (!String(dobColumns[0].Type || '').toLowerCase().includes('30')) {
+    await pool.query('ALTER TABLE memberstab MODIFY COLUMN dob VARCHAR(30) DEFAULT NULL');
+  }
+
   memberTinColumnReady = true;
+}
+
+function createDuplicateRegistrationError(details) {
+  const error = new Error('This registration matches an existing account record and cannot proceed.');
+  error.code = 'DUPLICATE_ACCOUNT';
+  error.details = details;
+  return error;
+}
+
+function createPlacementBusyError(message = 'This placement is busy right now. Please try again.') {
+  const error = new Error(message);
+  error.code = 'PLACEMENT_LOCKED';
+  return error;
+}
+
+async function acquirePlacementLock(conn, lockKey, requestId) {
+  try {
+    await conn.query(
+      `INSERT INTO placement_lockstab (lock_key, locked_by_req, expires_at)
+       VALUES (?, ?, DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 2 MINUTE))`,
+      [lockKey, String(requestId || 'registration').slice(0, 80)]
+    );
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      throw createPlacementBusyError();
+    }
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function releasePlacementLocks(conn, lockKeys) {
+  if (!Array.isArray(lockKeys) || lockKeys.length === 0) return;
+  for (const lockKey of lockKeys) {
+    try {
+      await conn.query('DELETE FROM placement_lockstab WHERE lock_key = ? LIMIT 1', [lockKey]);
+    } catch (error) {
+      if (error.code === 'ER_NO_SUCH_TABLE') continue;
+      throw error;
+    }
+  }
 }
 
 /**
@@ -54,6 +113,56 @@ async function validateCode(code) {
     [code.trim()]
   );
   return rows.length === 1;
+}
+
+async function previewActivationCode(code) {
+  const trimmed = String(code || '').trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      canRegister: false,
+      reason: 'Code is required.',
+    };
+  }
+
+  const [rows] = await pool.query(
+    `SELECT id, code, producttype, productamount, codetype, codestatus
+       FROM codestab
+      WHERE code = ?
+      LIMIT 1`,
+    [trimmed]
+  );
+
+  if (rows.length === 0) {
+    return {
+      valid: false,
+      canRegister: false,
+      reason: 'Code not found.',
+    };
+  }
+
+  const row = rows[0];
+  const packageLabel = ACCOUNT_TYPES[Number(row.producttype || 0)] || PRODUCT_TYPES[Number(row.producttype || 0)] || `Type ${row.producttype}`;
+  const codeTypeLabel = CODE_PREFIXES[Number(row.codetype || 0)] || 'Unknown';
+  const isPackageEntryCode = Number(row.producttype || 0) >= 1 && Number(row.producttype || 0) <= 60;
+  const isAvailable = Number(row.codestatus || 0) === 1;
+
+  return {
+    valid: isAvailable,
+    canRegister: isAvailable && isPackageEntryCode,
+    code: row.code,
+    codeType: Number(row.codetype || 0),
+    codeTypeLabel,
+    producttype: Number(row.producttype || 0),
+    packageLabel,
+    productamount: Number(row.productamount || 0),
+    accountLabel: `${packageLabel} - ${codeTypeLabel}`,
+    reason: !isAvailable
+      ? 'Code is not available.'
+      : !isPackageEntryCode
+        ? 'This code is for product maintenance or repurchase, not for account registration.'
+        : null,
+  };
 }
 
 /**
@@ -292,16 +401,23 @@ async function consumeActivationCodeForRegistration(conn, { activationCode, spon
  */
 async function registerMember({
   activationCode, sponsorUid, placementUid, username, password,
-  firstname, lastname, middlename, tin, email, position
+  firstname, lastname, middlename, tin, email, position,
+  requestedPosition = null, placementPolicy = null, referralToken = null,
+  contactno = '', dob = '', requestId = null,
 }) {
   await ensureMemberTinColumn();
 
   const conn = await pool.getConnection();
+  const lockKeys = [];
   try {
     await conn.beginTransaction();
 
     const normalizedTin = String(tin || '').trim();
     const normalizedEmail = normalizeEmail(email);
+    const normalizedContactNo = normalizeContactNo(contactno);
+    const normalizedDob = normalizeDob(dob);
+    const normalizedUsername = sanitizeAlphaNum(username);
+
     if (!normalizedTin || normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
@@ -309,16 +425,40 @@ async function registerMember({
       throw new Error('A valid email address is required.');
     }
 
-    // 1. Validate activation code
+    const duplicateResult = await evaluateDuplicateIdentity({
+      firstname,
+      lastname,
+      middlename,
+      tin: normalizedTin,
+      email: normalizedEmail,
+      contactno: normalizedContactNo,
+      dob: normalizedDob,
+    }, conn);
+    if (!duplicateResult.allowed) {
+      throw createDuplicateRegistrationError(duplicateResult);
+    }
+
+    const enforcedPosition = placementPolicy?.mode === 'forced'
+      ? Number(placementPolicy.forcedPosition)
+      : Number(position);
+    const requestedPositionValue = requestedPosition == null ? Number(position) : Number(requestedPosition);
+
+    lockKeys.push(`placement:${Number(placementUid)}:${enforcedPosition}`);
+    if (placementPolicy?.mode === 'forced') {
+      lockKeys.push(`sponsor-first:${Number(sponsorUid)}`);
+    }
+    for (const lockKey of lockKeys) {
+      await acquirePlacementLock(conn, lockKey, requestId);
+    }
+
     const codeData = await consumeActivationCodeForRegistration(conn, {
       activationCode,
       sponsorUid,
     });
 
-    // 2. Check username uniqueness
     const [existingUser] = await conn.query(
       'SELECT uid FROM memberstab WHERE username = ?',
-      [sanitizeAlphaNum(username)]
+      [normalizedUsername]
     );
     if (existingUser.length > 0) throw new Error('Username already taken');
 
@@ -328,23 +468,17 @@ async function registerMember({
     );
     if (existingEmail.length > 0) throw new Error('Email address is already being used by another account');
 
-    // 3. Check placement availability
     const [placementCheck] = await conn.query(
       'SELECT uid FROM usertab WHERE refid = ? AND position = ?',
-      [placementUid, position]
+      [placementUid, enforcedPosition]
     );
     if (placementCheck.length > 0) throw new Error('Placement position already taken');
 
-    // 4. Generate UID and count ID
     const newUid = await generateUID();
     const newCountId = await getNextCountId();
-
-    // 5. Calculate CD amount/total if codetype == 3
     const { cdAmount, cdTotal, cdStatus } = deriveRegistrationCdState(codeData);
-
     const now = getOffsetTimestamp();
 
-    // 6. Insert into usertab
     await conn.query(
       `INSERT INTO usertab (id, uid, refid, drefid, mainid, stockistid,
        accttype, currentaccttype, packageid, codeid, activationcode,
@@ -356,16 +490,15 @@ async function registerMember({
        ?, ?, ?, ?, ?, 1, ?)`,
       [newCountId, newUid, placementUid, sponsorUid, newUid, codeData.stockistid,
        codeData.producttype, codeData.producttype, codeData.codetype, activationCode,
-       now, position, codeData.binarypoints, codeData.directreferral,
+       now, enforcedPosition, codeData.binarypoints, codeData.directreferral,
        codeData.incentivepoints, cdAmount, cdTotal, cdStatus, codeData.profitsharing, sponsorUid]
     );
 
-    // 7. Insert into memberstab (hash password with bcrypt)
     const hashedPassword = await bcrypt.hash(password, 12);
     await conn.query(
-      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [newCountId, newUid, sanitizeAlphaNum(username), hashedPassword, firstname, lastname, middlename, normalizedTin, normalizedEmail.slice(0, 180)]
+      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email, contactnos, dob)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newCountId, newUid, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin, normalizedEmail.slice(0, 180), normalizedContactNo || null, normalizedDob || null]
     );
 
     await conn.query(
@@ -385,7 +518,7 @@ async function registerMember({
               CASE WHEN ancestor_uid = ? THEN ? ELSE leg END
        FROM binary_tree_closuretab
        WHERE descendant_uid = ?`,
-      [newUid, placementUid, Number(position) === 1 ? 'left' : 'right', placementUid]
+      [newUid, placementUid, Number(enforcedPosition) === 1 ? 'left' : 'right', placementUid]
     ).catch(() => {});
 
     await conn.query(
@@ -399,19 +532,55 @@ async function registerMember({
         newUid,
         sponsorUid,
         placementUid,
-        Number(position) === 1 ? 'left' : 'right',
+        Number(enforcedPosition) === 1 ? 'left' : 'right',
         String(codeData.producttype || ''),
         Number(codeData.binarypoints || 0),
         createProcessKey(['binary_point', 'registration', activationCode, newUid]),
       ]
     ).catch(() => {});
 
-    // 9. Issue voucher for new member (DOC2 §4.1)
+    await appendPlacementAudit(conn, {
+      sponsorUid: Number(sponsorUid),
+      placementUid: Number(placementUid),
+      createdUid: Number(newUid),
+      requestedPosition: requestedPositionValue,
+      enforcedPosition,
+      policyMode: placementPolicy?.mode || 'manual',
+      policyReason: placementPolicy?.reason || 'manual',
+      referralToken,
+      processKey: createProcessKey(['placement_audit', sponsorUid, newUid, activationCode]),
+    }).catch((error) => {
+      if (error.code === 'ER_NO_SUCH_TABLE') return;
+      throw error;
+    });
+
+    await appendActivationCodeUsage(conn, {
+      code: activationCode,
+      codeRowId: codeData.id || null,
+      eventType: 'registration-used',
+      fromUid: Number(sponsorUid),
+      toUid: Number(newUid),
+      actorUid: Number(sponsorUid),
+      actorAdminId: null,
+      referralToken,
+      registrationUid: Number(newUid),
+      upgradeUid: null,
+      notes: {
+        placementUid: Number(placementUid),
+        requestedPosition: requestedPositionValue,
+        enforcedPosition,
+        policyMode: placementPolicy?.mode || 'manual',
+        policyReason: placementPolicy?.reason || 'manual',
+      },
+      processKey: createProcessKey(['activation_code_usage', 'registration', activationCode, newUid]),
+    }).catch((error) => {
+      if (error.code === 'ER_NO_SUCH_TABLE') return;
+      throw error;
+    });
+
     try {
       await issueVoucher(conn, newUid, codeData.producttype);
     } catch (voucherErr) {
-      // Voucher issuance is non-critical — log but don't block registration
-      // Table may not exist yet if migrations haven't run
       console.warn('[Registration] Voucher issuance skipped:', voucherErr.message);
     }
 
@@ -420,13 +589,17 @@ async function registerMember({
     return {
       success: true,
       uid: newUid,
-      username: sanitizeAlphaNum(username),
+      username: normalizedUsername,
       placementUid,
+      position: enforcedPosition,
+      requestedPosition: requestedPositionValue,
+      placementPolicy,
     };
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
+    await releasePlacementLocks(conn, lockKeys);
     conn.release();
   }
 }
@@ -450,4 +623,5 @@ module.exports = {
   consumeActivationCodeForRegistration,
   registerMember,
   ensureMemberTinColumn,
+  previewActivationCode,
 };

@@ -3,11 +3,55 @@
  * Mirrors PHP session-based auth: if (!isset($_SESSION['uid'])) redirect
  */
 
+const { pool } = require('../config/database');
+
+async function enforceMemberAccountStatus(req, res) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT account_status, account_status_reason
+         FROM usertab
+        WHERE uid = ?
+        LIMIT 1`,
+      [req.session.uid]
+    );
+
+    const status = String(rows[0]?.account_status || 'active').trim().toLowerCase();
+    if (status === 'active' || !status) {
+      req.session.accountStatus = 'active';
+      req.session.accountStatusReason = null;
+      return true;
+    }
+
+    const reason = rows[0]?.account_status_reason || null;
+    req.session.destroy(() => {});
+    res.status(423).json({
+      error: status === 'frozen'
+        ? 'This account is frozen. Please contact support or your administrator.'
+        : 'This account is suspended. Please contact support or your administrator.',
+      accountStatus: status,
+      reason,
+    });
+    return false;
+  } catch (error) {
+    if (error.code === 'ER_BAD_FIELD_ERROR') {
+      return true;
+    }
+    throw error;
+  }
+}
+
 function memberAuth(req, res, next) {
   if (!req.session || !req.session.uid) {
     return res.status(401).json({ error: 'Not authenticated', redirect: '/login' });
   }
-  next();
+  enforceMemberAccountStatus(req, res)
+    .then((allowed) => {
+      if (allowed) next();
+    })
+    .catch((error) => {
+      console.error('[Auth] Member status enforcement error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    });
 }
 
 function adminAuth(req, res, next) {

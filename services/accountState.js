@@ -132,8 +132,22 @@ function countsForPairingSource(row) {
   return false;
 }
 
+function getAccountStateLabel(row) {
+  if (!row) return 'Unknown';
+
+  const codeid = toNumber(row.codeid);
+  const cdstatus = toNumber(row.cdstatus);
+
+  if (codeid === 1) return 'PD';
+  if (codeid === 2) return 'FS';
+  if (codeid === 3 && cdstatus === 2) return 'CD - Paid';
+  if (codeid === 3) return 'CD';
+  return 'Unknown';
+}
+
 module.exports = {
   getLatestUpgradeCode,
   getEffectiveAccountState,
   countsForPairingSource,
+  getAccountStateLabel,
 };

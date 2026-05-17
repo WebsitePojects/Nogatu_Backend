@@ -1,79 +1,103 @@
 /**
  * Leadership Bonus Calculation
- * 1:1 port of PHP income-leadership-2026-fnc.php (latest version)
- *
- * Income Type 3 (income3)
- * - Recursive tree traversal via drefid relationships
- * - Level-based percentage rates:
- *   Level 1 (direct): 5% of income
- *   Level 2: 2% of income
- *   Levels 3-5: 1% of income
+ * 1:1 port baseline of PHP income-leadership-2026-fnc.php, extended with
+ * traceability rows for member/admin audit views.
  */
 const { pool } = require('../../config/database');
 
-/**
- * Recursively get direct referral tree for leadership calculation
- * @param {number} parent - Parent UID
- * @param {number} level - Current level (1-based)
- * @param {Array} results - Accumulator array
- */
-async function getLeadershipDref(parent, level, results) {
-  if (level > 5) return; // Cap at 5 levels
+function toNumber(value) {
+  return Number(value || 0);
+}
 
-  const [rows] = await pool.query(
-    'SELECT uid, drefid FROM usertab WHERE drefid = ?',
-    [parent]
+function rateForLeadershipLevel(level) {
+  const numericLevel = toNumber(level);
+  if (numericLevel === 1) return 0.05;
+  if (numericLevel === 2) return 0.02;
+  if (numericLevel >= 3 && numericLevel <= 5) return 0.01;
+  return 0;
+}
+
+function summarizeLeadershipTraceability(rows = []) {
+  const normalizedRows = rows
+    .map((row) => {
+      const rate = rateForLeadershipLevel(row.level);
+      return {
+        uid: toNumber(row.uid),
+        username: row.username || null,
+        fullName: row.fullName || row.fullname || row.name || row.username || `UID ${row.uid}`,
+        level: toNumber(row.level),
+        rate,
+        ratePercent: rate * 100,
+        pairingIncome: toNumber(row.pairingIncome ?? row.income),
+        leadershipBonus: toNumber(row.pairingIncome ?? row.income) * rate,
+        directReferralCount: toNumber(row.directReferralCount),
+      };
+    })
+    .filter((row) => row.level > 0 && row.rate > 0);
+
+  return {
+    rows: normalizedRows,
+    totalSources: normalizedRows.length,
+    totalBonus: normalizedRows.reduce((sum, row) => sum + row.leadershipBonus, 0),
+    byLevel: {
+      level1: normalizedRows.filter((row) => row.level === 1).reduce((sum, row) => sum + row.leadershipBonus, 0),
+      level2: normalizedRows.filter((row) => row.level === 2).reduce((sum, row) => sum + row.leadershipBonus, 0),
+      level35: normalizedRows.filter((row) => row.level >= 3 && row.level <= 5).reduce((sum, row) => sum + row.leadershipBonus, 0),
+    },
+  };
+}
+
+async function collectLeadershipTraceability(parentUid, level, conn, results) {
+  if (level > 5) return;
+
+  const [rows] = await conn.query(
+    `SELECT
+        u.uid,
+        m.username,
+        m.firstname,
+        m.lastname,
+        COALESCE(p.ttlincome2, 0) AS pairingIncome,
+        (
+          SELECT COUNT(*)
+          FROM usertab dr
+          WHERE dr.drefid = u.uid
+        ) AS directReferralCount
+     FROM usertab u
+     LEFT JOIN memberstab m ON m.uid = u.uid
+     LEFT JOIN payouttotaltab p ON p.uid = u.uid
+     WHERE u.drefid = ?
+     ORDER BY u.uid ASC`,
+    [parentUid]
   );
 
   for (const row of rows) {
-    // Get this user's total pairing income (ttlincome2 from payouttotaltab)
-    const [incomeRows] = await pool.query(
-      'SELECT ttlincome2 FROM payouttotaltab WHERE uid = ?',
-      [row.uid]
-    );
-
-    const income = Number(incomeRows[0]?.ttlincome2 || 0);
-
     results.push({
-      uid: row.uid,
-      level: level,
-      income: income,
+      uid: toNumber(row.uid),
+      username: row.username || null,
+      fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || `UID ${row.uid}`,
+      level,
+      pairingIncome: toNumber(row.pairingIncome),
+      directReferralCount: toNumber(row.directReferralCount),
     });
 
-    // Recurse to next level
-    await getLeadershipDref(row.uid, level + 1, results);
+    await collectLeadershipTraceability(row.uid, level + 1, conn, results);
   }
 }
 
-/**
- * Calculate leadership bonus for a user
- * @param {number} uid - User ID
- * @returns {number} Total leadership bonus
- */
-async function getLeadershipBonus(uid) {
-  const results = [];
-  await getLeadershipDref(uid, 1, results);
-
-  let level1Total = 0;
-  let level2Total = 0;
-  let level35Total = 0;
-
-  for (const r of results) {
-    if (r.level === 1) {
-      level1Total += r.income;
-    } else if (r.level === 2) {
-      level2Total += r.income;
-    } else if (r.level >= 3 && r.level <= 5) {
-      level35Total += r.income;
-    }
-  }
-
-  // Apply percentage rates
-  const leadershipTotal1 = level1Total * 0.05;  // 5%
-  const leadershipTotal2 = level2Total * 0.02;  // 2%
-  const leadershipTotal35 = level35Total * 0.01; // 1%
-
-  return leadershipTotal1 + leadershipTotal2 + leadershipTotal35;
+async function getLeadershipTraceability(uid, conn = pool) {
+  const rows = [];
+  await collectLeadershipTraceability(toNumber(uid), 1, conn, rows);
+  return summarizeLeadershipTraceability(rows);
 }
 
-module.exports = { getLeadershipBonus };
+async function getLeadershipBonus(uid, conn = pool) {
+  const trace = await getLeadershipTraceability(uid, conn);
+  return trace.totalBonus;
+}
+
+module.exports = {
+  rateForLeadershipLevel,
+  summarizeLeadershipTraceability,
+  getLeadershipTraceability,
+  getLeadershipBonus,
+};

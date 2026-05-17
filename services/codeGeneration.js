@@ -7,6 +7,8 @@
  */
 const { pool } = require('../config/database');
 const PseudoCrypt = require('../utils/pseudoCrypt');
+const { createProcessKey } = require('../utils/security');
+const { appendActivationCodeUsage } = require('./registrationAudit');
 
 // Product configuration - 1:1 from PHP codeInsert()
 const PRODUCT_CONFIG = {
@@ -18,15 +20,16 @@ const PRODUCT_CONFIG = {
   50: { name: 'Garnet', directreferral: 5000, binarypoints: 5000, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 50000 },
   60: { name: 'Diamond', directreferral: 15000, binarypoints: 15000, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 150000 },
   // Product types (100+)
-  100: { name: 'Barley', directreferral: 0, binarypoints: 0, unilevelpoints: 50, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  101: { name: 'Glutathione', directreferral: 0, binarypoints: 0, unilevelpoints: 45, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  102: { name: 'Gluta w/ Collagen', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  103: { name: 'Coffee Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  104: { name: 'Chocolate Drink', directreferral: 0, binarypoints: 0, unilevelpoints: 45, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  105: { name: 'Mangosteen', directreferral: 0, binarypoints: 0, unilevelpoints: 30, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  106: { name: 'Vitamin Zinc', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  107: { name: 'Max Coffee', directreferral: 0, binarypoints: 0, unilevelpoints: 100, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  100: { name: 'Nogatu Barley Juice', directreferral: 0, binarypoints: 0, unilevelpoints: 50, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  101: { name: 'Nogatu Glow', directreferral: 0, binarypoints: 0, unilevelpoints: 45, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  102: { name: 'Nogatu Collagen Vitamin C', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  103: { name: 'Nogatu Coffee Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  104: { name: 'Chocolate Drink Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 45, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  105: { name: 'Mangosteen Coffee Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 30, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  106: { name: 'Vitamin C', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  107: { name: 'Max Fuel Coffee Drink Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 100, incentivepoints: 0, profitsharing: 0, productamount: 0 },
   108: { name: 'Black Coffee', directreferral: 0, binarypoints: 0, unilevelpoints: 10, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  109: { name: 'Berry NAD+', directreferral: 0, binarypoints: 0, unilevelpoints: 35, incentivepoints: 0, profitsharing: 0, productamount: 0 },
 };
 
 // Code type prefixes
@@ -87,7 +90,7 @@ async function codeInsert(code, productType, codeType, stockistId, adminId) {
   const config = PRODUCT_CONFIG[productType];
   if (!config) throw new Error(`Unknown product type: ${productType}`);
 
-  await pool.query(
+  const [result] = await pool.query(
     `INSERT INTO codestab
      (id, code, producttype, productamount, codetype, directreferral,
       binarypoints, unilevelpoints, incentivepoints, profitsharing,
@@ -97,6 +100,19 @@ async function codeInsert(code, productType, codeType, stockistId, adminId) {
      config.directreferral, config.binarypoints, config.unilevelpoints,
      config.incentivepoints, config.profitsharing, stockistId]
   );
+
+  await appendActivationCodeUsage(pool, {
+    code,
+    codeRowId: result.insertId || null,
+    eventType: 'generated',
+    actorAdminId: Number(adminId) || null,
+    notes: {
+      productType: Number(productType),
+      codeType: Number(codeType),
+      stockistId: Number(stockistId) || null,
+    },
+    processKey: createProcessKey(['code-generated', code, result.insertId || code, adminId || 'system']),
+  });
 }
 
 module.exports = { generateCodes, PRODUCT_CONFIG, CODE_PREFIXES };

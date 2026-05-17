@@ -7,6 +7,7 @@ const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { getGenealogyTree, isInNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
+const { getEffectiveAccountState, getAccountStateLabel } = require('../services/accountState');
 
 function packageColor(accttype) {
   const key = Number(accttype || 0);
@@ -37,18 +38,22 @@ async function getChildNodes(parentUid) {
      ORDER BY u.position ASC, u.id ASC`,
     [parentUid]
   );
-  return rows.map((row) => ({
-    uid: row.public_uid || String(row.uid),
-    internalUid: row.uid,
-    displayName: `${row.firstname || ''} ${String(row.lastname || '').slice(0, 1)}.`.trim() || row.username || `Member ${row.uid}`,
-    username: row.username,
-    packageType: packageColor(row.currentaccttype),
-    position: Number(row.position) === 1 ? 'left' : 'right',
-    binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
-    leftChildCount: Number(row.leftChildCount || 0),
-    rightChildCount: Number(row.rightChildCount || 0),
-    hasMoreLeft: Number(row.leftChildCount || 0) > 0,
-    hasMoreRight: Number(row.rightChildCount || 0) > 0,
+  return Promise.all(rows.map(async (row) => {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    return {
+      uid: row.public_uid || String(row.uid),
+      internalUid: row.uid,
+      displayName: `${row.firstname || ''} ${String(row.lastname || '').slice(0, 1)}.`.trim() || row.username || `Member ${row.uid}`,
+      username: row.username,
+      packageType: packageColor(row.currentaccttype),
+      position: Number(row.position) === 1 ? 'left' : 'right',
+      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+      accountStateLabel: getAccountStateLabel(effectiveRow || row),
+      leftChildCount: Number(row.leftChildCount || 0),
+      rightChildCount: Number(row.rightChildCount || 0),
+      hasMoreLeft: Number(row.leftChildCount || 0) > 0,
+      hasMoreRight: Number(row.rightChildCount || 0) > 0,
+    };
   }));
 }
 
@@ -111,6 +116,7 @@ router.get('/expand/:publicUid', memberAuth, async (req, res) => {
       username: root.username,
       packageType: packageColor(root.currentaccttype),
       position: 'self',
+      accountStateLabel: getAccountStateLabel(await getEffectiveAccountState(root.uid, root)),
     };
 
     res.json({

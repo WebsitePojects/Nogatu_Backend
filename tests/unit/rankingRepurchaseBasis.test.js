@@ -4,6 +4,9 @@ const assert = require('node:assert/strict');
 const {
   RANKING_BASIS_LABEL,
   getRankCashIncentive,
+  getPackageRankingPolicy,
+  filterRankDefinitionsForPackage,
+  canReleaseRankAchievementForPackage,
   normalizeRankDefinitions,
   sumRepurchasePoints,
 } = require('../../services/ranking');
@@ -72,4 +75,60 @@ test('rank definitions normalize left/right requirements from rank codes', () =>
   assert.equal(normalized[1].right_rank_required, 1);
   assert.equal(normalized[2].rank, 3);
   assert.equal(normalized[2].left_rank_required, 0);
+});
+
+test('package ranking policy excludes Bronze and Silver and gates higher packages', () => {
+  assert.deepEqual(
+    getPackageRankingPolicy(10),
+    {
+      packageType: 10,
+      packageLabel: 'Bronze',
+      rankingEligible: false,
+      maxRank: 0,
+      maxRankLabel: null,
+      nextUpgradePackageType: 30,
+      nextUpgradePackageLabel: 'Gold',
+      reason: 'Upgrade to Gold package to begin ranking.',
+    }
+  );
+
+  assert.deepEqual(
+    getPackageRankingPolicy(30),
+    {
+      packageType: 30,
+      packageLabel: 'Gold',
+      rankingEligible: true,
+      maxRank: 3,
+      maxRankLabel: 'Supervisor 3',
+      nextUpgradePackageType: 40,
+      nextUpgradePackageLabel: 'Platinum',
+      reason: 'Upgrade to Platinum package to progress beyond Supervisor 3.',
+    }
+  );
+});
+
+test('rank definitions are filtered by package ceiling', () => {
+  const definitions = [
+    { rank: 1, rank_name: 'Supervisor 1' },
+    { rank: 2, rank_name: 'Supervisor 2' },
+    { rank: 3, rank_name: 'Supervisor 3' },
+    { rank: 4, rank_name: 'Manager 1' },
+  ];
+
+  assert.deepEqual(
+    filterRankDefinitionsForPackage(definitions, 10).map((row) => row.rank),
+    []
+  );
+
+  assert.deepEqual(
+    filterRankDefinitionsForPackage(definitions, 30).map((row) => row.rank),
+    [1, 2, 3]
+  );
+});
+
+test('rank achievement release respects the current package gate', () => {
+  assert.equal(canReleaseRankAchievementForPackage(30, 3), true);
+  assert.equal(canReleaseRankAchievementForPackage(30, 4), false);
+  assert.equal(canReleaseRankAchievementForPackage(10, 1), false);
+  assert.equal(canReleaseRankAchievementForPackage(50, 10), true);
 });

@@ -8,10 +8,13 @@ const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const registrationService = require('../services/registration');
-const { resolveTin, isValidTin } = require('../utils/tin');
 const { createReferralSlug, normalizeReferralSlug, createPublicId } = require('../utils/security');
 const { writeAuditLog } = require('../services/audit');
 const { recommendPlacementForSponsor } = require('../services/placementRecommendation');
+const {
+  getPlacementPolicyForSponsor,
+  placementPolicyMessage,
+} = require('../services/binaryPlacementPolicy');
 
 async function ensureReferralInvitesTable() {
   await pool.query(
@@ -41,6 +44,29 @@ async function ensurePublicIdentityColumns() {
   }
 }
 
+async function ensurePublicRegistrationAuditColumns() {
+  const [requestedCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'requested_position'").catch(() => [[]]);
+  if (requestedCols.length === 0) {
+    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN requested_position TINYINT NULL').catch(() => {});
+  }
+  const [enforcedCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'enforced_position'").catch(() => [[]]);
+  if (enforcedCols.length === 0) {
+    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN enforced_position TINYINT NULL').catch(() => {});
+  }
+  const [modeCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'placement_policy_mode'").catch(() => [[]]);
+  if (modeCols.length === 0) {
+    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN placement_policy_mode VARCHAR(32) NULL').catch(() => {});
+  }
+  const [reasonCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'placement_policy_reason'").catch(() => [[]]);
+  if (reasonCols.length === 0) {
+    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN placement_policy_reason VARCHAR(120) NULL').catch(() => {});
+  }
+  const [consumedCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'consumed_at'").catch(() => [[]]);
+  if (consumedCols.length === 0) {
+    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN consumed_at TIMESTAMP(6) NULL').catch(() => {});
+  }
+}
+
 async function ensureReferralSlug(uid) {
   await ensurePublicIdentityColumns();
   const [rows] = await pool.query('SELECT public_uid, referral_slug FROM usertab WHERE uid = ? LIMIT 1', [uid]);
@@ -65,6 +91,25 @@ async function ensureReferralSlug(uid) {
 }
 
 async function buildPlacementPreview(sponsorUid, conn = pool) {
+  const placementPolicy = await getPlacementPolicyForSponsor(Number(sponsorUid), conn);
+  if (placementPolicy.mode === 'forced') {
+    const [rows] = await conn.query(
+      'SELECT username FROM memberstab WHERE uid = ? LIMIT 1',
+      [Number(sponsorUid)]
+    );
+
+    return {
+      placementUid: Number(sponsorUid),
+      position: Number(placementPolicy.forcedPosition),
+      side: Number(placementPolicy.forcedPosition) === 2 ? 'right' : 'left',
+      strategy: 'first-direct-safetynet',
+      placementUsername: rows[0]?.username || null,
+      positionLabel: placementPolicy.forcedPositionLabel,
+      note: placementPolicyMessage(placementPolicy),
+      placementPolicy,
+    };
+  }
+
   const placement = await recommendPlacementForSponsor(Number(sponsorUid), conn);
   const [rows] = await conn.query(
     'SELECT username FROM memberstab WHERE uid = ? LIMIT 1',
@@ -75,8 +120,30 @@ async function buildPlacementPreview(sponsorUid, conn = pool) {
     ...placement,
     placementUsername: rows[0]?.username || null,
     positionLabel: Number(placement.position) === 1 ? 'Left' : 'Right',
-    note: 'System auto-assigns placement on the weak leg to help generate guaranteed binary points.',
+    note: placementPolicyMessage(placementPolicy),
+    placementPolicy,
   };
+}
+
+async function writeDuplicateRegistrationAudit(req, sponsorUid, details, attemptedIdentity) {
+  await writeAuditLog({
+    req,
+    actorUid: Number(sponsorUid) || null,
+    actorRole: 'member',
+    action: 'registration.duplicate_blocked',
+    targetUid: Number(details?.matchedUid || 0) || null,
+    targetTable: 'memberstab',
+    targetId: details?.matchedUid ? String(details.matchedUid) : null,
+    beforeState: {
+      attemptedIdentity,
+    },
+    afterState: {
+      blocked: true,
+      normalizedName: details?.normalizedName || '',
+      matchedSignals: details?.matchedSignals || [],
+      reason: details?.reason || 'name-plus-strong-signal-match',
+    },
+  }).catch(() => {});
 }
 
 /**
@@ -86,8 +153,8 @@ async function buildPlacementPreview(sponsorUid, conn = pool) {
 router.get('/validate-code', async (req, res) => {
   try {
     const { code } = req.query;
-    const isValid = await registrationService.validateCode(code || '');
-    res.json({ valid: isValid });
+    const preview = await registrationService.previewActivationCode(code || '');
+    res.json(preview);
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -227,7 +294,7 @@ router.get('/referral-link', memberAuth, async (req, res) => {
     res.json({
       slug: identity.slug,
       publicUid: identity.publicUid,
-      placementMode: 'weak-leg',
+      placementMode: placement?.placementPolicy?.mode || 'manual',
       placement,
     });
   } catch (err) {
@@ -244,9 +311,10 @@ router.post('/referral-invite', memberAuth, async (req, res) => {
   try {
     await ensureReferralInvitesTable();
     const sponsorUid = Number(req.session.uid);
+    const placementPolicy = await getPlacementPolicyForSponsor(sponsorUid);
     const placementUid = Number(req.body?.placementUid || 0);
     const requestedPosition = Number(req.body?.position || 0);
-    const placement = (placementUid && [1, 2].includes(requestedPosition))
+    const placement = (placementPolicy.mode === 'manual' && placementUid && [1, 2].includes(requestedPosition))
       ? {
           placementUid,
           position: requestedPosition,
@@ -254,6 +322,7 @@ router.post('/referral-invite', memberAuth, async (req, res) => {
           side: requestedPosition === 1 ? 'left' : 'right',
           strategy: 'manual',
           note: 'Manual placement was selected for this referral invite.',
+          placementPolicy,
         }
       : await buildPlacementPreview(sponsorUid);
 
@@ -300,6 +369,7 @@ router.get('/referral/:token', async (req, res) => {
         [slug]
       );
       if (slugRows.length > 0) {
+        const placement = await buildPlacementPreview(Number(slugRows[0].sponsor_uid));
         return res.json({
           invite: {
             token: slug,
@@ -308,6 +378,9 @@ router.get('/referral/:token', async (req, res) => {
             sponsor_public_uid: slugRows[0].sponsor_public_uid,
             sponsor_username: slugRows[0].sponsor_username,
             reusable: true,
+            placement_uid: placement.placementUid,
+            position: placement.position,
+            placement,
           },
         });
       }
@@ -322,7 +395,18 @@ router.get('/referral/:token', async (req, res) => {
       [String(req.params.token || '')]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
-    res.json({ invite: rows[0] });
+    const livePlacement = await buildPlacementPreview(Number(rows[0].sponsor_uid));
+    const placement = livePlacement?.placementPolicy?.mode === 'forced'
+      ? livePlacement
+      : {
+          ...livePlacement,
+          placementUid: Number(rows[0].placement_uid),
+          position: Number(rows[0].position),
+          side: Number(rows[0].position) === 2 ? 'right' : 'left',
+          positionLabel: Number(rows[0].position) === 2 ? 'Right' : 'Left',
+          note: 'Placement is reserved by this referral invite. The backend will re-check it before saving.',
+        };
+    res.json({ invite: { ...rows[0], placement } });
   } catch (err) {
     console.error('[Registration] Public referral lookup error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -334,10 +418,10 @@ router.post('/public-register', async (req, res) => {
     await ensureReferralInvitesTable();
     const {
       token, slug, activationCode, username, password,
-      firstname, lastname, middlename, tin, email, deviceFingerprint
+      firstname, lastname, middlename, tin, email, deviceFingerprint, contactno, dob
     } = req.body;
 
-    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname || !email) {
+    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname || !email || !contactno || !dob) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -349,6 +433,7 @@ router.post('/public-register', async (req, res) => {
 
     let invite;
     let reusableSlug = false;
+    let placement;
     if (slug) {
       const normalizedSlug = normalizeReferralSlug(slug);
       const [sponsorRows] = await pool.query(
@@ -356,7 +441,7 @@ router.post('/public-register', async (req, res) => {
         [normalizedSlug]
       );
       if (sponsorRows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
-      const placement = await buildPlacementPreview(Number(sponsorRows[0].uid));
+      placement = await buildPlacementPreview(Number(sponsorRows[0].uid));
       invite = {
         sponsor_uid: Number(sponsorRows[0].uid),
         placement_uid: placement.placementUid,
@@ -373,12 +458,22 @@ router.post('/public-register', async (req, res) => {
       );
       if (rows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
       invite = rows[0];
+      const livePlacement = await buildPlacementPreview(Number(invite.sponsor_uid));
+      placement = livePlacement?.placementPolicy?.mode === 'forced'
+        ? livePlacement
+        : {
+            ...livePlacement,
+            placementUid: Number(invite.placement_uid),
+            position: Number(invite.position),
+            side: Number(invite.position) === 2 ? 'right' : 'left',
+            positionLabel: Number(invite.position) === 2 ? 'Right' : 'Left',
+          };
     }
 
     const result = await registrationService.registerMember({
       activationCode,
       sponsorUid: Number(invite.sponsor_uid),
-      placementUid: Number(invite.placement_uid),
+      placementUid: Number(placement?.placementUid || invite.placement_uid),
       username,
       password,
       firstname,
@@ -386,7 +481,13 @@ router.post('/public-register', async (req, res) => {
       middlename,
       tin,
       email,
-      position: Number(invite.position),
+      contactno,
+      dob,
+      position: Number(placement?.position || invite.position),
+      requestedPosition: Number(invite.position),
+      placementPolicy: placement?.placementPolicy || null,
+      referralToken: invite.referral_slug || String(token || '').slice(0, 80),
+      requestId: req.requestId || null,
     });
 
     if (!reusableSlug) {
@@ -394,17 +495,23 @@ router.post('/public-register', async (req, res) => {
     }
 
     await ensureReferralSlug(Number(result.uid)).catch(() => {});
+    await ensurePublicRegistrationAuditColumns();
     await pool.query(
       `INSERT INTO public_registration_audittab
        (registration_uid, sponsor_uid, new_member_uid, referral_slug, activation_code,
-        registration_ip, device_fingerprint, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'completed')`,
+        requested_position, enforced_position, placement_policy_mode, placement_policy_reason,
+        registration_ip, device_fingerprint, status, consumed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP(6))`,
       [
         createPublicId(),
         Number(invite.sponsor_uid),
         Number(result.uid),
         invite.referral_slug || String(token || '').slice(0, 32),
         activationCode,
+        Number(invite.position || 0) || null,
+        Number(result.position || 0) || null,
+        result.placementPolicy?.mode || null,
+        result.placementPolicy?.reason || null,
         req.ip || null,
         String(deviceFingerprint || '').slice(0, 256) || null,
       ]
@@ -418,12 +525,35 @@ router.post('/public-register', async (req, res) => {
       targetUid: Number(result.uid),
       targetTable: 'usertab',
       targetId: String(result.uid),
-      afterState: { placementUid: invite.placement_uid, position: invite.position },
+      afterState: {
+        placementUid: result.placementUid,
+        requestedPosition: invite.position,
+        enforcedPosition: result.position,
+        placementPolicy: result.placementPolicy || null,
+      },
     }).catch(() => {});
 
     res.json(result);
   } catch (err) {
     console.error('[Registration] Public registration error:', err);
+    if (err.code === 'DUPLICATE_ACCOUNT') {
+      await writeDuplicateRegistrationAudit(req, Number(req.body?.sponsorUid || 0), err.details, {
+        firstname: req.body?.firstname,
+        lastname: req.body?.lastname,
+        middlename: req.body?.middlename,
+        tin: req.body?.tin,
+        email: req.body?.email,
+        contactno: req.body?.contactno,
+        dob: req.body?.dob,
+      });
+      return res.status(400).json({
+        error: err.message,
+        duplicatePolicy: {
+          blocked: true,
+          reason: err.details?.reason || 'name-plus-strong-signal-match',
+        },
+      });
+    }
     res.status(400).json({ error: err.message });
   }
 });
@@ -436,13 +566,13 @@ router.post('/register', memberAuth, async (req, res) => {
   try {
     const {
       activationCode, placementUid, username, password,
-      firstname, lastname, middlename, position, tin, tinno, email
+      firstname, lastname, middlename, position, tin, tinno, email, contactno, dob
     } = req.body;
 
     const rawTin = String(tin || tinno || '').trim();
 
     // Input validation
-    if (!activationCode || !username || !password || !firstname || !lastname || !rawTin || !email) {
+    if (!activationCode || !username || !password || !firstname || !lastname || !rawTin || !email || !contactno || !dob) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -459,14 +589,18 @@ router.post('/register', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
     }
 
-    const recommendedPlacement = !placementUid
-      ? await buildPlacementPreview(Number(req.session.uid))
-      : null;
+    const recommendedPlacement = await buildPlacementPreview(Number(req.session.uid));
+    const finalPlacementUid = recommendedPlacement?.placementPolicy?.mode === 'forced'
+      ? Number(recommendedPlacement.placementUid)
+      : (!placementUid ? Number(recommendedPlacement.placementUid) : Number(placementUid));
+    const finalPosition = recommendedPlacement?.placementPolicy?.mode === 'forced'
+      ? Number(recommendedPlacement.position)
+      : (!placementUid ? Number(recommendedPlacement.position) : Number(position));
 
     const result = await registrationService.registerMember({
       activationCode,
       sponsorUid: req.session.uid,
-      placementUid: recommendedPlacement ? Number(recommendedPlacement.placementUid) : Number(placementUid),
+      placementUid: finalPlacementUid,
       username,
       password,
       firstname,
@@ -474,12 +608,35 @@ router.post('/register', memberAuth, async (req, res) => {
       middlename,
       tin: rawTin,
       email,
-      position: recommendedPlacement ? Number(recommendedPlacement.position) : Number(position),
+      contactno,
+      dob,
+      position: finalPosition,
+      requestedPosition: Number(position),
+      placementPolicy: recommendedPlacement?.placementPolicy || null,
+      requestId: req.requestId || null,
     });
 
     res.json(result);
   } catch (err) {
     console.error('[Registration] Error:', err);
+    if (err.code === 'DUPLICATE_ACCOUNT') {
+      await writeDuplicateRegistrationAudit(req, Number(req.session.uid), err.details, {
+        firstname: req.body?.firstname,
+        lastname: req.body?.lastname,
+        middlename: req.body?.middlename,
+        tin: req.body?.tin || req.body?.tinno,
+        email: req.body?.email,
+        contactno: req.body?.contactno,
+        dob: req.body?.dob,
+      });
+      return res.status(400).json({
+        error: err.message,
+        duplicatePolicy: {
+          blocked: true,
+          reason: err.details?.reason || 'name-plus-strong-signal-match',
+        },
+      });
+    }
     res.status(400).json({ error: err.message });
   }
 });

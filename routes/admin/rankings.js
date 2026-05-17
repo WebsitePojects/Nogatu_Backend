@@ -40,7 +40,7 @@ router.put('/:uid/process', adminAuth, adminRights([1, 3]), async (req, res) => 
         ...result,
       });
     } else {
-      res.status(400).json({ error: 'No pending incentive found' });
+      res.status(400).json({ error: result.error || 'No pending incentive found' });
     }
   } catch (err) {
     console.error('[Admin Rankings] Process error:', err);

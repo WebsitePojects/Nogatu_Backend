@@ -12,37 +12,35 @@ const {
 } = require('../../services/globalBonus');
 
 /**
- * GET /api/admin/global-bonus?month=MM&year=YYYY&page=1&perPage=30
- * Returns preview + distributed records for selected period.
+ * GET /api/admin/global-bonus?year=YYYY&page=1&perPage=30
+ * Returns preview + distributed records for selected annual period.
  */
 router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const month = req.query.month;
     const year = req.query.year;
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 30));
 
-    const report = await getGlobalBonusReport(month, year, page, perPage);
+    const report = await getGlobalBonusReport(year, page, perPage);
     res.json(report);
   } catch (err) {
     console.error('[Admin Global Bonus] Report error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
 /**
- * GET /api/admin/global-bonus/preview?month=MM&year=YYYY
+ * GET /api/admin/global-bonus/preview?year=YYYY
  * Preview current computed pool/recipients without writing distribution rows.
  */
 router.get('/preview', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const month = req.query.month;
     const year = req.query.year;
-    const preview = await calculateGlobalBonus(month, year);
+    const preview = await calculateGlobalBonus(year);
     res.json(preview);
   } catch (err) {
     console.error('[Admin Global Bonus] Preview error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -62,20 +60,19 @@ router.get('/latest', adminAuth, adminRights([1, 3]), async (req, res) => {
 
 /**
  * POST /api/admin/global-bonus/distribute
- * Body: { month?: MM, year?: YYYY }
- * Calculates and persists monthly distribution rows.
+ * Body: { year?: YYYY }
+ * Calculates and persists annual distribution rows.
  */
 router.post('/distribute', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const month = req.body?.month;
     const year = req.body?.year;
     const processId = req.session.adminid || 'admin';
 
-    const summary = await distributeGlobalBonus(month, year, processId);
+    const summary = await distributeGlobalBonus(year, processId);
 
     res.json({
       success: true,
-      message: 'Global bonus distributed successfully',
+      message: 'Annual global bonus distributed successfully',
       summary,
     });
   } catch (err) {

@@ -12,6 +12,7 @@
  */
 const { pool } = require('../../config/database');
 const { previousMonthRange, currentMonthRange } = require('../../utils/helpers');
+const { getPackagePolicy } = require('../packagePolicy');
 
 /**
  * Get total repurchase points for a user in previous month
@@ -86,7 +87,7 @@ async function updateIncomeTransDate(uid, incomeType) {
  * @param {{ ctlLevel: number, totals: { lev1: number, lev23: number, lev45: number, lev610: number } }} state
  */
 async function calculateUnilevel(parent, level, state) {
-  if (level > 10) return;
+  if (level > 10 || level > Number(state.maxReach || 10)) return;
 
   const [rows] = await pool.query(
     'SELECT uid FROM usertab WHERE drefid = ?',
@@ -129,10 +130,20 @@ async function getUnilevel(uid) {
   const alreadyCalculated = await checkUnilevelTransDate(uid);
   if (alreadyCalculated) return 0;
 
+  const [packageRows] = await pool.query(
+    'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
+    [uid]
+  );
+  const packagePolicy = getPackagePolicy(packageRows[0]?.currentaccttype || 0);
+
   const state = {
     ctlLevel: 0,
+    maxReach: Number(packagePolicy.unilevelReach || 0) || 0,
     totals: { lev1: 0, lev23: 0, lev45: 0, lev610: 0 },
   };
+  if (state.maxReach <= 0) {
+    return 0;
+  }
   await calculateUnilevel(uid, 1, state);
 
   // Apply percentage rates
