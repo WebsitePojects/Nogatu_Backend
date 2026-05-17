@@ -3,7 +3,7 @@ const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName } = require('../../utils/helpers');
-const { PACKAGE_AMOUNTS } = require('../../services/voucher');
+const { PACKAGE_AMOUNTS, grantVouchersToExistingMembers } = require('../../services/voucher');
 
 async function ensureVoucherTables() {
   await pool.query(
@@ -232,6 +232,25 @@ router.put('/:id/unsuspend', adminAuth, adminRights([1, 2, 3]), async (req, res)
     res.json({ success: true });
   } catch (error) {
     console.error('[Admin Voucher Management] Unsuspend error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/admin/voucher-management/grant-existing
+ */
+router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const inserted = await grantVouchersToExistingMembers();
+
+    res.json({
+      success: true,
+      inserted,
+      message: `Granted ${inserted} voucher(s) to existing members without vouchers.`,
+    });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Grant existing error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

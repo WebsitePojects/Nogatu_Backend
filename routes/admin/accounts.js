@@ -18,6 +18,27 @@ const PACKAGE_MAP = {
   60: 'Diamond',
 };
 
+let tinColumnsChecked = false;
+let memberHasTinNoColumn = false;
+
+async function ensureMemberTinColumns() {
+  if (tinColumnsChecked) return;
+  try {
+    const [tinRows] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
+    if (tinRows.length === 0) {
+      await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL AFTER contactnos');
+      console.log('[Admin Accounts] Added memberstab.tin column');
+    }
+
+    const [tinNoRows] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tinno'");
+    memberHasTinNoColumn = tinNoRows.length > 0;
+
+    tinColumnsChecked = true;
+  } catch (err) {
+    console.error('[Admin Accounts] Failed ensuring TIN columns:', err.message);
+  }
+}
+
 /**
  * GET /api/admin/accounts?page=1&search=name
  * Account masterlist (paginated, 50 per page)
@@ -87,12 +108,16 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
+    await ensureMemberTinColumns();
     const uid = Number(req.params.uid);
+    const tinSelect = memberHasTinNoColumn
+      ? 'COALESCE(m.tin, m.tinno) AS tin, m.tinno'
+      : 'm.tin AS tin, NULL AS tinno';
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
               m.username, m.firstname, m.lastname, m.middlename,
-              m.address, m.contactnos, m.payoutid, m.payoutdetails
+              m.address, m.contactnos, ${tinSelect}, m.payoutid, m.payoutdetails
        FROM usertab u, memberstab m
        WHERE u.uid = m.uid AND u.uid = ?`,
       [uid]
@@ -102,7 +127,14 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    res.json(rows[0]);
+    const row = rows[0];
+    const resolvedTin = row.tin || row.tinno || null;
+
+    res.json({
+      ...row,
+      tin: resolvedTin,
+      tinno: resolvedTin,
+    });
   } catch (err) {
     console.error('[Admin Accounts] Get error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -116,28 +148,64 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
+    await ensureMemberTinColumns();
     const uid = Number(req.params.uid);
     const { firstname, lastname, middlename, address, password,
-            payoutdetails, payoutoptions, contactnos } = req.body;
+            payoutdetails, payoutoptions, contactnos, tin, tinno } = req.body;
+
+    const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
+      || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
+
+    let normalizedTin = null;
+    if (hasTinField) {
+      normalizedTin = String(tin || tinno || '').trim();
+      if (normalizedTin && (normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin))) {
+        return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+      }
+    }
+
+    const setClauses = [
+      'firstname = ?',
+      'lastname = ?',
+      'middlename = ?',
+      'address = ?',
+      'payoutdetails = ?',
+      'payoutid = ?',
+      'contactnos = ?',
+    ];
+    const values = [
+      firstname,
+      lastname,
+      middlename,
+      address,
+      payoutdetails,
+      payoutoptions,
+      contactnos,
+    ];
+
+    if (hasTinField) {
+      setClauses.push('tin = ?');
+      values.push(normalizedTin || null);
+    }
 
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);
-      await pool.query(
-        `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-         address = ?, password = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
-         WHERE uid = ? LIMIT 1`,
-        [firstname, lastname, middlename, address, hashedPassword,
-         payoutdetails, payoutoptions, contactnos, uid]
-      );
-    } else {
-      await pool.query(
-        `UPDATE memberstab SET firstname = ?, lastname = ?, middlename = ?,
-         address = ?, payoutdetails = ?, payoutid = ?, contactnos = ?
-         WHERE uid = ? LIMIT 1`,
-        [firstname, lastname, middlename, address,
-         payoutdetails, payoutoptions, contactnos, uid]
-      );
+      setClauses.push('password = ?');
+      values.push(hashedPassword);
     }
+
+    if (hasTinField && memberHasTinNoColumn) {
+      setClauses.push('tinno = ?');
+      values.push(normalizedTin || null);
+    }
+
+    values.push(uid);
+
+    await pool.query(
+      `UPDATE memberstab SET ${setClauses.join(', ')}
+       WHERE uid = ? LIMIT 1`,
+      values
+    );
 
     const [result] = await pool.query('SELECT uid FROM memberstab WHERE uid = ?', [uid]);
 

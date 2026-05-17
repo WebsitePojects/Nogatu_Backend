@@ -131,11 +131,27 @@ router.post('/upgrade', memberAuth, async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
+    const [memberRows] = await conn.query(
+      `SELECT accttype, currentaccttype, codeid, cdamount, cdtotal, cdstatus
+         FROM usertab
+        WHERE uid = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [uid]
+    );
+
+    if (memberRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const member = memberRows[0];
+
     // Validate upgrade code
     const [codeRows] = await conn.query(
       `SELECT * FROM codestab WHERE code = ? AND producttype > ?
-       AND codetype = 1 AND producttype <= 90 AND codestatus = 1 AND uid = ?`,
-      [code, req.session.currentaccttype, uid]
+       AND codetype IN (1, 2, 3) AND producttype <= 90 AND codestatus = 1 AND uid = ?`,
+      [code, member.currentaccttype, uid]
     );
 
     if (codeRows.length === 0) {
@@ -155,11 +171,52 @@ router.post('/upgrade', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Upgrade code is no longer available' });
     }
 
-    // Update account type
-    await conn.query(
-      'UPDATE usertab SET currentaccttype = ? WHERE uid = ? LIMIT 1',
-      [codeData.producttype, uid]
-    );
+    // Update account state based on the actual code type used for the upgrade.
+    if (Number(codeData.codetype) === 1) {
+      if (Number(member.codeid) === 3) {
+        await conn.query(
+          `UPDATE usertab
+              SET currentaccttype = ?,
+                  cdtotal = cdamount,
+                  cdstatus = 2
+            WHERE uid = ?
+            LIMIT 1`,
+          [codeData.producttype, uid]
+        );
+      } else {
+        await conn.query(
+          'UPDATE usertab SET currentaccttype = ? WHERE uid = ? LIMIT 1',
+          [codeData.producttype, uid]
+        );
+      }
+    } else if (Number(codeData.codetype) === 2) {
+      await conn.query(
+        `UPDATE usertab
+            SET currentaccttype = ?,
+                cdamount = 0,
+                cdtotal = 0,
+                cdstatus = 0
+          WHERE uid = ?
+          LIMIT 1`,
+        [codeData.producttype, uid]
+      );
+    } else if (Number(codeData.codetype) === 3) {
+      await conn.query(
+        `UPDATE usertab
+            SET currentaccttype = ?,
+                cdamount = ?,
+                cdtotal = 0,
+                cdstatus = 1
+          WHERE uid = ?
+          LIMIT 1`,
+        [codeData.producttype, codeData.productamount, uid]
+      );
+    } else {
+      await conn.query(
+        'UPDATE usertab SET currentaccttype = ? WHERE uid = ? LIMIT 1',
+        [codeData.producttype, uid]
+      );
+    }
 
     // Insert upgrade record
     const now = nowMySQL();
@@ -176,6 +233,13 @@ router.post('/upgrade', memberAuth, async (req, res) => {
     // Update session
     req.session.currentaccttype = codeData.producttype;
     req.session.caccttype = ACCOUNT_TYPES[codeData.producttype] || 'Unknown';
+    if (Number(codeData.codetype) === 1 && Number(member.codeid) === 3) {
+      req.session.cdstatus = 2;
+    } else if (Number(codeData.codetype) === 2) {
+      req.session.cdstatus = 0;
+    } else if (Number(codeData.codetype) === 3) {
+      req.session.cdstatus = 1;
+    }
 
     res.json({
       success: true,

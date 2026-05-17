@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { getRankProgress } = require('../services/ranking');
+const { getRankingExplanation } = require('../services/rankingTransparency');
 
 /**
  * GET /api/ranking
@@ -17,6 +18,16 @@ router.get('/', memberAuth, async (req, res) => {
     res.json(progress);
   } catch (err) {
     console.error('[Ranking] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/explain', memberAuth, async (req, res) => {
+  try {
+    const explanation = await getRankingExplanation(req.session.uid);
+    res.json(explanation);
+  } catch (err) {
+    console.error('[Ranking] Explain error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

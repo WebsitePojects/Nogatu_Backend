@@ -5,7 +5,13 @@
  * Handles binary tree traversal, genealogy building, and network validation
  */
 const { pool } = require('../config/database');
-const { getAccountTypeName } = require('../utils/helpers');
+const { getAccountTypeName, PACKAGE_BINARY_POINTS } = require('../utils/helpers');
+
+function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
+  const numericStored = Number(storedBinaryPoints || 0);
+  if (numericStored > 0) return numericStored;
+  return Number(PACKAGE_BINARY_POINTS[Number(currentaccttype || 0)] || 0);
+}
 
 /**
  * Get all downline UIDs recursively via refid (binary tree)
@@ -17,6 +23,42 @@ async function getNetworkList(parent) {
   return list;
 }
 
+async function getNetworkMembersDetailed(rootUid, maxDepth = 10) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT c.descendant_uid AS uid, c.depth, c.leg,
+              u.public_uid, u.currentaccttype, u.position, u.binarypoints, u.datereg,
+              m.username, m.firstname, m.lastname
+       FROM binary_tree_closuretab c
+       INNER JOIN usertab u ON u.uid = c.descendant_uid
+       LEFT JOIN memberstab m ON m.uid = u.uid
+       WHERE c.ancestor_uid = ? AND c.depth > 0 AND c.depth <= ?
+       ORDER BY c.depth ASC, u.position ASC, u.id ASC`,
+      [rootUid, maxDepth]
+    );
+
+    return rows.map((row) => ({
+      uid: Number(row.uid),
+      publicUid: row.public_uid || null,
+      username: row.username,
+      fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+      accttype: Number(row.currentaccttype || 0),
+      accttypeName: getAccountTypeName(row.currentaccttype),
+      depth: Number(row.depth || 0),
+      leg: row.leg || null,
+      position: Number(row.position || 0),
+      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+      datereg: row.datereg,
+    }));
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
+
+    const results = [];
+    await _traverseNetworkDetailed(rootUid, results, 1, maxDepth, null);
+    return results;
+  }
+}
+
 async function _traverseNetwork(parent, list) {
   const [rows] = await pool.query(
     'SELECT uid, refid, drefid, datereg FROM usertab WHERE refid = ?',
@@ -26,6 +68,38 @@ async function _traverseNetwork(parent, list) {
   for (const row of rows) {
     list.push(row.uid);
     await _traverseNetwork(row.uid, list);
+  }
+}
+
+async function _traverseNetworkDetailed(parent, list, depth, maxDepth, leg) {
+  if (depth > maxDepth) return;
+
+  const [rows] = await pool.query(
+    `SELECT u.uid, u.public_uid, u.currentaccttype, u.position, u.binarypoints, u.datereg,
+            m.username, m.firstname, m.lastname
+     FROM usertab u
+     LEFT JOIN memberstab m ON m.uid = u.uid
+     WHERE u.refid = ?
+     ORDER BY u.position ASC, u.id ASC`,
+    [parent]
+  );
+
+  for (const row of rows) {
+    const rowLeg = leg || (Number(row.position) === 1 ? 'left' : 'right');
+    list.push({
+      uid: Number(row.uid),
+      publicUid: row.public_uid || null,
+      username: row.username,
+      fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+      accttype: Number(row.currentaccttype || 0),
+      accttypeName: getAccountTypeName(row.currentaccttype),
+      depth,
+      leg: rowLeg,
+      position: Number(row.position || 0),
+      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+      datereg: row.datereg,
+    });
+    await _traverseNetworkDetailed(row.uid, list, depth + 1, maxDepth, rowLeg);
   }
 }
 
@@ -42,7 +116,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
   const [rows] = await pool.query(
     `SELECT m.uid, m.firstname, m.lastname, m.middlename, m.username,
             u.uid as uUid, u.refid, u.drefid, u.accttype, u.currentaccttype,
-            u.position, u.codeid, u.datereg
+            u.position, u.codeid, u.datereg, u.public_uid, u.binarypoints
      FROM memberstab m, usertab u
      WHERE m.uid = u.uid AND u.uid = ?`,
     [uid]
@@ -53,6 +127,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
   const row = rows[0];
   const node = {
     uid: row.uid,
+    publicUid: row.public_uid || null,
     username: row.username,
     firstname: row.firstname,
     lastname: row.lastname,
@@ -62,6 +137,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
     codeid: row.codeid,
     datereg: row.datereg,
     position: row.position,
+    binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
     left: null,
     right: null,
     hasLeftSlot: true,
@@ -76,6 +152,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
     );
     node.hasLeftSlot = !children.some(c => c.position === 1);
     node.hasRightSlot = !children.some(c => c.position === 2);
+    node.childCount = children.length;
     return node;
   }
 
@@ -170,8 +247,10 @@ async function getPairingCounts(uid) {
 
 module.exports = {
   getNetworkList,
+  getNetworkMembersDetailed,
   getGenealogyTree,
   isInNetwork,
   getDirectReferrals,
   getPairingCounts,
+  resolveGenealogyPoints,
 };

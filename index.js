@@ -31,6 +31,7 @@ const MySQLStore = require('express-mysql-session')(session);
 const cors = require('cors');
 const helmet = require('helmet');
 const { testConnection, pool } = require('./config/database');
+const { requestId } = require('./utils/security');
 
 const rateLimit = require('express-rate-limit');
 const app = express();
@@ -47,10 +48,26 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  req.requestId = requestId(req);
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
 
-const legacyImageDir = path.resolve(__dirname, '../public_html/img');
-if (fs.existsSync(legacyImageDir)) {
+const frontendLegacyImageDir = path.resolve(__dirname, '../Nogatu_Frontend/public/legacy-img');
+const legacyImageCandidates = [
+  frontendLegacyImageDir,
+  path.resolve(__dirname, '../public_html/img'),
+  path.resolve(__dirname, '../public_html(Original_Code)/img'),
+  path.resolve(__dirname, '../reference_system/public_html(latest_production_code)/img'),
+];
+const legacyImageDir = legacyImageCandidates.find((dir) => fs.existsSync(dir));
+if (legacyImageDir) {
   app.use('/legacy-img', express.static(legacyImageDir));
+  const sourceLabel = legacyImageDir === frontendLegacyImageDir ? 'frontend legacy-img assets' : 'legacy fallback images';
+  console.log(`[Server] Serving ${sourceLabel} from: ${legacyImageDir}`);
+} else {
+  console.warn('[Server] Legacy image directory not found. /legacy-img route is disabled.');
 }
 
 const SESSION_TABLE = /^[A-Za-z0-9_]+$/.test(process.env.SESSION_TABLE || '')
@@ -144,6 +161,20 @@ async function ensurePasswordColumns() {
   }
 }
 
+async function ensureDevelopmentAdminPasswords() {
+  if (process.env.NODE_ENV === 'production') return;
+
+  const devAdminPassword = String(process.env.DEV_ADMIN_PASSWORD || '1');
+  if (!devAdminPassword) return;
+
+  const [result] = await pool.query(
+    'UPDATE accesstab SET password = ? WHERE password IS NULL OR password <> ?',
+    [devAdminPassword, devAdminPassword]
+  );
+
+  console.log(`[Server] Development admin passwords normalized to DEV_ADMIN_PASSWORD (${result.affectedRows} row(s) updated).`);
+}
+
 // Validate session secret
 if (!process.env.SESSION_SECRET || !String(process.env.SESSION_SECRET).trim()) {
   throw new Error('SESSION_SECRET is required. Set SESSION_SECRET in the environment file.');
@@ -191,9 +222,11 @@ app.use('/api/news', require('./routes/news'));
 app.use('/api/stats', require('./routes/stats'));
 app.use('/api/vouchers', require('./routes/vouchers'));
 app.use('/api/ranking', require('./routes/ranking'));
-app.use('/api/global-bonus', require('./routes/globalBonus'));
 app.use('/api/leaderboard', require('./routes/leaderboard'));
+app.use('/api/global-bonus', require('./routes/globalBonus'));
 app.use('/api/contact', require('./routes/contact'));
+app.use('/api/support', require('./routes/support'));
+app.use('/api/events', require('./routes/events'));
 app.use('/api/applications', require('./routes/applications').router);
 
 // Admin routes
@@ -203,12 +236,15 @@ app.use('/api/admin/accounts', require('./routes/admin/accounts'));
 app.use('/api/admin/codes', require('./routes/admin/codes'));
 app.use('/api/admin/encashment', require('./routes/admin/encashment'));
 app.use('/api/admin/redeem', require('./routes/admin/redeem'));
+app.use('/api/admin/hifive', require('./routes/admin/hifive'));
 app.use('/api/admin/genealogy', require('./routes/admin/genealogy'));
 app.use('/api/admin/news', require('./routes/admin/news'));
 app.use('/api/admin/vouchers', require('./routes/admin/vouchers'));
+app.use('/api/admin/voucher-management', require('./routes/admin/voucherManagement'));
 app.use('/api/admin/rankings', require('./routes/admin/rankings'));
 app.use('/api/admin/global-bonus', require('./routes/admin/globalBonus'));
 app.use('/api/admin/messages', require('./routes/admin/messages'));
+app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 app.use('/api/admin/applications', require('./routes/admin/applications'));
 app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 app.use('/api/admin/voucher-management', require('./routes/admin/voucherManagement'));
@@ -231,6 +267,7 @@ app.use((err, req, res, next) => {
 async function start() {
   await testConnection();
   await ensurePasswordColumns();
+  await ensureDevelopmentAdminPasswords();
   await logAuthTableSnapshot();
   await ensureSessionsTable();
 

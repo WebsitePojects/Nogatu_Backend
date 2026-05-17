@@ -8,6 +8,17 @@
  */
 const { pool } = require('../../config/database');
 const { nowMySQL } = require('../../utils/helpers');
+const { getEffectiveAccountState } = require('../accountState');
+const {
+  calculateEncashmentBreakdown,
+  validatePayoutDetails,
+} = require('../../utils/finance');
+const {
+  createProcessKey,
+  createPublicId,
+  maskSensitiveValue,
+} = require('../../utils/security');
+const { writeAuditLog } = require('../audit');
 
 const PAYOUT_OPTION_LABELS = {
   1: 'Pickup',
@@ -41,6 +52,7 @@ function getNextPayoutDate(baseDate = new Date()) {
  * @param {number} uid - User ID
  * @param {Object} income - Income breakdown object
  *   { dref, paircash, leadership, unilevel, hifive, lpc, beginningbalance, endingbalance }
+ *   income6 is reserved for Ranking Bonus fulfillment; calculateAndStoreIncome sends lpc=0.
  */
 async function insertIncome(uid, income) {
   const {
@@ -98,6 +110,70 @@ async function insertIncome(uid, income) {
   return true;
 }
 
+async function getEncashmentPreview(uid, encashmentAmount, userInfo, conn = pool) {
+  const amount = Number(encashmentAmount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Invalid encashment amount');
+  }
+
+  const [balanceRows] = await conn.query(
+    'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1',
+    [uid]
+  );
+  const currentBalance = Number(balanceRows[0]?.ttlcashbalance || 0);
+
+  const [profileRows] = await conn.query(
+    `SELECT u.codeid, u.cdstatus, u.cdamount, u.cdtotal,
+            m.payoutid, m.payoutdetails
+     FROM usertab u
+     LEFT JOIN memberstab m ON m.uid = u.uid
+     WHERE u.uid = ?
+     LIMIT 1`,
+    [uid]
+  );
+  const rawProfile = { ...(userInfo || {}), ...(profileRows[0] || {}) };
+  const profile = await getEffectiveAccountState(uid, rawProfile, conn) || rawProfile;
+  const payoutValidation = validatePayoutDetails({
+    payoutId: profile.payoutid,
+    payoutDetails: profile.payoutdetails,
+  });
+
+  const isCdDeductionActive = (
+    Number(profile.codeid) === 3 &&
+    Number(profile.cdstatus) === 1 &&
+    Number(profile.cdamount || 0) > Number(profile.cdtotal || 0)
+  );
+  const cdRemaining = isCdDeductionActive
+    ? Number(profile.cdamount || 0) - Number(profile.cdtotal || 0)
+    : 0;
+  const breakdown = calculateEncashmentBreakdown({
+    amount,
+    cdRemaining,
+    isCdDeductionActive,
+  });
+
+  return {
+    amount,
+    currentBalance,
+    sufficientBalance: amount <= currentBalance,
+    payout: payoutValidation,
+    deductions: {
+      tax: breakdown.tax,
+      processingFee: breakdown.processingFee,
+      maintenanceFee: breakdown.maintenanceFee,
+      cdDeduction: breakdown.cdDeduction,
+      total: breakdown.totalDeductions,
+    },
+    gross: breakdown.gross,
+    net: breakdown.net,
+    newBalance: currentBalance - amount,
+    paymentOptionId: Number(profile.payoutid || 0) || null,
+    paymentOption: PAYOUT_OPTION_LABELS[Number(profile.payoutid || 0)] || null,
+    paymentDetailsMasked: maskSensitiveValue(profile.payoutdetails),
+    asOf: new Date().toISOString(),
+  };
+}
+
 /**
  * Process encashment (cash withdrawal)
  * @param {number} uid - User ID
@@ -105,7 +181,7 @@ async function insertIncome(uid, income) {
  * @param {Object} userInfo - { codeid, cdstatus, cdamount, cdtotal }
  * @returns {Object} Encashment result details
  */
-async function insertEncashment(uid, encashmentAmount, userInfo) {
+async function insertEncashment(uid, encashmentAmount, userInfo, options = {}) {
   let conn;
   try {
     conn = await pool.getConnection();
@@ -131,26 +207,39 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
        FOR UPDATE`,
       [uid]
     );
-    const profile = { ...(userInfo || {}), ...(profileRows[0] || {}) };
-
-    // Calculate deductions
-    const tax = encashmentAmount * 0.10; // 10% tax
-    const fee = 50; // Fixed processing fee
-
-    // CD deduction (25% if codeid == 3 and CD debt is still active).
-    let cdDeduction = 0;
-    if (
-      Number(profile.codeid) === 3 &&
-      (Number(profile.cdstatus) === 1 || Number(profile.cdamount || 0) > Number(profile.cdtotal || 0))
-    ) {
-      const cdAmount = Number(profile.cdamount || 0);
-      const cdTotal = Number(profile.cdtotal || 0);
-      const cdRemaining = cdAmount - cdTotal;
-      cdDeduction = Math.min(encashmentAmount * 0.25, Math.max(0, cdRemaining));
+    const rawProfile = { ...(userInfo || {}), ...(profileRows[0] || {}) };
+    const profile = await getEffectiveAccountState(uid, rawProfile, conn) || rawProfile;
+    const payoutValidation = validatePayoutDetails({
+      payoutId: profile.payoutid,
+      payoutDetails: profile.payoutdetails,
+    });
+    if (!payoutValidation.ok) {
+      const error = new Error(payoutValidation.message);
+      error.code = payoutValidation.code;
+      error.statusCode = 422;
+      throw error;
     }
 
-    const grossDeduction = tax + fee + cdDeduction;
-    const netEncashment = encashmentAmount - grossDeduction;
+    const isCdDeductionActive = (
+      Number(profile.codeid) === 3 &&
+      Number(profile.cdstatus) === 1 &&
+      Number(profile.cdamount || 0) > Number(profile.cdtotal || 0)
+    );
+    const cdAmount = Number(profile.cdamount || 0);
+    const cdTotal = Number(profile.cdtotal || 0);
+    const cdRemaining = isCdDeductionActive ? cdAmount - cdTotal : 0;
+    const breakdown = calculateEncashmentBreakdown({
+      amount: encashmentAmount,
+      cdRemaining,
+      isCdDeductionActive,
+    });
+
+    const tax = breakdown.tax;
+    const fee = breakdown.processingFee;
+    const maintenanceFee = breakdown.maintenanceFee;
+    const cdDeduction = breakdown.cdDeduction;
+    const grossDeduction = breakdown.totalDeductions;
+    const netEncashment = breakdown.net;
     const newBalance = currentBalance - encashmentAmount;
 
     if (netEncashment <= 0) {
@@ -211,6 +300,85 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
       ]
     );
 
+    const encashmentUid = createPublicId();
+    const requestId = options.requestId || 'server-request';
+    const processKey = createProcessKey(['encashment', uid, requestId, encashmentAmount]);
+
+    try {
+      await conn.query(
+        `INSERT INTO encashmentstab
+         (encashment_uid, process_key, beneficiary_uid, payouthistory_pid,
+          requested_amount, tax_amount, processing_fee, cd_deduction, maintenance_fee,
+          net_payout, payout_option_id, payout_details_masked, status, request_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted', ?)
+         ON DUPLICATE KEY UPDATE updated_at = updated_at`,
+        [
+          encashmentUid,
+          processKey,
+          uid,
+          insertResult.insertId || null,
+          encashmentAmount,
+          tax,
+          fee,
+          cdDeduction,
+          maintenanceFee,
+          netEncashment,
+          payoutId || null,
+          maskSensitiveValue(payoutDetails),
+          requestId,
+        ]
+      );
+
+      await conn.query(
+        `INSERT INTO income_eventstab
+         (event_uid, process_key, beneficiary_uid, income_type, source_ref_uid, source_ref_type,
+          gross_amount, tax_deduction, processing_fee, cd_deduction, maintenance_fee,
+          net_amount, status, credited_at)
+         VALUES (?, ?, ?, 'encashment_debit', ?, 'encashmentstab',
+          ?, ?, ?, ?, ?, ?, 'credited', CURRENT_TIMESTAMP(6))
+         ON DUPLICATE KEY UPDATE event_uid = event_uid`,
+        [
+          createPublicId(),
+          createProcessKey(['income', 'encashment_debit', uid, processKey]),
+          uid,
+          encashmentUid,
+          encashmentAmount,
+          tax,
+          fee,
+          cdDeduction,
+          maintenanceFee,
+          netEncashment,
+        ]
+      );
+
+      await writeAuditLog(conn, {
+        req: options.req,
+        requestId,
+        actorUid: uid,
+        actorRole: 'member',
+        action: 'encashment.submit',
+        targetUid: uid,
+        targetTable: 'encashmentstab',
+        targetId: encashmentUid,
+        beforeState: { currentBalance },
+        afterState: {
+          requestedAmount: encashmentAmount,
+          tax,
+          processingFee: fee,
+          maintenanceFee,
+          cdDeduction,
+          netPayout: netEncashment,
+          newBalance,
+        },
+      });
+    } catch (ledgerError) {
+      if (ledgerError.code === 'ER_NO_SUCH_TABLE') {
+        console.warn('[Encashment] ledger tables missing; run npm run db:migrate to enable mirrored ledgers.');
+      } else {
+        throw ledgerError;
+      }
+    }
+
     await conn.commit();
 
     const payoutDateObj = getNextPayoutDate(new Date());
@@ -227,6 +395,7 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
       encashmentAmount,
       tax,
       fee,
+      maintenanceFee,
       cdDeduction,
       grossDeduction,
       netEncashment,
@@ -237,6 +406,8 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
       paymentOption: payoutOption,
       paymentOptionId: payoutId || null,
       paymentDetails: payoutDetails,
+      paymentDetailsMasked: maskSensitiveValue(payoutDetails),
+      processKey,
       payoutDate,
       payoutDateISO: payoutDateObj.toISOString().slice(0, 10),
     };
@@ -252,4 +423,4 @@ async function insertEncashment(uid, encashmentAmount, userInfo) {
   }
 }
 
-module.exports = { insertIncome, insertEncashment };
+module.exports = { insertIncome, insertEncashment, getEncashmentPreview };

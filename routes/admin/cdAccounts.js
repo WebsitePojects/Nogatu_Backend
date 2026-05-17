@@ -5,7 +5,7 @@ const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName } = require('../../utils/helpers');
 
 /**
- * GET /api/admin/cd-accounts?page=1&search=username
+ * GET /api/admin/cd-accounts?page=1&search=username&status=all|paid|unpaid
  * Paginated list of CD accounts for the admin dashboard.
  */
 router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
@@ -14,9 +14,16 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const perPage = 30;
     const offset = (page - 1) * perPage;
     const search = String(req.query.search || '').trim();
+    const status = String(req.query.status || 'all').trim().toLowerCase();
 
     const filters = ['u.codeid = 3'];
     const params = [];
+
+    if (status === 'paid') {
+      filters.push('(u.cdstatus = 2 OR COALESCE(u.cdtotal, 0) >= COALESCE(u.cdamount, 0))');
+    } else if (status === 'unpaid') {
+      filters.push('NOT (u.cdstatus = 2 OR COALESCE(u.cdtotal, 0) >= COALESCE(u.cdamount, 0))');
+    }
 
     if (search) {
       filters.push('(m.username LIKE ? OR m.firstname LIKE ? OR m.lastname LIKE ?)');
@@ -78,6 +85,8 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
         totalPaid: Number(statsRows[0]?.totalPaid || 0),
       },
       page,
+      perPage,
+      status,
       totalPages: Math.max(1, Math.ceil(Number(countRows[0]?.total || 0) / perPage)),
       total: Number(countRows[0]?.total || 0),
     });

@@ -64,7 +64,8 @@ router.post('/login', async (req, res) => {
         passwordMatch = sha1.toLowerCase() === storedPassword.toLowerCase();
       }
 
-      if (passwordMatch) {
+      // Keep plaintext admin passwords in development when requested.
+      if (passwordMatch && process.env.NODE_ENV === 'production') {
         const hashed = await bcrypt.hash(password, 12);
         await pool.query('UPDATE accesstab SET password = ? WHERE username = ?', [hashed, admin.username]);
       }
@@ -77,9 +78,27 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    await new Promise((resolve, reject) => {
+      req.session.regenerate((sessionErr) => {
+        if (sessionErr) reject(sessionErr);
+        else resolve();
+      });
+    });
+
     req.session.adminid = admin.username;
     req.session.adminname = admin.name;
     req.session.adminrights = admin.rights;
+    delete req.session.uid;
+    delete req.session.publicUid;
+    delete req.session.username;
+    delete req.session.accountname;
+    delete req.session.shortname;
+    delete req.session.accttype;
+    delete req.session.currentaccttype;
+    delete req.session.caccttype;
+    delete req.session.codeid;
+    delete req.session.cdstatus;
+    delete req.session.position;
 
     await new Promise((resolve, reject) => {
       req.session.save((saveErr) => {
