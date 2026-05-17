@@ -10,24 +10,23 @@ const {
 } = require('../services/globalBonus');
 
 /**
- * GET /api/global-bonus?month=MM&year=YYYY
- * Returns member eligibility + monthly distributed/projected share.
- * If no month/year is provided and current period has no pool yet,
+ * GET /api/global-bonus?year=YYYY
+ * Returns member eligibility + annual distributed/projected share.
+ * If no year is provided and the requested annual period has no pool yet,
  * falls back to the latest distributed period for better UX visibility.
  */
 router.get('/', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
-    const month = req.query.month;
     const year = req.query.year;
 
-    let details = await getMemberGlobalBonus(uid, month, year);
+    let details = await getMemberGlobalBonus(uid, year);
     let sourcePeriod = 'requested-period';
 
-    if (!month && !year && !details.pool) {
+    if (!year && !details.pool) {
       const latestPool = await getLatestPoolRecord();
       if (latestPool) {
-        details = await getMemberGlobalBonus(uid, latestPool.month, latestPool.year);
+        details = await getMemberGlobalBonus(uid, latestPool.year);
         sourcePeriod = 'latest-distributed-period';
       }
     }

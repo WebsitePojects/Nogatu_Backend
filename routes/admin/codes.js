@@ -9,6 +9,9 @@ const { adminAuth, adminRights } = require('../../middleware/auth');
 const { generateCodes } = require('../../services/codeGeneration');
 const { PRODUCT_TYPES } = require('../../utils/helpers');
 const { sanitizeAlphaNum } = require('../../utils/helpers');
+const { createProcessKey } = require('../../utils/security');
+const { appendActivationCodeUsage } = require('../../services/registrationAudit');
+const { listAdminActivationHistory } = require('../../services/codeHistory');
 
 /**
  * POST /api/admin/codes/generate
@@ -91,6 +94,18 @@ router.get('/', adminAuth, async (req, res) => {
   }
 });
 
+router.get('/history', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const q = (req.query.q || '').trim();
+    const result = await listAdminActivationHistory({ page, perPage: 30, codeQuery: q });
+    res.json(result);
+  } catch (err) {
+    console.error('[Admin Codes] History error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 /**
  * GET /api/admin/codes/lookup-account?username=00001
  * Legacy parity helper: search and tag transfer account by username
@@ -135,11 +150,27 @@ router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
     let released = 0;
 
     for (const code of selectedCodes) {
+      const [codeRows] = await pool.query(
+        'SELECT id, uid FROM codestab WHERE code = ? AND codestatus = 0 LIMIT 1',
+        [code]
+      );
+      if (codeRows.length === 0) continue;
+
       const [result] = await pool.query(
         "UPDATE codestab SET releasedate = 1, codestatus = 1 WHERE code = ? AND codestatus = 0 LIMIT 1",
         [code]
       );
-      if (result.affectedRows === 1) released++;
+      if (result.affectedRows === 1) {
+        released++;
+        await appendActivationCodeUsage(pool, {
+          code,
+          codeRowId: codeRows[0].id,
+          eventType: 'release',
+          toUid: codeRows[0].uid || null,
+          actorAdminId: Number(req.session.adminid) || null,
+          processKey: createProcessKey(['code-release', code, req.session.adminid, Date.now()]),
+        });
+      }
     }
 
     res.json({ success: true, released });
@@ -191,6 +222,19 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
          ON DUPLICATE KEY UPDATE history = CONCAT(history, ' -> ', ?), datetransfer = NOW()`,
         [codeRows[0].id, code, codeRows[0].dategen, history, history]
       );
+
+      await appendActivationCodeUsage(pool, {
+        code,
+        codeRowId: codeRows[0].id,
+        eventType: 'admin_transfer',
+        fromUid: codeRows[0].uid || null,
+        toUid: targetUid,
+        actorAdminId: Number(req.session.adminid) || null,
+        notes: {
+          targetUsername: targetSanitized,
+        },
+        processKey: createProcessKey(['admin-code-transfer', code, req.session.adminid, targetUid, Date.now()]),
+      });
 
       transferred++;
     }

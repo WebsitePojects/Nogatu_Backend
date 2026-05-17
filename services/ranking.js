@@ -6,6 +6,7 @@ const { pool } = require('../config/database');
 const { nowMySQL, getAccountTypeName } = require('../utils/helpers');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { writeAuditLog } = require('./audit');
+const { getPackagePolicy, listPackagePolicies } = require('./packagePolicy');
 const {
   listRankableEventsForMember,
   computeRankAwardsFromEvents,
@@ -43,14 +44,9 @@ const FULL_RANK_DEFINITIONS = [
   { rank: 10, rank_code: 'ambassador', rank_name: 'AMBASSADOR', points_required: 2000000, left_rank_required: 9, right_rank_required: 9, incentive_summary: '1,000,000 Cash, Yellow Polo Shirt, White Jacket, 1 Pin and a ring, US travel for 2, One point for global bonus', cash_incentive: 1000000, sort_order: 100 },
 ];
 
-const PACKAGE_LABELS = {
-  10: 'Bronze',
-  20: 'Silver',
-  30: 'Gold',
-  40: 'Platinum',
-  50: 'Garnet',
-  60: 'Diamond',
-};
+const PACKAGE_LABELS = Object.fromEntries(
+  listPackagePolicies().map((policy) => [Number(policy.packageType), policy.packageLabel])
+);
 
 const RANK_REQUIREMENTS = FULL_RANK_DEFINITIONS.reduce((map, row) => {
   map[row.rank] = {
@@ -73,6 +69,46 @@ const RANK_CASH_INCENTIVES = FULL_RANK_DEFINITIONS.reduce((map, row) => {
 
 function toNumber(value) {
   return Number(value || 0);
+}
+
+function getPackageRankingPolicy(packageType) {
+  const numericPackageType = toNumber(packageType);
+  const policy = getPackagePolicy(numericPackageType);
+  const packageLabel = policy.packageLabel || PACKAGE_LABELS[numericPackageType] || getAccountTypeName(numericPackageType) || `Type ${numericPackageType}`;
+  const rankingEligibilityReason = !policy.rankingEligible
+    ? 'Upgrade to Gold package to begin ranking.'
+    : policy.nextUpgradePackageLabel
+    ? `Upgrade to ${policy.nextUpgradePackageLabel} package to progress beyond ${policy.rankingMaxLabel || 'the current package ceiling'}.`
+    : null;
+
+  return {
+    packageType: numericPackageType,
+    packageLabel,
+    rankingEligible: Boolean(policy.rankingEligible),
+    maxRank: toNumber(policy.rankingMax),
+    maxRankLabel: policy.rankingMaxLabel || null,
+    nextUpgradePackageType: policy.nextUpgradePackageType == null ? null : toNumber(policy.nextUpgradePackageType),
+    nextUpgradePackageLabel: policy.nextUpgradePackageLabel || null,
+    reason: rankingEligibilityReason,
+  };
+}
+
+function filterRankDefinitionsForPackage(definitions = [], packageType) {
+  const policy = getPackageRankingPolicy(packageType);
+  if (!policy.rankingEligible || policy.maxRank <= 0) return [];
+  return definitions.filter((definition) => toNumber(definition.rank) > 0 && toNumber(definition.rank) <= policy.maxRank);
+}
+
+function canReleaseRankAchievementForPackage(packageType, rankNo) {
+  const policy = getPackageRankingPolicy(packageType);
+  const numericRank = toNumber(rankNo);
+  return Boolean(policy.rankingEligible) && numericRank > 0 && numericRank <= policy.maxRank;
+}
+
+function clampRankToPackage(packageType, rankNo) {
+  const policy = getPackageRankingPolicy(packageType);
+  if (!policy.rankingEligible || policy.maxRank <= 0) return 0;
+  return Math.min(policy.maxRank, Math.max(0, toNumber(rankNo)));
 }
 
 function toMysqlDateTime(value) {
@@ -357,8 +393,10 @@ function buildRemainingEventPool(rankableEvents, consumedState) {
 async function getSubtreeQualifiedRankCounts(uid, rankDefinitions, conn = pool) {
   const [rows] = await conn.query(
     `SELECT c.leg,
+            u.currentaccttype,
             GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) AS awarded_rank
      FROM binary_tree_closuretab c
+     INNER JOIN usertab u ON u.uid = c.descendant_uid
      LEFT JOIN rankingstab r ON r.uid = c.descendant_uid
      WHERE c.ancestor_uid = ?
        AND c.depth > 0`,
@@ -375,7 +413,7 @@ async function getSubtreeQualifiedRankCounts(uid, rankDefinitions, conn = pool) 
 
   for (const row of rows) {
     const leg = row.leg === 'left' ? 'left' : row.leg === 'right' ? 'right' : null;
-    const awardedRank = toNumber(row.awarded_rank);
+    const awardedRank = clampRankToPackage(row.currentaccttype, row.awarded_rank);
     if (!leg || awardedRank <= 0) continue;
 
     for (const [threshold, counts] of thresholdCounts.entries()) {
@@ -496,16 +534,89 @@ function parseSnapshotRow(row) {
   };
 }
 
+function buildPendingAchievementSummary(achievements = []) {
+  const pending = achievements.filter((achievement) => String(achievement.achievementStatus || achievement.status || '') === 'pending_fulfillment');
+  const fulfilled = achievements.filter((achievement) => String(achievement.achievementStatus || achievement.status || '') === 'fulfilled');
+
+  return {
+    pendingCount: pending.length,
+    fulfilledCount: fulfilled.length,
+    nextPendingRank: pending[0] || null,
+  };
+}
+
+function normalizeNextRankRequirement(definition) {
+  if (!definition) return null;
+  return {
+    ...definition,
+    rank: toNumber(definition.rank),
+    rankName: definition.rankName || definition.rank_name || definition.rank_name || `Rank ${toNumber(definition.rank)}`,
+    pointsRequired: toNumber(definition.pointsRequired ?? definition.points_required),
+    leftRankRequired: toNumber(definition.leftRankRequired ?? definition.left_rank_required),
+    rightRankRequired: toNumber(definition.rightRankRequired ?? definition.right_rank_required),
+  };
+}
+
+function applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, achievements = []) {
+  const policy = getPackageRankingPolicy(packageType);
+  const effectiveDefinitions = filterRankDefinitionsForPackage(definitions, packageType);
+  const filteredAchievements = (achievements || []).filter((achievement) =>
+    canReleaseRankAchievementForPackage(packageType, achievement.rank)
+  );
+  const effectiveAchievementSummary = buildPendingAchievementSummary(filteredAchievements);
+  const effectiveCurrentRankFromAchievements = filteredAchievements.length > 0
+    ? Math.max(...filteredAchievements.map((achievement) => toNumber(achievement.rank)))
+    : 0;
+
+  const rawCurrentRank = toNumber(snapshot.currentRank);
+  const effectiveCurrentRank = Math.max(
+    clampRankToPackage(packageType, rawCurrentRank),
+    effectiveCurrentRankFromAchievements
+  );
+  const nextRankRequirement = normalizeNextRankRequirement(
+    effectiveDefinitions.find((definition) => toNumber(definition.rank) > effectiveCurrentRank) || null
+  );
+  const maxPublishedRank = definitions.reduce((max, definition) => Math.max(max, toNumber(definition.rank)), 0);
+  const blockedByPackageGate = !policy.rankingEligible
+    || (policy.maxRank > 0 && policy.maxRank < maxPublishedRank && effectiveCurrentRank >= policy.maxRank && !nextRankRequirement);
+
+  return {
+    ...snapshot,
+    rawCurrentRank,
+    currentRank: effectiveCurrentRank,
+    currentRankLabel: effectiveCurrentRank > 0 ? (RANK_REQUIREMENTS[effectiveCurrentRank]?.label || `Rank ${effectiveCurrentRank}`) : 'Unranked',
+    currentRankColor: rankColor(effectiveCurrentRank),
+    nextRank: nextRankRequirement ? toNumber(nextRankRequirement.rank) : null,
+    nextRankRequirement,
+    leftRequirementMet: !nextRankRequirement || toNumber(snapshot.leftQualifiedCount) >= toNumber(nextRankRequirement.leftRankRequired),
+    rightRequirementMet: !nextRankRequirement || toNumber(snapshot.rightQualifiedCount) >= toNumber(nextRankRequirement.rightRankRequired),
+    rankingEligible: policy.rankingEligible,
+    rankingEligibilityReason: blockedByPackageGate ? policy.reason : null,
+    blockedByPackageGate,
+    packageType: toNumber(packageType),
+    packageLabel: policy.packageLabel,
+    packageRankMax: policy.maxRank,
+    packageRankMaxLabel: policy.maxRankLabel,
+    upgradeRequiredPackageType: blockedByPackageGate ? policy.nextUpgradePackageType : null,
+    upgradeRequiredPackageLabel: blockedByPackageGate ? policy.nextUpgradePackageLabel : null,
+    achievements: filteredAchievements,
+    pendingAchievementCount: effectiveAchievementSummary.pendingCount,
+    nextPendingRank: effectiveAchievementSummary.nextPendingRank,
+    rankDefinitions: effectiveDefinitions,
+  };
+}
+
 async function getSnapshotRow(uid, conn = pool) {
   const [rows] = await conn.query(
-    `SELECT current_rank, rank_level, highest_rank_no, basis_points, consumed_points,
+    `SELECT r.current_rank, r.rank_level, r.highest_rank_no, r.basis_points, r.consumed_points,
             remaining_rankable_points, basis_label, race_basis_mode,
             rank_date, race_last_awarded_at, qualified_date,
             left_qualified_count, right_qualified_count,
             incentive_status, reward_status, pending_achievement_count,
-            last_calculated_at
-     FROM rankingstab
-     WHERE uid = ?
+            last_calculated_at, u.currentaccttype
+     FROM rankingstab r
+     INNER JOIN usertab u ON u.uid = r.uid
+     WHERE r.uid = ?
      LIMIT 1`,
     [uid]
   );
@@ -586,6 +697,12 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
   try {
     const definitions = ctx.definitions || await getRankDefinitions(conn);
     ctx.definitions = definitions;
+    const [memberRows] = await conn.query(
+      'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
+      [memberUid]
+    );
+    const packageType = toNumber(memberRows[0]?.currentaccttype);
+    const effectiveDefinitions = filterRankDefinitionsForPackage(definitions, packageType);
     const definitionByRank = new Map(definitions.map((definition) => [toNumber(definition.rank), definition]));
 
     const children = await getDirectChildren(memberUid, conn);
@@ -597,11 +714,11 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
     const achievementsBefore = await getAchievementRowsForMember(memberUid, conn);
     const consumedState = await getConsumedEventMapForMember(memberUid, conn);
     const eventPool = buildRemainingEventPool(rankableEvents, consumedState);
-    const subtreeQualifiedRankCounts = await getSubtreeQualifiedRankCounts(memberUid, definitions, conn);
+    const subtreeQualifiedRankCounts = await getSubtreeQualifiedRankCounts(memberUid, effectiveDefinitions, conn);
 
     const raceState = computeRankAwardsFromEvents({
       memberUid,
-      rankDefinitions: definitions,
+      rankDefinitions: effectiveDefinitions,
       rankableEvents: eventPool.remainingEvents,
       subtreeQualifiedRankCounts,
       existingAchievements: achievementsBefore,
@@ -619,13 +736,16 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
     }
 
     const achievementsAfter = await getAchievementRowsForMember(memberUid, conn);
-    const achievementSummary = summarizeAchievementStatus(achievementsAfter);
+    const filteredAchievements = achievementsAfter.filter((achievement) =>
+      canReleaseRankAchievementForPackage(packageType, achievement.rank)
+    );
+    const achievementSummary = summarizeAchievementStatus(filteredAchievements);
     const pairing = await getLatestPairingSnapshot(memberUid, conn);
-    const latestAward = [...achievementsAfter].sort((a, b) => toNumber(a.rank) - toNumber(b.rank)).at(-1) || null;
+    const latestAward = [...filteredAchievements].sort((a, b) => toNumber(a.rank) - toNumber(b.rank)).at(-1) || null;
     const nextRankDefinition = raceState.nextRankRequirement;
     const nextCounts = nextRankDefinition ? (subtreeQualifiedRankCounts[toNumber(nextRankDefinition.rank)] || {}) : {};
-    const currentRank = achievementsAfter.length > 0
-      ? Math.max(...achievementsAfter.map((achievement) => toNumber(achievement.rank)))
+    const currentRank = filteredAchievements.length > 0
+      ? Math.max(...filteredAchievements.map((achievement) => toNumber(achievement.rank)))
       : 0;
 
     const snapshotPayload = {
@@ -667,16 +787,16 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
       rightRequirementMet: raceState.rightRequirementMet,
       nextRank: raceState.nextRank,
       nextRankRequirement: raceState.nextRankRequirement,
-      achievements: achievementsAfter,
+      achievements: filteredAchievements,
       pendingAchievementCount: achievementSummary.pendingCount,
       nextPendingRank: achievementSummary.nextPendingRank,
       incentiveStatus: snapshotPayload.incentiveStatus,
       rewardStatus: snapshotPayload.rewardStatus,
       pairing,
     };
-
-    ctx.memo.set(memberUid, snapshot);
-    return snapshot;
+    const gatedSnapshot = applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, filteredAchievements);
+    ctx.memo.set(memberUid, gatedSnapshot);
+    return gatedSnapshot;
   } finally {
     ctx.stack.delete(memberUid);
   }
@@ -694,13 +814,14 @@ function shouldRefreshRankState(row) {
 
 async function getStoredRankingRow(uid, conn = pool) {
   const [rows] = await conn.query(
-    `SELECT uid, current_rank, rank_level, highest_rank_no, basis_points, consumed_points,
+    `SELECT r.uid, r.current_rank, r.rank_level, r.highest_rank_no, r.basis_points, r.consumed_points,
             remaining_rankable_points, basis_label, race_basis_mode, left_qualified_count,
             right_qualified_count, rank_date, qualified_date, race_last_awarded_at,
             incentive_status, reward_status, pending_achievement_count, reward_claimed_date,
-            last_calculated_at
-     FROM rankingstab
-     WHERE uid = ?
+            last_calculated_at, u.currentaccttype
+     FROM rankingstab r
+     INNER JOIN usertab u ON u.uid = r.uid
+     WHERE r.uid = ?
      LIMIT 1`,
     [uid]
   );
@@ -717,8 +838,7 @@ function buildSnapshotFromStoredRow(row, definitions, pairing, achievements = []
   const nextRankRequirement = definitions.find((definition) => toNumber(definition.rank) > currentRank) || null;
   const leftQualifiedCount = toNumber(row?.left_qualified_count);
   const rightQualifiedCount = toNumber(row?.right_qualified_count);
-
-  return {
+  const snapshot = {
     uid: toNumber(row?.uid),
     currentRank,
     currentRankLabel: currentRank > 0 ? (RANK_REQUIREMENTS[currentRank]?.label || `Rank ${currentRank}`) : 'Unranked',
@@ -744,6 +864,8 @@ function buildSnapshotFromStoredRow(row, definitions, pairing, achievements = []
     rewardStatus: toNumber(row?.reward_status),
     pairing,
   };
+
+  return applyPackageRankingGateToSnapshot(snapshot, row?.currentaccttype, definitions, achievements);
 }
 
 async function refreshMemberRankSnapshot(uid) {
@@ -786,14 +908,26 @@ async function getRankProgress(uid) {
     snapshot = await refreshMemberRankSnapshot(memberUid);
   }
 
-  const progress = snapshot.nextRankRequirement
+  const progress = !snapshot.rankingEligible
+    ? 0
+    : snapshot.nextRankRequirement
     ? Math.min(100, (toNumber(snapshot.remainingRankablePoints) / toNumber(snapshot.nextRankRequirement.pointsRequired || 0)) * 100)
     : 100;
 
   const achievementsByRank = new Map(snapshot.achievements.map((achievement) => [toNumber(achievement.rank), achievement]));
+  const effectiveDefinitions = snapshot.rankDefinitions || filterRankDefinitionsForPackage(definitions, snapshot.packageType);
 
   return {
     uid: memberUid,
+    packageType: snapshot.packageType,
+    packageLabel: snapshot.packageLabel,
+    rankingEligible: snapshot.rankingEligible,
+    rankingEligibilityReason: snapshot.rankingEligibilityReason,
+    blockedByPackageGate: snapshot.blockedByPackageGate,
+    packageRankMax: snapshot.packageRankMax,
+    packageRankMaxLabel: snapshot.packageRankMaxLabel,
+    upgradeRequiredPackageType: snapshot.upgradeRequiredPackageType,
+    upgradeRequiredPackageLabel: snapshot.upgradeRequiredPackageLabel,
     currentRank: snapshot.currentRank,
     currentRankLabel: snapshot.currentRankLabel,
     currentRankColor: snapshot.currentRankColor,
@@ -837,8 +971,8 @@ async function getRankProgress(uid) {
     incentiveStatus: snapshot.incentiveStatus,
     rewardStatus: snapshot.rewardStatus,
     incentives: snapshot.nextPendingRank?.incentiveSummary || snapshot.achievements.at(-1)?.incentiveSummary || 'N/A',
-    rankDefinitions: definitions,
-    ranks: definitions.map((definition) => {
+    rankDefinitions: effectiveDefinitions,
+    ranks: effectiveDefinitions.map((definition) => {
       const achievement = achievementsByRank.get(toNumber(definition.rank));
       return {
         rank: toNumber(definition.rank),
@@ -898,6 +1032,7 @@ async function refreshRankingForest() {
 
 async function getAllRankings(page = 1, perPage = 30) {
   await ensureRankingTable();
+  const definitions = await getRankDefinitions();
 
   const currentPage = Math.max(1, Number(page) || 1);
   const size = Math.min(100, Math.max(1, Number(perPage) || 30));
@@ -947,7 +1082,7 @@ async function getAllRankings(page = 1, perPage = 30) {
 
   const hydrated = [];
   for (const row of rows) {
-    const snapshot = {
+    const snapshot = applyPackageRankingGateToSnapshot({
       currentRank: Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level)),
       currentRankLabel: RANK_REQUIREMENTS[Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level))]?.label || 'Unranked',
       currentRankColor: rankColor(Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level))),
@@ -960,7 +1095,11 @@ async function getAllRankings(page = 1, perPage = 30) {
       incentiveStatus: toNumber(row.incentive_status),
       rewardStatus: toNumber(row.reward_status),
       nextPendingRank: null,
-    };
+      leftQualifiedCount: 0,
+      rightQualifiedCount: 0,
+      achievements: [],
+      pairing: { binaryPoints: 0, leftCount: 0, rightCount: 0, leftPoints: 0, rightPoints: 0 },
+    }, row.currentaccttype, definitions, []);
 
     hydrated.push({
       uid: toNumber(row.uid),
@@ -968,7 +1107,14 @@ async function getAllRankings(page = 1, perPage = 30) {
       lastname: row.lastname,
       username: row.username,
       packageType: toNumber(row.currentaccttype),
-      packageLabel: PACKAGE_LABELS[toNumber(row.currentaccttype)] || getAccountTypeName(toNumber(row.currentaccttype)),
+      packageLabel: snapshot.packageLabel,
+      rankingEligible: snapshot.rankingEligible,
+      rankingEligibilityReason: snapshot.rankingEligibilityReason,
+      blockedByPackageGate: snapshot.blockedByPackageGate,
+      packageRankMax: snapshot.packageRankMax,
+      packageRankMaxLabel: snapshot.packageRankMaxLabel,
+      upgradeRequiredPackageType: snapshot.upgradeRequiredPackageType,
+      upgradeRequiredPackageLabel: snapshot.upgradeRequiredPackageLabel,
       current_rank: snapshot.currentRank,
       currentRank: snapshot.currentRank,
       rankLabel: snapshot.currentRankLabel,
@@ -1074,6 +1220,22 @@ async function processIncentive(uid, options = {}) {
     if (!pending) {
       await conn.rollback();
       return { success: false };
+    }
+
+    const [memberRows] = await conn.query(
+      'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [memberUid]
+    );
+    const packageType = toNumber(memberRows[0]?.currentaccttype);
+    const definitions = await getRankDefinitions(conn);
+    const pendingRank = definitions.find((definition) => definition.rank_code === pending.rank_code)?.rank || 0;
+
+    if (!canReleaseRankAchievementForPackage(packageType, pendingRank)) {
+      await conn.rollback();
+      return {
+        success: false,
+        error: 'Ranking claim is blocked by the member package gate.',
+      };
     }
 
     const cashIncentive = toNumber(pending.cash_incentive);
@@ -1230,6 +1392,10 @@ module.exports = {
   buildSnapshotFromStoredRow,
   normalizeRankDefinitions,
   sumRepurchasePoints,
+  getPackageRankingPolicy,
+  filterRankDefinitionsForPackage,
+  canReleaseRankAchievementForPackage,
+  clampRankToPackage,
   RANKING_BASIS_LABEL,
   RANK_REQUIREMENTS,
   RANK_INCENTIVES,

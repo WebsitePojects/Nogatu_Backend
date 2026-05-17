@@ -18,6 +18,8 @@ const { getLeadershipBonus } = require('./leadership');
 const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('./unilevel');
 const { insertIncome } = require('./insertIncome');
 const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
+const { getPackagePolicy } = require('../packagePolicy');
+const { applyLifetimeIncomeCeiling } = require('./incomeCapPolicy');
 
 const INCOME_PAYOUT_FLAGS = {
   unilevel: true,
@@ -82,19 +84,32 @@ async function calculateAndStoreIncome(uid, accttype) {
     }
 
     // ── Persist if there is new income ───────────────────────────────
-    const totalNewIncome = newDref + newPairing + newLeadership +
-      activeUnilevel + newHifive + activeLpc;
-    const endingBalance = beginningBalance + totalNewIncome;
-
-    if (totalNewIncome >= 1) {
-      await insertIncome(uid, {
+    const capResult = applyLifetimeIncomeCeiling({
+      packagePolicy: getPackagePolicy(accttype),
+      storedTotals: stored,
+      proposedIncome: {
         dref: newDref,
         paircash: newPairing,
         leadership: newLeadership,
         unilevel: activeUnilevel,
         hifive: newHifive,
-        ppctemp: 0,
         lpc: activeLpc,
+      },
+    });
+
+    const allowedIncome = capResult.allowedIncome;
+    const totalNewIncome = capResult.allowedTotal;
+    const endingBalance = beginningBalance + totalNewIncome;
+
+    if (totalNewIncome >= 1) {
+      await insertIncome(uid, {
+        dref: allowedIncome.dref,
+        paircash: allowedIncome.paircash,
+        leadership: allowedIncome.leadership,
+        unilevel: allowedIncome.unilevel,
+        hifive: allowedIncome.hifive,
+        ppctemp: 0,
+        lpc: allowedIncome.lpc,
         pairproduct: 0,
         beginningbalance: beginningBalance,
         endingbalance: endingBalance,
@@ -102,7 +117,7 @@ async function calculateAndStoreIncome(uid, accttype) {
     }
 
     // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
-    if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
+    if (canEarnPairing && pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
       await savePairingReport(uid, pairingResult.dailyReports);
     }
 
