@@ -35,6 +35,7 @@ router.post('/login', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT u.uid, u.public_uid, u.mainid, u.accttype, u.currentaccttype, u.cdstatus,
               u.codeid, DATE_FORMAT(u.datereg, '%Y-%m-%d') as datereg, u.position,
+              u.account_status, u.account_status_reason,
               m.uid as mUid, m.username, m.password, m.firstname, m.lastname
        FROM memberstab m, usertab u
        WHERE m.uid = u.uid AND m.username = ?`,
@@ -88,6 +89,17 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    const accountStatus = String(user.account_status || 'active').trim().toLowerCase();
+    if (accountStatus && accountStatus !== 'active') {
+      return res.status(423).json({
+        error: accountStatus === 'frozen'
+          ? 'This account is frozen. Please contact support or your administrator.'
+          : 'This account is suspended. Please contact support or your administrator.',
+        accountStatus,
+        reason: user.account_status_reason || null,
+      });
+    }
+
     await new Promise((resolve, reject) => {
       req.session.regenerate((sessionErr) => {
         if (sessionErr) reject(sessionErr);
@@ -107,6 +119,8 @@ router.post('/login', async (req, res) => {
     req.session.codeid = user.codeid;
     req.session.cdstatus = user.cdstatus;
     req.session.position = user.position;
+    req.session.accountStatus = accountStatus || 'active';
+    req.session.accountStatusReason = user.account_status_reason || null;
     delete req.session.adminid;
     delete req.session.adminname;
     delete req.session.adminrights;
@@ -132,6 +146,8 @@ router.post('/login', async (req, res) => {
         codeid: user.codeid,
         cdstatus: user.cdstatus,
         position: user.position,
+        accountStatus: accountStatus || 'active',
+        accountStatusReason: user.account_status_reason || null,
         datereg: user.datereg,
       },
     });
@@ -295,6 +311,8 @@ router.get('/session', (req, res) => {
         codeid: req.session.codeid,
         cdstatus: req.session.cdstatus,
         position: req.session.position,
+        accountStatus: req.session.accountStatus || 'active',
+        accountStatusReason: req.session.accountStatusReason || null,
       },
     });
   } else {

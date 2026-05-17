@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
+const { listPackagePolicies } = require('../services/packagePolicy');
 
 let memberTinColumnsReady = false;
 let memberHasTinNoColumn = false;
@@ -32,6 +33,17 @@ async function ensureMemberTinColumns() {
 
   memberTinColumnsReady = true;
 }
+
+router.get('/package-policies', memberAuth, async (_req, res) => {
+  try {
+    res.json({
+      packages: listPackagePolicies(),
+    });
+  } catch (err) {
+    console.error('[Account] Package policies error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 /**
  * GET /api/account

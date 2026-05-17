@@ -5,12 +5,14 @@
  * Handles binary tree traversal, genealogy building, and network validation
  */
 const { pool } = require('../config/database');
-const { getAccountTypeName, PACKAGE_BINARY_POINTS } = require('../utils/helpers');
+const { getAccountTypeName } = require('../utils/helpers');
+const { getEffectiveAccountState, getAccountStateLabel } = require('./accountState');
+const { getPackageBinaryValue } = require('./packagePolicy');
 
 function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
   const numericStored = Number(storedBinaryPoints || 0);
   if (numericStored > 0) return numericStored;
-  return Number(PACKAGE_BINARY_POINTS[Number(currentaccttype || 0)] || 0);
+  return getPackageBinaryValue(currentaccttype);
 }
 
 /**
@@ -37,18 +39,22 @@ async function getNetworkMembersDetailed(rootUid, maxDepth = 10) {
       [rootUid, maxDepth]
     );
 
-    return rows.map((row) => ({
-      uid: Number(row.uid),
-      publicUid: row.public_uid || null,
-      username: row.username,
-      fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
-      accttype: Number(row.currentaccttype || 0),
-      accttypeName: getAccountTypeName(row.currentaccttype),
-      depth: Number(row.depth || 0),
-      leg: row.leg || null,
-      position: Number(row.position || 0),
-      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
-      datereg: row.datereg,
+    return Promise.all(rows.map(async (row) => {
+      const effectiveRow = await getEffectiveAccountState(row.uid, row);
+      return {
+        uid: Number(row.uid),
+        publicUid: row.public_uid || null,
+        username: row.username,
+        fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+        accttype: Number(row.currentaccttype || 0),
+        accttypeName: getAccountTypeName(row.currentaccttype),
+        depth: Number(row.depth || 0),
+        leg: row.leg || null,
+        position: Number(row.position || 0),
+        binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+        datereg: row.datereg,
+        accountStateLabel: getAccountStateLabel(effectiveRow || row),
+      };
     }));
   } catch (error) {
     if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
@@ -98,6 +104,7 @@ async function _traverseNetworkDetailed(parent, list, depth, maxDepth, leg) {
       position: Number(row.position || 0),
       binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
       datereg: row.datereg,
+      accountStateLabel: getAccountStateLabel(await getEffectiveAccountState(row.uid, row)),
     });
     await _traverseNetworkDetailed(row.uid, list, depth + 1, maxDepth, rowLeg);
   }
@@ -138,6 +145,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
     datereg: row.datereg,
     position: row.position,
     binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+    accountStateLabel: getAccountStateLabel(await getEffectiveAccountState(uid, row)),
     left: null,
     right: null,
     hasLeftSlot: true,

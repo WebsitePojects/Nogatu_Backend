@@ -245,9 +245,8 @@ app.use('/api/admin/rankings', require('./routes/admin/rankings'));
 app.use('/api/admin/global-bonus', require('./routes/admin/globalBonus'));
 app.use('/api/admin/messages', require('./routes/admin/messages'));
 app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
+app.use('/api/admin/finance', require('./routes/admin/finance'));
 app.use('/api/admin/applications', require('./routes/admin/applications'));
-app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
-app.use('/api/admin/voucher-management', require('./routes/admin/voucherManagement'));
 
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {

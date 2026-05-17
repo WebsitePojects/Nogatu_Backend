@@ -8,6 +8,7 @@ const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
+const { getLeadershipTraceability } = require('../services/income/leadership');
 
 /**
  * GET /api/dashboard
@@ -257,10 +258,30 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
       response.formula = 'LPC is disabled for launch; legacy income6 is reserved for Ranking Bonus.';
       response.rows = [];
       response.total = 0;
-    } else if (['leadership-bonus', 'hifive-bonus', 'hi-five-bonus', 'ranking-bonus'].includes(metric)) {
-      const incomeColumn = metric.includes('leadership') ? 'income3'
-        : metric.includes('ranking') ? 'income6'
-          : 'income5';
+    } else if (metric === 'leadership-bonus') {
+      const trace = await getLeadershipTraceability(uid);
+      const [directCountRows] = await pool.query(
+        'SELECT COUNT(*) AS total FROM usertab WHERE drefid = ?',
+        [uid]
+      );
+      response.formula = 'Leadership bonus is 5% of level 1 pairing income, 2% of level 2, and 1% of levels 3 to 5.';
+      response.rows = trace.rows.map((row) => ({
+        uid: row.uid,
+        username: row.username,
+        fullname: row.fullName,
+        level: row.level,
+        ratePercent: row.ratePercent,
+        pairingIncome: row.pairingIncome,
+        amount: row.leadershipBonus,
+        directReferralCount: row.directReferralCount,
+      }));
+      response.total = trace.totalBonus;
+      response.summary = {
+        totalSources: trace.totalSources,
+        directReferralCount: Number(directCountRows[0]?.total || 0),
+      };
+    } else if (['hifive-bonus', 'hi-five-bonus', 'ranking-bonus'].includes(metric)) {
+      const incomeColumn = metric.includes('ranking') ? 'income6' : 'income5';
       const [rows] = await pool.query(
         `SELECT pid, ${incomeColumn} AS amount, transdate, processid
          FROM payouthistorytab
