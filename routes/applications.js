@@ -1,20 +1,9 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-const multer = require('multer');
 const router = express.Router();
 const { pool } = require('../config/database');
-const { cloudinary } = require('../utils/cloudinary');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_LETTER_FILE_SIZE = 5 * 1024 * 1024;
-const ALLOWED_LETTER_MIME_TYPES = new Set([
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'image/jpeg',
-  'image/png',
-  'image/webp',
-]);
 
 const applicationLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
@@ -24,79 +13,12 @@ const applicationLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_LETTER_FILE_SIZE },
-});
-
 function normalizeApplicationFields(body = {}) {
   return {
     name: String(body?.name || '').trim(),
     phone: String(body?.phone || '').trim(),
     email: String(body?.email || '').trim().toLowerCase(),
   };
-}
-
-function validateLetterOfIntentFile(file) {
-  if (!file) {
-    return { ok: false, error: 'Letter of intent is required.' };
-  }
-
-  if (!ALLOWED_LETTER_MIME_TYPES.has(String(file.mimetype || '').toLowerCase())) {
-    return { ok: false, error: 'Letter of intent must be a PDF, DOC, DOCX, JPG, PNG, or WEBP file.' };
-  }
-
-  if (Number(file.size || 0) > MAX_LETTER_FILE_SIZE) {
-    return { ok: false, error: 'Letter of intent exceeds the 5MB file size limit.' };
-  }
-
-  return { ok: true };
-}
-
-function handleUpload(req, res, next) {
-  upload.single('letter_of_intent')(req, res, (err) => {
-    if (!err) return next();
-
-    if (err instanceof multer.MulterError) {
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'Letter of intent exceeds the 5MB file size limit.' });
-      }
-      return res.status(400).json({ error: err.message || 'Invalid upload payload.' });
-    }
-
-    return res.status(400).json({ error: 'Invalid upload payload.' });
-  });
-}
-
-async function uploadLetterOfIntent(file) {
-  if (!file) return null;
-  if (!cloudinary) {
-    const error = new Error('Letter upload service is not configured.');
-    error.code = 'UPLOAD_NOT_CONFIGURED';
-    throw error;
-  }
-
-  return new Promise((resolve, reject) => {
-    const safeOriginalFilename = String(file.originalname || 'letter-of-intent').slice(0, 255);
-    const uploadStream = cloudinary.uploader.upload_stream(
-      {
-        folder: 'nogatu/stockist-applications',
-        resource_type: 'auto',
-        public_id: `letter-${Date.now()}-${safeOriginalFilename.replace(/[^a-zA-Z0-9._-]/g, '_')}`,
-      },
-      (err, result) => {
-        if (err) return reject(err);
-        resolve({
-          url: result?.secure_url || null,
-          publicId: result?.public_id || null,
-          originalFilename: safeOriginalFilename,
-          resourceType: result?.resource_type || null,
-        });
-      }
-    );
-
-    uploadStream.end(file.buffer);
-  });
 }
 
 async function ensureApplicationsTable() {
@@ -135,19 +57,14 @@ async function ensureApplicationsTable() {
   ).catch(() => {});
 }
 
-router.post('/', applicationLimiter, handleUpload, async (req, res) => {
+router.post('/', applicationLimiter, async (req, res) => {
   try {
     await ensureApplicationsTable();
 
     const { name, phone, email } = normalizeApplicationFields(req.body);
-    const fileValidation = validateLetterOfIntentFile(req.file);
 
     if (!name || !phone || !email) {
       return res.status(400).json({ error: 'Name, contact number, and email are required.' });
-    }
-
-    if (!fileValidation.ok) {
-      return res.status(400).json({ error: fileValidation.error });
     }
 
     if (name.length > 150 || phone.length > 50 || email.length > 200) {
@@ -175,26 +92,21 @@ router.post('/', applicationLimiter, handleUpload, async (req, res) => {
       });
     }
 
-    const uploadedLetter = await uploadLetterOfIntent(req.file);
-
     const [result] = await pool.query(
       `INSERT INTO distributor_applicationstab
        (name, phone, email, letter_of_intent_url, letter_of_intent_public_id, letter_of_intent_filename,
         letter_of_intent_uploaded_at, status, follow_up_status, ip_address, submitted_at)
-       VALUES (?, ?, ?, ?, ?, ?, NOW(), 'pending', 'new', ?, NOW())`,
-      [name, phone, email, uploadedLetter?.url || null, uploadedLetter?.publicId || null, uploadedLetter?.originalFilename || null, req.ip || null]
+       VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 'pending', 'new', ?, NOW())`,
+      [name, phone, email, req.ip || null]
     );
 
     res.json({
       success: true,
       id: Number(result.insertId || 0),
-      message: 'Distributor application interest submitted.',
+      message: 'Distributor inquiry submitted successfully.',
     });
   } catch (err) {
     console.error('[Applications] Submit error:', err);
-    if (err.code === 'UPLOAD_NOT_CONFIGURED') {
-      return res.status(400).json({ error: err.message });
-    }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -203,6 +115,4 @@ module.exports = {
   router,
   ensureApplicationsTable,
   normalizeApplicationFields,
-  validateLetterOfIntentFile,
-  uploadLetterOfIntent,
 };

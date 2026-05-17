@@ -67,7 +67,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const total = Number(countRows[0]?.total || 0);
 
     const [rows] = await pool.query(
-      `SELECT id, name, age, phone, email, letter_of_intent_url, letter_of_intent_filename,
+      `SELECT id, name, age, phone, email,
               status, follow_up_status, admin_note, reviewed_by,
               DATE_FORMAT(reviewed_at, '%Y-%m-%d %H:%i') AS reviewed_at,
               DATE_FORMAT(submitted_at, '%Y-%m-%d %H:%i') AS submitted_at
@@ -91,8 +91,6 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
         age: Number(row.age),
         phone: row.phone,
         email: row.email,
-        letterOfIntentUrl: row.letter_of_intent_url || null,
-        letterOfIntentFilename: row.letter_of_intent_filename || null,
         status: row.status,
         followUpStatus: row.follow_up_status,
         adminNote: row.admin_note,
