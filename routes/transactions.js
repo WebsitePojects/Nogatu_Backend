@@ -7,6 +7,93 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { ensureVoucherTxTable } = require('../services/voucher');
+const { getPairingTrace } = require('../services/income/pairingTracker');
+const { getEffectiveAccountState, getAccountStateLabel } = require('../services/accountState');
+const { getPackageClaimDetails, getPackageRewardAmounts } = require('../services/income/hifiveBonus');
+
+function normalizeAmount(value) {
+  return Number(value || 0);
+}
+
+function normalizeDateValue(value) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function pickPairingRowsForTransaction(rows = [], targetAmount = 0, transdate = null) {
+  const safeTarget = normalizeAmount(targetAmount);
+  if (safeTarget <= 0) return [];
+
+  const cutoff = normalizeDateValue(transdate);
+  const exactCandidates = rows
+    .filter((row) => normalizeAmount(row.creditedIncome) > 0)
+    .filter((row) => {
+      if (!cutoff) return true;
+      const pairedAt = normalizeDateValue(row.pairedAt);
+      return pairedAt && pairedAt.getTime() <= cutoff.getTime();
+    })
+    .sort((left, right) => new Date(right.pairedAt || 0) - new Date(left.pairedAt || 0));
+
+  const picked = [];
+  let running = 0;
+
+  for (const row of exactCandidates) {
+    if (running >= safeTarget) break;
+    picked.push(row);
+    running += normalizeAmount(row.creditedIncome);
+  }
+
+  return running >= safeTarget ? picked : [];
+}
+
+async function resolveHiFiveSourcesForTransaction(uid, tx) {
+  const amount = normalizeAmount(tx?.hifive);
+  if (amount <= 0 || !tx) {
+    return { claims: [], summary: null };
+  }
+
+  const rewardAmounts = await getPackageRewardAmounts().catch(() => ({}));
+  const [rows] = await pool.query(
+    `SELECT qualification_uid, package_or_product, qualifying_count, status, created_at, updated_at
+       FROM hifive_qualificationstab
+      WHERE member_uid = ?
+        AND hifive_type = 'package'
+        AND status = 'paid'
+      ORDER BY updated_at DESC, created_at DESC`,
+    [uid]
+  ).catch(() => [[]]);
+
+  if (!rows.length) {
+    return { claims: [], summary: null };
+  }
+
+  const txDate = normalizeDateValue(tx.transdate);
+  const candidates = rows
+    .map((row) => {
+      const packageKey = String(row.package_or_product || '').toLowerCase();
+      const payout = normalizeAmount(rewardAmounts[packageKey]) * normalizeAmount(row.qualifying_count || 0);
+      const updatedAt = normalizeDateValue(row.updated_at || row.created_at);
+      const timeDistance = txDate && updatedAt ? Math.abs(updatedAt.getTime() - txDate.getTime()) : Number.MAX_SAFE_INTEGER;
+      return { ...row, payout, timeDistance };
+    })
+    .filter((row) => row.payout === amount)
+    .sort((left, right) => left.timeDistance - right.timeDistance);
+
+  if (!candidates.length) {
+    return { claims: [], summary: null };
+  }
+
+  const details = await getPackageClaimDetails(candidates[0].qualification_uid).catch(() => null);
+  if (!details) {
+    return { claims: [], summary: null };
+  }
+
+  return {
+    claims: details.contributors || [],
+    summary: details.summary || null,
+  };
+}
 
 /**
  * GET /api/transactions?page=1
@@ -35,7 +122,7 @@ router.get('/', memberAuth, async (req, res) => {
               t.income1, t.income2, t.income3, t.income4, t.income5, t.income6,
               t.encashment1, t.tax, t.fee, t.cddeduction,
               t.cashstatus, t.cashtransdate, t.transdate,
-              t.transactiontype,
+              t.transactiontype, t.processid,
               t.cash_paid, t.voucher_used, t.total_value, t.voucher_id
        FROM (
          SELECT CAST(p.pid AS CHAR) AS pid,
@@ -51,6 +138,7 @@ router.get('/', memberAuth, async (req, res) => {
                 DATE_FORMAT(p.cashtransdate, '%Y-%m-%d %H:%i') AS cashtransdate,
                 DATE_FORMAT(p.transdate, '%Y-%m-%d %H:%i') AS transdate,
                 p.transactiontype,
+                p.processid,
                 0 AS cash_paid,
                 0 AS voucher_used,
                 0 AS total_value,
@@ -80,6 +168,7 @@ router.get('/', memberAuth, async (req, res) => {
                 DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS cashtransdate,
                 DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS transdate,
                 11 AS transactiontype,
+                NULL AS processid,
                 vt.cash_paid,
                 vt.voucher_used,
                 vt.total_value,
@@ -136,6 +225,158 @@ router.get('/', memberAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('[Transactions] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/:pid', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    const pid = String(req.params.pid || '');
+
+    await ensureVoucherTxTable();
+
+    const [rows] = await pool.query(
+      `SELECT t.pid, t.uid, t.beginningbalance, t.endingbalance,
+              t.income1, t.income2, t.income3, t.income4, t.income5, t.income6,
+              t.encashment1, t.tax, t.fee, t.cddeduction,
+              t.cashstatus, t.cashtransdate, t.transdate,
+              t.transactiontype, t.processid,
+              t.cash_paid, t.voucher_used, t.total_value, t.voucher_id
+       FROM (
+         SELECT CAST(p.pid AS CHAR) AS pid,
+                p.uid,
+                p.beginningbalance,
+                p.endingbalance,
+                p.income1, p.income2, p.income3, p.income4, p.income5, p.income6,
+                p.encashment1,
+                p.tax_1 AS tax,
+                p.encashmentfee AS fee,
+                p.cddeduction,
+                p.cashstatus,
+                DATE_FORMAT(p.cashtransdate, '%Y-%m-%d %H:%i') AS cashtransdate,
+                DATE_FORMAT(p.transdate, '%Y-%m-%d %H:%i') AS transdate,
+                p.transactiontype,
+                p.processid,
+                0 AS cash_paid,
+                0 AS voucher_used,
+                0 AS total_value,
+                0 AS voucher_id
+         FROM payouthistorytab p
+         WHERE p.uid = ?
+         UNION ALL
+         SELECT CONCAT('V-', vt.id) AS pid,
+                vt.uid,
+                0 AS beginningbalance,
+                0 AS endingbalance,
+                0 AS income1,
+                0 AS income2,
+                0 AS income3,
+                0 AS income4,
+                0 AS income5,
+                0 AS income6,
+                0 AS encashment1,
+                0 AS tax,
+                0 AS fee,
+                0 AS cddeduction,
+                0 AS cashstatus,
+                DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS cashtransdate,
+                DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS transdate,
+                11 AS transactiontype,
+                NULL AS processid,
+                vt.cash_paid,
+                vt.voucher_used,
+                vt.total_value,
+                vt.voucher_id
+         FROM voucher_transactionstab vt
+         WHERE vt.uid = ?
+       ) t
+       WHERE t.pid = ?
+       LIMIT 1`,
+      [uid, uid, pid]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Transaction not found.' });
+    }
+
+    const row = rows[0];
+    const effectiveAccount = await getEffectiveAccountState(uid);
+    const hasPairingIncome = Number(row.income2 || 0) > 0;
+    const [pairingTrace, hiFiveTrace] = await Promise.all([
+      hasPairingIncome
+        ? getPairingTrace(uid, Number(req.session.currentaccttype || req.session.accttype || 0), { limit: 40 }).catch(() => ({ rows: [] }))
+        : Promise.resolve({ rows: [] }),
+      resolveHiFiveSourcesForTransaction(uid, {
+        hifive: row.income5,
+        transdate: row.transdate,
+        processid: row.processid,
+      }),
+    ]);
+
+    const exactPairingRows = pickPairingRowsForTransaction(pairingTrace.rows || [], row.income2, row.transdate);
+
+    res.json({
+      transaction: {
+        pid: row.pid,
+        beginningBalance: Number(row.beginningbalance || 0),
+        endingBalance: Number(row.endingbalance || 0),
+        directReferral: Number(row.income1 || 0),
+        pairing: Number(row.income2 || 0),
+        leadership: Number(row.income3 || 0),
+        unilevel: Number(row.income4 || 0),
+        hifive: Number(row.income5 || 0),
+        rankingBonus: Number(row.income6 || 0),
+        encashment: Number(row.encashment1 || 0),
+        tax: Number(row.tax || 0),
+        fee: Number(row.fee || 0),
+        cdDeduction: Number(row.cddeduction || 0),
+        cashPaid: Number(row.cash_paid || 0),
+        voucherUsed: Number(row.voucher_used || 0),
+        totalProductValue: Number(row.total_value || 0),
+        voucherId: Number(row.voucher_id || 0),
+        deductions: Number(row.tax || 0) + Number(row.fee || 0) + Number(row.cddeduction || 0),
+        cashStatus: Number(row.cashstatus || 0),
+        transactionType: Number(row.transactiontype || 0),
+        processKey: row.processid || null,
+        transactionTypeName:
+          Number(row.transactiontype || 0) === 1
+            ? 'Income'
+            : Number(row.transactiontype || 0) === 10
+              ? 'Encashment'
+              : Number(row.transactiontype || 0) === 11
+                ? 'Voucher'
+                : 'Other',
+        transdate: row.transdate,
+        cashtransdate: row.cashtransdate,
+      },
+      account: {
+        uid,
+        entryState: getAccountStateLabel(effectiveAccount),
+        cdAmount: Number(effectiveAccount?.cdamount || 0),
+        cdTotal: Number(effectiveAccount?.cdtotal || 0),
+        cdStatus: Number(effectiveAccount?.cdstatus || 0),
+      },
+      supporting: {
+        directReferrals: [],
+        leadershipSources: [],
+        pairingTrace: exactPairingRows,
+        hiFiveSources: hiFiveTrace.claims || [],
+        hiFiveSummary: hiFiveTrace.summary || null,
+        unilevelSources: [],
+        rankingSources: [],
+        notes: {
+          directReferrals: Number(row.income1 || 0) > 0 ? 'This payout row does not store exact per-record direct-referral contributors yet, so unrelated names are intentionally hidden.' : null,
+          leadershipSources: Number(row.income3 || 0) > 0 ? 'This payout row does not store exact per-record leadership source rows yet, so unrelated names are intentionally hidden.' : null,
+          pairingTrace: Number(row.income2 || 0) > 0 && exactPairingRows.length === 0 ? 'Pairing income exists on this record, but exact contributor rows were not fully preserved in the legacy ledger for this payout.' : null,
+          hiFiveSources: Number(row.income5 || 0) > 0 && (hiFiveTrace.claims || []).length === 0 ? 'Hi-Five income exists on this record, but the exact paid claim source could not be matched from the current legacy data.' : null,
+          unilevelSources: Number(row.income4 || 0) > 0 ? 'This payout row does not store exact per-record unilevel contributors yet, so unrelated names are intentionally hidden.' : null,
+          rankingSources: Number(row.income6 || 0) > 0 ? 'This payout row does not store exact per-record ranking contributors yet, so unrelated names are intentionally hidden.' : null,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[Transactions] Detail error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

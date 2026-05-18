@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { normalizeVoucherProductSelection } = require('../../services/voucher');
+const { normalizeVoucherProductSelection, VOUCHER_PRODUCT_CATALOG } = require('../../services/voucher');
 
 test('voucher product selection resolves by product key', () => {
   const product = normalizeVoucherProductSelection({ productKey: 'bl' });
@@ -23,7 +23,9 @@ test('voucher product selection includes the newer landing-page products', () =>
 
   assert.equal(berry.name, 'Berry NAD+');
   assert.equal(berry.incentivePoints, 35);
-  assert.equal(vitamin.name, 'Vitamin C');
+  assert.equal(vitamin.name, 'Vitamin C with Zinc & Mangosteen');
+  assert.equal(vitamin.price, 580);
+  assert.equal(VOUCHER_PRODUCT_CATALOG.glc.price, 500);
 });
 
 test('voucher product selection rejects unknown products', () => {

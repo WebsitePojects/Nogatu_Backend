@@ -54,21 +54,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const frontendLegacyImageDir = path.resolve(__dirname, '../Nogatu_Frontend/public/legacy-img');
-const legacyImageCandidates = [
-  frontendLegacyImageDir,
-  path.resolve(__dirname, '../public_html/img'),
-  path.resolve(__dirname, '../public_html(Original_Code)/img'),
-  path.resolve(__dirname, '../reference_system/public_html(latest_production_code)/img'),
-];
-const legacyImageDir = legacyImageCandidates.find((dir) => fs.existsSync(dir));
-if (legacyImageDir) {
-  app.use('/legacy-img', express.static(legacyImageDir));
-  const sourceLabel = legacyImageDir === frontendLegacyImageDir ? 'frontend legacy-img assets' : 'legacy fallback images';
-  console.log(`[Server] Serving ${sourceLabel} from: ${legacyImageDir}`);
-} else {
-  console.warn('[Server] Legacy image directory not found. /legacy-img route is disabled.');
-}
+console.log('[Server] Legacy image static serving is disabled in the backend. Frontend public assets should serve /legacy-img directly.');
 
 const SESSION_TABLE = /^[A-Za-z0-9_]+$/.test(process.env.SESSION_TABLE || '')
   ? process.env.SESSION_TABLE

@@ -19,7 +19,7 @@ test('package binary helpers separate BP counts from peso values', () => {
 
 test('product type labels cover the expanded landing-page maintenance catalog', () => {
   assert.equal(PRODUCT_TYPES[100], 'Nogatu Barley Juice');
-  assert.equal(PRODUCT_TYPES[106], 'Vitamin C');
-  assert.equal(PRODUCT_TYPES[107], 'Max Fuel Coffee Drink Mix');
+  assert.equal(PRODUCT_TYPES[106], 'Vitamin C with Zinc & Mangosteen');
+  assert.equal(PRODUCT_TYPES[107], 'Nogatu Max Fuel Coffee Drink Mix');
   assert.equal(PRODUCT_TYPES[109], 'Berry NAD+');
 });

@@ -5,6 +5,9 @@ const { adminAuth, adminRights } = require('../../middleware/auth');
 const {
   getFinanceSnapshot,
   savePackageConfig,
+  createCustomBudgetColumn,
+  updateCustomBudgetColumn,
+  saveCustomBudgetColumnValue,
   normalizeFinanceYear,
 } = require('../../services/adminFinance');
 const {
@@ -86,6 +89,15 @@ function money(value) {
 }
 
 function buildFinancePdfDefinition(snapshot) {
+  const packageScale = Math.max(1, ...snapshot.packageRows.map((row) => Number(row.grossSales || 0)));
+  const walletRows = [
+    { label: 'Expense Reserve', value: Number(snapshot.wallets.expenseReserveWallet || 0), color: '#d97706' },
+    { label: 'Encashment Requested', value: Number(snapshot.wallets.encashmentWallet.requestedAmount || 0), color: '#1d4ed8' },
+    { label: 'Service + Maintenance', value: Number(snapshot.wallets.serviceAndMaintenanceWallet.total || 0), color: '#0f766e' },
+    { label: 'CD Recovery', value: Number(snapshot.wallets.cdRecoveryWallet.totalCdDeduction || 0), color: '#b45309' },
+  ];
+  const walletScale = Math.max(1, ...walletRows.map((row) => row.value));
+
   return {
     fileName: `finance-report-${snapshot.year}`,
     title: `Finance Accounting ${snapshot.year}`,
@@ -101,6 +113,28 @@ function buildFinancePdfDefinition(snapshot) {
       { label: 'Service + Maintenance', value: money(snapshot.wallets.serviceAndMaintenanceWallet.total), color: '#0f766e' },
       { label: 'CD Recovery', value: money(snapshot.wallets.cdRecoveryWallet.totalCdDeduction), color: '#b45309' },
       { label: 'Admin / Ops Reserve', value: money(snapshot.totals.adminExtraTotal), color: '#7c3aed' },
+    ],
+    charts: [
+      {
+        title: 'Package Sales Ladder',
+        note: 'Gross sales by package for the selected year. This makes the biggest package contributors immediately visible for accounting review.',
+        bars: snapshot.packageRows.map((row) => ({
+          label: row.packageLabel,
+          valueLabel: money(row.grossSales),
+          percent: Math.max(4, Math.round((Number(row.grossSales || 0) / packageScale) * 100)),
+          color: '#d4af37',
+        })),
+      },
+      {
+        title: 'Reserve Wallet Mix',
+        note: 'Wallet buckets available from the current accounting records and reserve computations.',
+        bars: walletRows.map((row) => ({
+          label: row.label,
+          valueLabel: money(row.value),
+          percent: Math.max(4, Math.round((row.value / walletScale) * 100)),
+          color: row.color,
+        })),
+      },
     ],
     tables: [
       {
@@ -163,6 +197,39 @@ router.put('/package-config/:packageType', adminAuth, adminRights([1, 3]), async
   } catch (error) {
     console.error('[Admin Finance] Config save error:', error);
     res.status(400).json({ error: error.message || 'Failed to save package finance config' });
+  }
+});
+
+router.post('/custom-columns', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const updatedBy = req.session.adminname || req.session.adminid || 'admin';
+    const column = await createCustomBudgetColumn(req.body || {}, updatedBy);
+    res.json({ success: true, column });
+  } catch (error) {
+    console.error('[Admin Finance] Custom column create error:', error);
+    res.status(400).json({ error: error.message || 'Failed to create finance column' });
+  }
+});
+
+router.put('/custom-columns/:columnId', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const updatedBy = req.session.adminname || req.session.adminid || 'admin';
+    const column = await updateCustomBudgetColumn(req.params.columnId, req.body || {}, updatedBy);
+    res.json({ success: true, column });
+  } catch (error) {
+    console.error('[Admin Finance] Custom column update error:', error);
+    res.status(400).json({ error: error.message || 'Failed to update finance column' });
+  }
+});
+
+router.put('/custom-columns/:columnId/values/:packageType', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const updatedBy = req.session.adminname || req.session.adminid || 'admin';
+    const column = await saveCustomBudgetColumnValue(req.params.columnId, req.params.packageType, req.body?.amount, updatedBy);
+    res.json({ success: true, column });
+  } catch (error) {
+    console.error('[Admin Finance] Custom column value update error:', error);
+    res.status(400).json({ error: error.message || 'Failed to update finance column value' });
   }
 });
 

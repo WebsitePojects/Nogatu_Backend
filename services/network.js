@@ -6,7 +6,7 @@
  */
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
-const { getEffectiveAccountState, getAccountStateLabel } = require('./accountState');
+const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo } = require('./accountState');
 const { getPackageBinaryValue } = require('./packagePolicy');
 
 function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
@@ -212,15 +212,24 @@ async function getDirectReferrals(uid) {
     [uid]
   );
 
-  return rows.map(row => ({
-    uid: row.uid,
-    username: row.username,
-    fullname: `${row.firstname} ${row.lastname}`,
-    accttype: row.currentaccttype,
-    accttypeName: getAccountTypeName(row.currentaccttype),
-    codeid: row.codeid,
-    entryType: row.codeid === 1 ? 'Paid Account' : row.codeid === 2 ? 'Free Slot' : 'CD Slot',
-    datereg: row.datereg,
+  return Promise.all(rows.map(async (row) => {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    const auditInfo = getAccountEntryAuditInfo(effectiveRow || row);
+
+    return {
+      uid: row.uid,
+      username: row.username,
+      fullname: `${row.firstname} ${row.lastname}`,
+      accttype: Number(effectiveRow?.currentaccttype || row.currentaccttype || 0),
+      accttypeName: getAccountTypeName(effectiveRow?.currentaccttype || row.currentaccttype),
+      codeid: Number(effectiveRow?.codeid || row.codeid || 0),
+      entryType: auditInfo.entryLabel,
+      entryCode: auditInfo.entryCode,
+      accountStateLabel: getAccountStateLabel(effectiveRow || row),
+      sponsorCreditEligible: Boolean(auditInfo.sponsorCreditEligible),
+      sourceBinaryEligible: Boolean(auditInfo.sourceBinaryEligible),
+      datereg: row.datereg,
+    };
   }));
 }
 

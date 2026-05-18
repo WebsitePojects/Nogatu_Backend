@@ -67,6 +67,9 @@ const RANK_CASH_INCENTIVES = FULL_RANK_DEFINITIONS.reduce((map, row) => {
   return map;
 }, {});
 
+let rankingInfraReadyPromise = null;
+const memberRefreshPromises = new Map();
+
 function toNumber(value) {
   return Number(value || 0);
 }
@@ -225,6 +228,16 @@ async function ensureRankingTable(conn = pool) {
   await ensureIndex(conn, 'usertab', 'idx_refid_position_uid', 'ALTER TABLE usertab ADD INDEX idx_refid_position_uid (refid, position, uid)');
   await ensureIndex(conn, 'usertab', 'idx_codeid_mainid_uid', 'ALTER TABLE usertab ADD INDEX idx_codeid_mainid_uid (codeid, mainid, uid)');
   await ensureIndex(conn, 'binary_tree_closuretab', 'idx_ancestor_leg_depth', 'ALTER TABLE binary_tree_closuretab ADD INDEX idx_ancestor_leg_depth (ancestor_uid, leg, depth)');
+}
+
+async function ensureRankingInfra() {
+  if (!rankingInfraReadyPromise) {
+    rankingInfraReadyPromise = ensureRankingTable().catch((error) => {
+      rankingInfraReadyPromise = null;
+      throw error;
+    });
+  }
+  return rankingInfraReadyPromise;
 }
 
 async function getRankDefinitions(conn = pool) {
@@ -869,30 +882,44 @@ function buildSnapshotFromStoredRow(row, definitions, pairing, achievements = []
 }
 
 async function refreshMemberRankSnapshot(uid) {
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    const snapshot = await rebuildRankSnapshot(uid, conn);
-    await conn.commit();
-    return snapshot;
-  } catch (error) {
+  const memberUid = toNumber(uid);
+  if (memberRefreshPromises.has(memberUid)) {
+    return memberRefreshPromises.get(memberUid);
+  }
+
+  const refreshPromise = (async () => {
+    const conn = await pool.getConnection();
     try {
-      await conn.rollback();
-    } catch {}
-    throw error;
+      await conn.beginTransaction();
+      const snapshot = await rebuildRankSnapshot(memberUid, conn);
+      await conn.commit();
+      return snapshot;
+    } catch (error) {
+      try {
+        await conn.rollback();
+      } catch {}
+      throw error;
+    } finally {
+      conn.release();
+    }
+  })();
+
+  memberRefreshPromises.set(memberUid, refreshPromise);
+  try {
+    return await refreshPromise;
   } finally {
-    conn.release();
+    memberRefreshPromises.delete(memberUid);
   }
 }
 
 async function getCurrentRank(uid) {
-  await ensureRankingTable();
+  await ensureRankingInfra();
   const snapshot = await refreshMemberRankSnapshot(uid);
   return toNumber(snapshot?.currentRank);
 }
 
 async function getRankProgress(uid) {
-  await ensureRankingTable();
+  await ensureRankingInfra();
   const memberUid = toNumber(uid);
   const definitions = await getRankDefinitions();
   const storedRow = await getStoredRankingRow(memberUid);
@@ -1006,7 +1033,7 @@ async function getCurrentRankMap(uidList, conn = pool) {
 }
 
 async function refreshRankingForest() {
-  await ensureRankingTable();
+  await ensureRankingInfra();
 
   const [rootRows] = await pool.query(
     `SELECT u.uid
@@ -1031,7 +1058,7 @@ async function refreshRankingForest() {
 }
 
 async function getAllRankings(page = 1, perPage = 30) {
-  await ensureRankingTable();
+  await ensureRankingInfra();
   const definitions = await getRankDefinitions();
 
   const currentPage = Math.max(1, Number(page) || 1);
@@ -1041,7 +1068,7 @@ async function getAllRankings(page = 1, perPage = 30) {
   const [countRows] = await pool.query(
     `SELECT COUNT(*) AS total
      FROM usertab u
-     WHERE u.codeid = 1 AND u.uid = u.mainid`
+     WHERE u.uid = u.mainid`
   );
   const total = toNumber(countRows[0]?.total);
 
@@ -1069,7 +1096,7 @@ async function getAllRankings(page = 1, perPage = 30) {
      FROM usertab u
      INNER JOIN memberstab m ON m.uid = u.uid
      LEFT JOIN rankingstab r ON r.uid = u.uid
-     WHERE u.codeid = 1 AND u.uid = u.mainid
+     WHERE u.uid = u.mainid
      ORDER BY
        GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) DESC,
        COALESCE(r.remaining_rankable_points, 0) DESC,

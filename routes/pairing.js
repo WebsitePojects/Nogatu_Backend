@@ -9,7 +9,7 @@ const { pool } = require('../config/database');
 const { getPairingCounts } = require('../services/network');
 const { backfillHistoricalBinaryPointEvents, getPairingTrace } = require('../services/income/pairingTracker');
 const { getPackagePolicy } = require('../services/packagePolicy');
-const { getEffectiveAccountState, countsForPairingSource } = require('../services/accountState');
+const { getEffectiveAccountState, countsForPairingSource, getAccountStateLabel } = require('../services/accountState');
 
 router.get('/sources', memberAuth, async (req, res) => {
   try {
@@ -80,29 +80,25 @@ router.get('/', memberAuth, async (req, res) => {
     const accttype = Number(req.session.currentaccttype || req.session.accttype || 0);
     const packagePolicy = getPackagePolicy(accttype);
     const effectiveAccount = await getEffectiveAccountState(uid);
-    const canEarnPairing = countsForPairingSource(effectiveAccount);
+    const sourceEligible = countsForPairingSource(effectiveAccount);
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = Math.min(100, Math.max(10, Number(req.query.perPage) || 50));
     const offset = (page - 1) * perPage;
 
     const [totalRows, reports, counts, trace, walletRows] = await Promise.all([
-      canEarnPairing
-        ? pool.query('SELECT COUNT(*) AS total FROM pairingstab WHERE uid = ? AND totalpoints >= 1', [uid]).then(([rows]) => rows)
-        : Promise.resolve([{ total: 0 }]),
-      canEarnPairing
-        ? pool.query(
-          `SELECT *
-           FROM pairingstab
-           WHERE uid = ?
-             AND totalpoints >= 1
-           ORDER BY id DESC
-           LIMIT ? OFFSET ?`,
-          [uid, perPage, offset]
-        ).then(([rows]) => rows)
-        : Promise.resolve([]),
+      pool.query('SELECT COUNT(*) AS total FROM pairingstab WHERE uid = ? AND totalpoints >= 1', [uid]).then(([rows]) => rows),
+      pool.query(
+        `SELECT *
+         FROM pairingstab
+         WHERE uid = ?
+           AND totalpoints >= 1
+         ORDER BY transdate DESC, id DESC
+         LIMIT ? OFFSET ?`,
+        [uid, perPage, offset]
+      ).then(([rows]) => rows),
       getPairingCounts(uid),
-      canEarnPairing
-        ? getPairingTrace(uid, accttype, { limit: 50 }).catch((error) => {
+      getPairingTrace(uid, accttype, { limit: 50 })
+        .catch((error) => {
           if (error.code === 'ER_NO_SUCH_TABLE') {
             return {
               rows: [],
@@ -120,20 +116,6 @@ router.get('/', memberAuth, async (req, res) => {
             };
           }
           throw error;
-        })
-        : Promise.resolve({
-          rows: [],
-          summary: {
-            totalEvents: 0,
-            totalPairPoints: 0,
-            totalGrossIncome: 0,
-            totalCreditedIncome: 0,
-            cappedEvents: 0,
-            uncappedEvents: 0,
-          },
-          weeklyCap: Number(packagePolicy.pairingWeeklyCap || 0),
-          packageName: packagePolicy.packageLabel || null,
-          sourceBackfill: { inserted: 0, skipped: 0 },
         }),
       pool.query('SELECT ttlincome2 FROM payouttotaltab WHERE uid = ? LIMIT 1', [uid]).then(([rows]) => rows),
     ]);
@@ -153,10 +135,12 @@ router.get('/', memberAuth, async (req, res) => {
       packagePolicy,
       walletPairingTotal,
       eligibility: {
-        canEarnPairing,
-        reason: canEarnPairing
+        canEarnPairing: true,
+        sourceEligible,
+        accountState: getAccountStateLabel(effectiveAccount),
+        reason: sourceEligible
           ? null
-          : 'This account cannot receive sales matched bonus while it is FS or an unpaid CD account.',
+          : 'This account cannot pass its own BP to its sponsor and uplines yet, but it can still earn pairing from eligible paid-direct or fully paid CD downlines on both legs.',
       },
     });
   } catch (err) {

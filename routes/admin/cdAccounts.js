@@ -26,8 +26,8 @@ const PACKAGE_MAP = {
   60: 'Diamond',
 };
 
-const FULLY_PAID_SQL = `(COALESCE(u.cdamount, 0) > 0 AND COALESCE(ph.totalCdDeduction, 0) >= COALESCE(u.cdamount, 0))`;
-const STILL_PAYING_SQL = `(COALESCE(u.cdamount, 0) = 0 OR COALESCE(ph.totalCdDeduction, 0) < COALESCE(u.cdamount, 0))`;
+const FULLY_PAID_SQL = `(COALESCE(u.cdstatus, 0) = 2)`;
+const STILL_PAYING_SQL = `(COALESCE(u.cdstatus, 0) <> 2)`;
 const CD_FROM_SQL = `
   FROM usertab u
   JOIN memberstab m ON m.uid = u.uid
@@ -95,6 +95,7 @@ function mapCdAccountRow(r) {
     recoveredRemaining: settlementState.recoveredRemaining,
     progress,
     isRecoveredFullyPaid: settlementState.isRecoveredFullyPaid,
+    isCdStatusPaid: Number(r.cdstatus || 0) === 2,
     isSettledOutsideDeduction: settlementState.isSettledOutsideDeduction,
     datereg: r.regdate,
     regdate: r.regdate,
@@ -150,15 +151,6 @@ function writeWorkbook(res, filename, sheets, format = 'xlsx') {
     addSheet(workbook, name, rows.rows, rows.widths || []);
   }
 
-  if (format === 'csv') {
-    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-    const csv = XLSX.utils.sheet_to_csv(firstSheet);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
-    res.send(csv);
-    return;
-  }
-
   const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
@@ -173,6 +165,12 @@ function money(value) {
 }
 
 function buildCdPdfDefinition(accounts, packageBreakdown, stats, filters) {
+  const packageScale = Math.max(1, ...packageBreakdown.map((row) => Number(row.totalCdAmount || 0)));
+  const progressBuckets = [
+    { label: 'Fully Paid', value: Number(stats.fullyPaid || 0), color: '#15803d' },
+    { label: 'Still Paying', value: Number(stats.stillPaying || 0), color: '#d97706' },
+  ];
+  const progressScale = Math.max(1, ...progressBuckets.map((row) => row.value));
   return {
     fileName: `cd-accounts-${filters.status}-${filters.packageType}`,
     title: 'CD Account Management Report',
@@ -191,6 +189,28 @@ function buildCdPdfDefinition(accounts, packageBreakdown, stats, filters) {
       { label: 'Total Paid', value: money(stats.totalPaid), color: '#047857' },
       { label: 'CD Deductions', value: money(stats.totalCdDeduction), color: '#db2777' },
       { label: 'Net Encashment', value: money(stats.totalNetEncashment), color: '#1d4ed8' },
+    ],
+    charts: [
+      {
+        title: 'CD Package Exposure',
+        note: 'Total CD amount grouped by package under the current filter.',
+        bars: packageBreakdown.map((row) => ({
+          label: row.package,
+          valueLabel: money(row.totalCdAmount),
+          percent: Math.max(4, Math.round((Number(row.totalCdAmount || 0) / packageScale) * 100)),
+          color: '#d4af37',
+        })),
+      },
+      {
+        title: 'Settlement Status Mix',
+        note: 'Recovered fully-paid versus still-paying CD accounts.',
+        bars: progressBuckets.map((row) => ({
+          label: row.label,
+          valueLabel: String(row.value),
+          percent: Math.max(4, Math.round((row.value / progressScale) * 100)),
+          color: row.color,
+        })),
+      },
     ],
     tables: [
       {
@@ -235,14 +255,14 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
     const status = String(req.query.status || 'all').trim();
     const packageType = String(req.query.packageType || 'all').trim();
     const rawFormat = String(req.query.format || 'xlsx').toLowerCase();
-    const format = rawFormat === 'csv' ? 'csv' : rawFormat === 'pdf' || rawFormat === 'crystal' ? rawFormat : 'xlsx';
+    const format = rawFormat === 'pdf' || rawFormat === 'crystal' ? rawFormat : 'xlsx';
     const filters = { search, status, packageType };
     const { whereClause, params } = buildCdWhereClause(filters);
     const accounts = await fetchCdAccounts({ whereClause, params });
     const packageBreakdown = buildCdPackageBreakdown(accounts);
     const stats = accounts.reduce((acc, account) => {
       acc.total += 1;
-      if (account.isRecoveredFullyPaid) acc.fullyPaid += 1;
+      if (account.isCdStatusPaid) acc.fullyPaid += 1;
       else acc.stillPaying += 1;
       acc.totalCdAmount += account.cdamount;
       acc.totalPaid += account.cdtotal;
@@ -339,7 +359,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     const stats = allAccounts.reduce((acc, account) => {
       acc.total += 1;
-      if (account.isRecoveredFullyPaid) acc.fullyPaid += 1;
+      if (account.isCdStatusPaid) acc.fullyPaid += 1;
       else acc.stillPaying += 1;
       acc.totalCdAmount += account.cdamount;
       acc.totalRemaining += account.remaining;

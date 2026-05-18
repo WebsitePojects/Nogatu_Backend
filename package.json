@@ -10,6 +10,7 @@
     "db:migrate": "node scripts/migrate.js",
     "db:backup-current": "node scripts/backupCurrentDb.js",
     "db:import-reference": "node scripts/importReferenceDb.js",
+    "db:replace-from-dump": "node scripts/replaceDbFromDump.js",
     "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
