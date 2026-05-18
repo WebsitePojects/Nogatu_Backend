@@ -89,10 +89,14 @@ router.get('/', memberAuth, async (req, res) => {
       isCurrentUser: Number(row.uid) === uid,
     }));
 
+    const aheadCount = Number(rankRows[0]?.rankPosition || 0);
+    const userLeaderboardPosition = leaderboardResult.total > 0 ? aheadCount + 1 : 0;
+
     res.json({
       leaderboard,
       rankDefinitions,
-      userRank: Number(rankRows[0]?.rankPosition || 0),
+      userRank: userLeaderboardPosition,
+      userLeaderboardPosition,
       userPoints: userGross,
       userRepurchasePoints: userGross,
       userGrossRankablePoints: userGross,
