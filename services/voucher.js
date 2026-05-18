@@ -8,6 +8,7 @@
  * - Expiry: Bronze=30d, Silver=40d, Gold=45d, Platinum=50d, Garnet=55d, Diamond=60d
  */
 const { pool } = require('../config/database');
+const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
@@ -91,19 +92,6 @@ const PACKAGE_AMOUNTS = {
   60: 150000,
 };
 
-const VOUCHER_PRODUCT_CATALOG = {
-  bl: { code: 100, name: 'Nogatu Barley Juice', incentivePoints: 50 },
-  gl: { code: 101, name: 'Nogatu Glow', incentivePoints: 45 },
-  glc: { code: 102, name: 'Collagen Vitamin C', incentivePoints: 40 },
-  cm: { code: 103, name: 'Nogatu Coffee Mix', incentivePoints: 40 },
-  cd: { code: 104, name: 'Chocolate Drink Mix', incentivePoints: 45 },
-  mgt: { code: 105, name: 'Mangosteen Coffee Mix', incentivePoints: 30 },
-  vc: { code: 106, name: 'Vitamin C', incentivePoints: 40 },
-  cmm: { code: 107, name: 'Max Fuel Coffee Drink Mix', incentivePoints: 100 },
-  bkc: { code: 108, name: 'Black Coffee', incentivePoints: 10 },
-  bnad: { code: 109, name: 'Berry NAD+', incentivePoints: 35 },
-};
-
 const VOUCHER_PRODUCT_BY_CODE = Object.fromEntries(
   Object.values(VOUCHER_PRODUCT_CATALOG).map((product) => [product.code, product])
 );
@@ -146,6 +134,20 @@ async function issueVoucher(conn, uid, packageType) {
   return result.insertId;
 }
 
+function buildVoucherExpiryLabel(expiryDate, status) {
+  if (!expiryDate || Number(status || 0) === 2) return 'Expired';
+  if (Number(status || 0) === 3) return 'Fully used';
+  if (Number(status || 0) === 4) return 'Suspended';
+
+  const expiry = new Date(expiryDate);
+  if (Number.isNaN(expiry.getTime())) return 'Active';
+  const diffMs = expiry.getTime() - Date.now();
+  const daysRemaining = Math.max(0, Math.ceil(diffMs / 86400000));
+  if (daysRemaining === 0) return 'Expires today';
+  if (daysRemaining === 1) return '1 day left';
+  return `${daysRemaining} days left`;
+}
+
 /**
  * Get all vouchers for a member
  */
@@ -172,7 +174,10 @@ async function getVouchers(uid) {
     [uid]
   );
 
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    expiry_label: buildVoucherExpiryLabel(row.expiry_date, row.status),
+  }));
 }
 
 /**
@@ -606,6 +611,7 @@ module.exports = {
   ensureVoucherTable,
   ensureVoucherTxTable,
   normalizeVoucherProductSelection,
+  VOUCHER_PRODUCT_CATALOG,
   VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,
 };

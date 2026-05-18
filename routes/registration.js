@@ -8,7 +8,9 @@ const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const registrationService = require('../services/registration');
+const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
 const { createReferralSlug, normalizeReferralSlug, createPublicId } = require('../utils/security');
+const { resolveTin, isValidTin } = require('../utils/tin');
 const { writeAuditLog } = require('../services/audit');
 const { recommendPlacementForSponsor } = require('../services/placementRecommendation');
 const {
@@ -144,6 +146,27 @@ async function writeDuplicateRegistrationAudit(req, sponsorUid, details, attempt
       reason: details?.reason || 'name-plus-strong-signal-match',
     },
   }).catch(() => {});
+}
+
+async function refreshSponsorIncomeAfterRegistration(sponsorUid, fallbackAcctType = 0) {
+  const numericSponsorUid = Number(sponsorUid || 0);
+  if (!numericSponsorUid) return;
+
+  try {
+    const [rows] = await pool.query(
+      'SELECT currentaccttype, accttype FROM usertab WHERE uid = ? LIMIT 1',
+      [numericSponsorUid]
+    );
+    const sponsorAcctType = Number(
+      rows[0]?.currentaccttype ||
+      rows[0]?.accttype ||
+      fallbackAcctType ||
+      0
+    );
+    await calculateAndStoreIncome(numericSponsorUid, sponsorAcctType);
+  } catch (error) {
+    console.error('[Registration] Sponsor income refresh warning:', error);
+  }
 }
 
 /**
@@ -418,7 +441,7 @@ router.post('/public-register', async (req, res) => {
     await ensureReferralInvitesTable();
     const {
       token, slug, activationCode, username, password,
-      firstname, lastname, middlename, tin, email, deviceFingerprint, contactno, dob
+      firstname, lastname, middlename, tin, email, address, deviceFingerprint, contactno, dob
     } = req.body;
 
     if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname || !email || !contactno || !dob) {
@@ -481,6 +504,7 @@ router.post('/public-register', async (req, res) => {
       middlename,
       tin,
       email,
+      address,
       contactno,
       dob,
       position: Number(placement?.position || invite.position),
@@ -533,6 +557,8 @@ router.post('/public-register', async (req, res) => {
       },
     }).catch(() => {});
 
+    await refreshSponsorIncomeAfterRegistration(Number(invite.sponsor_uid));
+
     res.json(result);
   } catch (err) {
     console.error('[Registration] Public registration error:', err);
@@ -566,10 +592,10 @@ router.post('/register', memberAuth, async (req, res) => {
   try {
     const {
       activationCode, placementUid, username, password,
-      firstname, lastname, middlename, position, tin, tinno, email, contactno, dob
+      firstname, lastname, middlename, position, tin, tinno, email, address, contactno, dob
     } = req.body;
 
-    const rawTin = String(tin || tinno || '').trim();
+    const rawTin = resolveTin({ tin, tinno });
 
     // Input validation
     if (!activationCode || !username || !password || !firstname || !lastname || !rawTin || !email || !contactno || !dob) {
@@ -585,8 +611,8 @@ router.post('/register', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Name fields must be under 50 characters' });
     }
 
-    if (rawTin.length < 9 || rawTin.length > 30 || !/^[0-9-]+$/.test(rawTin)) {
-      return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+    if (!isValidTin(rawTin)) {
+      return res.status(400).json({ error: 'TIN must contain 9-15 digits and will be saved in grouped format.' });
     }
 
     const recommendedPlacement = await buildPlacementPreview(Number(req.session.uid));
@@ -608,6 +634,7 @@ router.post('/register', memberAuth, async (req, res) => {
       middlename,
       tin: rawTin,
       email,
+      address,
       contactno,
       dob,
       position: finalPosition,
@@ -615,6 +642,11 @@ router.post('/register', memberAuth, async (req, res) => {
       placementPolicy: recommendedPlacement?.placementPolicy || null,
       requestId: req.requestId || null,
     });
+
+    await refreshSponsorIncomeAfterRegistration(
+      Number(req.session.uid),
+      Number(req.session.currentaccttype || req.session.accttype || 0)
+    );
 
     res.json(result);
   } catch (err) {

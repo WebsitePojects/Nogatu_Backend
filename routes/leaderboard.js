@@ -34,8 +34,7 @@ router.get('/', memberAuth, async (req, res) => {
       `SELECT COUNT(*) AS rankPosition
        FROM rankingstab r
        INNER JOIN usertab u ON u.uid = r.uid
-       WHERE u.codeid = 1
-         AND u.uid = u.mainid
+       WHERE u.uid = u.mainid
          AND (
            GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) > ?
            OR (
@@ -93,7 +92,7 @@ router.get('/', memberAuth, async (req, res) => {
     res.json({
       leaderboard,
       rankDefinitions,
-      userRank: Number(rankRows[0]?.rankPosition || null),
+      userRank: Number(rankRows[0]?.rankPosition || 0),
       userPoints: userGross,
       userRepurchasePoints: userGross,
       userGrossRankablePoints: userGross,

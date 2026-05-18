@@ -54,6 +54,7 @@ async function renderAdminPdfReport({
   generatedAt = '',
   filterChips = [],
   summaryCards = [],
+  charts = [],
   tables = [],
   orientation = 'landscape',
 }) {
@@ -148,6 +149,56 @@ async function renderAdminPdfReport({
                 grid-template-columns: repeat(4, minmax(0, 1fr));
                 gap: 10px;
                 margin-bottom: 16px;
+              }
+              .chart-grid {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 12px;
+                margin-bottom: 16px;
+              }
+              .chart-card {
+                border-radius: 16px;
+                padding: 14px;
+                border: 1px solid #ebdec0;
+                background: white;
+                page-break-inside: avoid;
+              }
+              .chart-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: #3a1000;
+                margin: 0 0 4px;
+              }
+              .chart-note {
+                font-size: 10px;
+                color: #6b7280;
+                margin: 0 0 10px;
+                line-height: 1.45;
+              }
+              .chart-row {
+                margin-bottom: 10px;
+              }
+              .chart-row:last-child {
+                margin-bottom: 0;
+              }
+              .chart-row-top {
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                font-size: 10px;
+                margin-bottom: 4px;
+                color: #374151;
+              }
+              .chart-bar-track {
+                width: 100%;
+                height: 10px;
+                border-radius: 999px;
+                background: #f5ead4;
+                overflow: hidden;
+              }
+              .chart-bar-fill {
+                height: 100%;
+                border-radius: 999px;
               }
               .summary-card {
                 border-radius: 14px;
@@ -249,6 +300,28 @@ async function renderAdminPdfReport({
                 </section>
               {{/if}}
 
+              {{#if charts.length}}
+                <section class="chart-grid">
+                  {{#each charts}}
+                    <div class="chart-card">
+                      <h2 class="chart-title">{{title}}</h2>
+                      {{#if note}}<p class="chart-note">{{note}}</p>{{/if}}
+                      {{#each bars}}
+                        <div class="chart-row">
+                          <div class="chart-row-top">
+                            <span>{{label}}</span>
+                            <span>{{valueLabel}}</span>
+                          </div>
+                          <div class="chart-bar-track">
+                            <div class="chart-bar-fill" style="width: {{percent}}%; background: {{color}};"></div>
+                          </div>
+                        </div>
+                      {{/each}}
+                    </div>
+                  {{/each}}
+                </section>
+              {{/if}}
+
               {{#each tables}}
                 <section class="section">
                   <h2 class="section-title">{{title}}</h2>
@@ -288,6 +361,7 @@ async function renderAdminPdfReport({
       generatedAt,
       filterChips,
       summaryCards,
+      charts,
       tables,
     },
   });

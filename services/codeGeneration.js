@@ -9,6 +9,7 @@ const { pool } = require('../config/database');
 const PseudoCrypt = require('../utils/pseudoCrypt');
 const { createProcessKey } = require('../utils/security');
 const { appendActivationCodeUsage } = require('./registrationAudit');
+const { MAINTENANCE_PRODUCT_CONFIG } = require('../constants/maintenanceProductCatalog');
 
 // Product configuration - 1:1 from PHP codeInsert()
 const PRODUCT_CONFIG = {
@@ -20,16 +21,7 @@ const PRODUCT_CONFIG = {
   50: { name: 'Garnet', directreferral: 5000, binarypoints: 5000, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 50000 },
   60: { name: 'Diamond', directreferral: 15000, binarypoints: 15000, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 150000 },
   // Product types (100+)
-  100: { name: 'Nogatu Barley Juice', directreferral: 0, binarypoints: 0, unilevelpoints: 50, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  101: { name: 'Nogatu Glow', directreferral: 0, binarypoints: 0, unilevelpoints: 45, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  102: { name: 'Nogatu Collagen Vitamin C', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  103: { name: 'Nogatu Coffee Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  104: { name: 'Chocolate Drink Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 45, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  105: { name: 'Mangosteen Coffee Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 30, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  106: { name: 'Vitamin C', directreferral: 0, binarypoints: 0, unilevelpoints: 40, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  107: { name: 'Max Fuel Coffee Drink Mix', directreferral: 0, binarypoints: 0, unilevelpoints: 100, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  108: { name: 'Black Coffee', directreferral: 0, binarypoints: 0, unilevelpoints: 10, incentivepoints: 0, profitsharing: 0, productamount: 0 },
-  109: { name: 'Berry NAD+', directreferral: 0, binarypoints: 0, unilevelpoints: 35, incentivepoints: 0, profitsharing: 0, productamount: 0 },
+  ...MAINTENANCE_PRODUCT_CONFIG,
 };
 
 // Code type prefixes

@@ -255,6 +255,23 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
  * @returns {{ totalPay, leftCount, leftPts, rightCount, rightPts, pairedPts }} Pairing result
  */
 async function getPairing(uid, accttype) {
+  const ownerAccount = await getEffectiveAccountState(uid);
+  if (!ownerAccount) {
+    return {
+      totalPay: 0,
+      leftCount: 0,
+      leftPts: 0,
+      rightCount: 0,
+      rightPts: 0,
+      pairedPts: 0,
+      dailyReports: [],
+    };
+  }
+
+  // Production pairing payout is driven by whether descendant source nodes are
+  // pairing-eligible. An unpaid CD owner cannot pass their own BP upward, but
+  // can still receive pairing from eligible downlines on both legs.
+
   const leftPoints = [];
   const rightPoints = [];
   const allDates = new Set();

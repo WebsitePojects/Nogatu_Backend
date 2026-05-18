@@ -10,7 +10,9 @@ const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName, ENTRY_TYPES } = require('../../utils/helpers');
 const { getLeadershipTraceability } = require('../../services/income/leadership');
 const { getPairingTrace } = require('../../services/income/pairingTracker');
+const { getEffectiveAccountState, getAccountEntryAuditInfo } = require('../../services/accountState');
 const { writeAuditLog } = require('../../services/audit');
+const { resolveTin, isValidTin } = require('../../utils/tin');
 
 const PACKAGE_MAP = {
   10: 'Bronze',
@@ -42,6 +44,16 @@ async function ensureMemberTinColumns() {
   }
 }
 
+function buildRegistrationRangeClause(range = 'all') {
+  if (range === 'week') {
+    return ` AND u.datereg >= DATE_SUB(NOW(), INTERVAL 7 DAY)`;
+  }
+  if (range === 'month') {
+    return ` AND MONTH(u.datereg) = MONTH(NOW()) AND YEAR(u.datereg) = YEAR(NOW())`;
+  }
+  return '';
+}
+
 /**
  * GET /api/admin/accounts?page=1&search=name
  * Account masterlist (paginated, 50 per page)
@@ -52,6 +64,13 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const perPage = 50;
     const offset = (page - 1) * perPage;
     const search = req.query.search || '';
+    const monitorPage = Math.max(1, Number(req.query.monitorPage) || 1);
+    const monitorPerPage = 25;
+    const monitorOffset = (monitorPage - 1) * monitorPerPage;
+    const monitorRange = String(req.query.monitorRange || 'all').trim().toLowerCase();
+    const monitorSort = String(req.query.monitorSort || 'newest').trim().toLowerCase() === 'oldest'
+      ? 'ASC'
+      : 'DESC';
 
     let countQuery = `SELECT COUNT(*) as total FROM memberstab m, usertab u
                       WHERE m.uid = u.uid AND u.uid = u.mainid`;
@@ -73,10 +92,52 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     listQuery += ` ORDER BY u.datereg DESC LIMIT ?, ?`;
 
-    const [countRows] = await pool.query(countQuery, params);
-    const total = Number(countRows[0].total);
+    const monitorWhere = `
+      FROM memberstab m
+      INNER JOIN usertab u ON m.uid = u.uid
+      WHERE u.uid = u.mainid
+      ${buildRegistrationRangeClause(monitorRange)}
+      ${search ? `AND (m.firstname LIKE ? OR m.lastname LIKE ? OR m.username LIKE ?)` : ''}
+    `;
 
-    const [rows] = await pool.query(listQuery, [...params, offset, perPage]);
+    const monitorParams = [];
+    if (search) {
+      const searchPattern = `%${search}%`;
+      monitorParams.push(searchPattern, searchPattern, searchPattern);
+    }
+
+    const [
+      [countRows],
+      [monitorCountRows],
+      [rangeCountRows],
+      [rows],
+      [monitorRows],
+    ] = await Promise.all([
+      pool.query(countQuery, params),
+      pool.query(`SELECT COUNT(*) AS total ${monitorWhere}`, monitorParams),
+      pool.query(
+        `SELECT
+            SUM(CASE WHEN u.datereg >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) AS weekly,
+            SUM(CASE WHEN MONTH(u.datereg) = MONTH(NOW()) AND YEAR(u.datereg) = YEAR(NOW()) THEN 1 ELSE 0 END) AS monthly
+         FROM usertab u
+         WHERE u.uid = u.mainid`
+      ),
+      pool.query(listQuery, [...params, offset, perPage]),
+      pool.query(
+        `SELECT
+            m.uid, m.username, m.firstname, m.lastname, m.middlename,
+            u.currentaccttype, u.codeid, u.account_status,
+            DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg
+         ${monitorWhere}
+         ORDER BY u.datereg ${monitorSort}, m.uid ${monitorSort}
+         LIMIT ?, ?`,
+        [...monitorParams, monitorOffset, monitorPerPage]
+      ),
+    ]);
+
+    const total = Number(countRows.total);
+    const monitorTotal = Number(monitorCountRows.total || 0);
+    const rangeCounts = rangeCountRows || { weekly: 0, monthly: 0 };
 
     const accounts = rows.map(r => ({
       uid: r.uid,
@@ -95,11 +156,38 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
       accountStatusReason: r.account_status_reason || null,
     }));
 
+    const monitoringAccounts = monitorRows.map((r) => ({
+      uid: r.uid,
+      username: r.username,
+      fullname: `${r.firstname} ${r.lastname}`.trim(),
+      firstname: r.firstname,
+      lastname: r.lastname,
+      middlename: r.middlename,
+      accttype: r.currentaccttype,
+      accttypeName: getAccountTypeName(r.currentaccttype),
+      entryType: ENTRY_TYPES[r.codeid] || 'Unknown',
+      datereg: r.datereg,
+      accountStatus: String(r.account_status || 'active').toLowerCase() === 'frozen'
+        ? 'suspended'
+        : String(r.account_status || 'active').toLowerCase(),
+    }));
+
     res.json({
       accounts,
       total,
       page,
       totalPages: Math.ceil(total / perPage),
+      monitoring: {
+        range: monitorRange,
+        sort: monitorSort === 'ASC' ? 'oldest' : 'newest',
+        page: monitorPage,
+        perPage: monitorPerPage,
+        total: monitorTotal,
+        totalPages: Math.max(1, Math.ceil(monitorTotal / monitorPerPage)),
+        weeklyRegistrations: Number(rangeCounts.weekly || 0),
+        monthlyRegistrations: Number(rangeCounts.monthly || 0),
+        accounts: monitoringAccounts,
+      },
     });
   } catch (err) {
     console.error('[Admin Accounts] List error:', err);
@@ -166,9 +254,9 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     let normalizedTin = null;
     if (hasTinField) {
-      normalizedTin = String(tin || tinno || '').trim();
-      if (normalizedTin && (normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin))) {
-        return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+      normalizedTin = resolveTin({ tin, tinno });
+      if (normalizedTin && !isValidTin(normalizedTin)) {
+        return res.status(400).json({ error: 'TIN must contain 9-15 digits and will be saved in grouped format.' });
       }
     }
 
@@ -235,12 +323,12 @@ router.put('/:uid/status', adminAuth, adminRights([1, 3]), async (req, res) => {
     const nextStatus = String(req.body?.status || '').trim().toLowerCase();
     const reason = String(req.body?.reason || '').trim();
 
-    if (!['active', 'suspended', 'frozen'].includes(nextStatus)) {
+    if (!['active', 'suspended'].includes(nextStatus)) {
       return res.status(400).json({ error: 'Invalid account status' });
     }
 
     if (nextStatus !== 'active' && !reason) {
-      return res.status(400).json({ error: 'Reason is required for suspension or freeze.' });
+      return res.status(400).json({ error: 'Reason is required for suspension.' });
     }
 
     conn = await pool.getConnection();
@@ -447,12 +535,13 @@ async function handleIncomeDetails(req, res) {
       ttlcashbalance: 0,
     };
 
-    // Direct referral contributors (paid accounts only).
+    // Direct referral contributors across all package-entry slots.
     const [drefRows] = await pool.query(
       `SELECT m.firstname, m.lastname, m.username,
-              u.currentaccttype, u.datereg, u.directreferral
+              u.uid, u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+              u.datereg, u.directreferral
        FROM usertab u INNER JOIN memberstab m ON m.uid = u.uid
-       WHERE u.drefid = ? AND u.codeid = 1
+       WHERE u.drefid = ?
        ORDER BY u.datereg DESC`,
       [uid]
     );
@@ -521,12 +610,20 @@ async function handleIncomeDetails(req, res) {
       [uid, pairingOffset, pairingPerPage]
     );
 
-    const directReferrals = drefRows.map(r => ({
-      name: `${r.firstname} ${r.lastname}`,
-      username: r.username,
-      pkg: PACKAGE_MAP[r.currentaccttype] || '',
-      datereg: r.datereg,
-      directReferralAmount: Number(r.directreferral || 0),
+    const directReferrals = await Promise.all(drefRows.map(async (r) => {
+      const effectiveRow = await getEffectiveAccountState(r.uid, r);
+      const auditInfo = getAccountEntryAuditInfo(effectiveRow || r);
+      return {
+        name: `${r.firstname} ${r.lastname}`,
+        username: r.username,
+        pkg: PACKAGE_MAP[effectiveRow?.currentaccttype || r.currentaccttype] || '',
+        datereg: r.datereg,
+        directReferralAmount: Number(effectiveRow?.directreferral || r.directreferral || 0),
+        entryType: auditInfo.entryLabel,
+        entryCode: auditInfo.entryCode,
+        sponsorCreditEligible: Boolean(auditInfo.sponsorCreditEligible),
+        sourceBinaryEligible: Boolean(auditInfo.sourceBinaryEligible),
+      };
     }));
 
     const upgradeReferralContributors = upgradeRows.map(r => ({

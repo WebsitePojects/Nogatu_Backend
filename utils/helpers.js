@@ -1,3 +1,5 @@
+const { MAINTENANCE_PRODUCT_TYPES } = require('../constants/maintenanceProductCatalog');
+
 /**
  * Shared helper functions used across the application
  */
@@ -38,16 +40,7 @@ const PRODUCT_TYPES = {
   40: 'Platinum Entry Package',
   50: 'Garnet Entry Package',
   60: 'Diamond Entry Package',
-  100: 'Nogatu Barley Juice',
-  101: 'Nogatu Glow',
-  102: 'Nogatu Collagen Vitamin C',
-  103: 'Nogatu Coffee Mix',
-  104: 'Chocolate Drink Mix',
-  105: 'Mangosteen Coffee Mix',
-  106: 'Vitamin C',
-  107: 'Max Fuel Coffee Drink Mix',
-  108: 'Black Coffee',
-  109: 'Berry NAD+',
+  ...MAINTENANCE_PRODUCT_TYPES,
 };
 
 // Code type prefix mapping

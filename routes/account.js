@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
+const { resolveTin, isValidTin } = require('../utils/tin');
 const { listPackagePolicies } = require('../services/packagePolicy');
 
 let memberTinColumnsReady = false;
@@ -130,9 +131,9 @@ router.put('/', memberAuth, async (req, res) => {
     }
 
     if (hasTinField) {
-      normalizedTin = String(tin || tinno || '').trim();
-      if (normalizedTin && (normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin))) {
-        return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+      normalizedTin = resolveTin({ tin, tinno });
+      if (normalizedTin && !isValidTin(normalizedTin)) {
+        return res.status(400).json({ error: 'TIN must contain 9-15 digits and will be saved in grouped format.' });
       }
     }
 

@@ -38,6 +38,11 @@ async function ensureMemberTinColumn() {
     await pool.query('ALTER TABLE memberstab MODIFY COLUMN contactnos VARCHAR(30) DEFAULT NULL');
   }
 
+  const [addressColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'address'");
+  if (addressColumns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN address VARCHAR(255) DEFAULT NULL');
+  }
+
   const [dobColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'dob'");
   if (dobColumns.length === 0) {
     await pool.query('ALTER TABLE memberstab ADD COLUMN dob VARCHAR(30) DEFAULT NULL');
@@ -88,6 +93,28 @@ async function releasePlacementLocks(conn, lockKeys) {
       if (error.code === 'ER_NO_SUCH_TABLE') continue;
       throw error;
     }
+  }
+}
+
+async function acquireRegistrationAdvisoryLocks(conn, lockKeys = []) {
+  const acquired = [];
+  for (const rawKey of lockKeys) {
+    const lockKey = String(rawKey || '').trim();
+    if (!lockKey) continue;
+    const [rows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
+    if (Number(rows[0]?.lockState || 0) !== 1) {
+      throw new Error('Registration is busy right now. Please try again.');
+    }
+    acquired.push(lockKey);
+  }
+  return acquired;
+}
+
+async function releaseRegistrationAdvisoryLocks(conn, lockKeys = []) {
+  for (const lockKey of lockKeys) {
+    try {
+      await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]);
+    } catch {}
   }
 }
 
@@ -403,22 +430,24 @@ async function registerMember({
   activationCode, sponsorUid, placementUid, username, password,
   firstname, lastname, middlename, tin, email, position,
   requestedPosition = null, placementPolicy = null, referralToken = null,
-  contactno = '', dob = '', requestId = null,
+  address = '', contactno = '', dob = '', requestId = null,
 }) {
   await ensureMemberTinColumn();
 
   const conn = await pool.getConnection();
   const lockKeys = [];
+  let advisoryLocks = [];
   try {
     await conn.beginTransaction();
 
-    const normalizedTin = String(tin || '').trim();
+    const normalizedTin = normalizeTin(tin);
     const normalizedEmail = normalizeEmail(email);
+    const normalizedAddress = String(address || '').trim().slice(0, 255);
     const normalizedContactNo = normalizeContactNo(contactno);
     const normalizedDob = normalizeDob(dob);
     const normalizedUsername = sanitizeAlphaNum(username);
 
-    if (!normalizedTin || normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin)) {
+    if (!normalizedTin || !isValidTin(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
     if (!isValidEmail(normalizedEmail)) {
@@ -442,6 +471,13 @@ async function registerMember({
       ? Number(placementPolicy.forcedPosition)
       : Number(position);
     const requestedPositionValue = requestedPosition == null ? Number(position) : Number(requestedPosition);
+
+    advisoryLocks = await acquireRegistrationAdvisoryLocks(conn, [
+      `registration:code:${String(activationCode || '').trim().toLowerCase()}`,
+      `registration:username:${String(username || '').trim().toLowerCase()}`,
+      referralToken ? `registration:referral:${String(referralToken).trim().toLowerCase()}` : '',
+      `registration:sponsor:${Number(sponsorUid || 0)}`,
+    ]);
 
     lockKeys.push(`placement:${Number(placementUid)}:${enforcedPosition}`);
     if (placementPolicy?.mode === 'forced') {
@@ -496,9 +532,9 @@ async function registerMember({
 
     const hashedPassword = await bcrypt.hash(password, 12);
     await conn.query(
-      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email, contactnos, dob)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [newCountId, newUid, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin, normalizedEmail.slice(0, 180), normalizedContactNo || null, normalizedDob || null]
+      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email, address, contactnos, dob)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newCountId, newUid, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin, normalizedEmail.slice(0, 180), normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
     );
 
     await conn.query(
@@ -557,7 +593,7 @@ async function registerMember({
     await appendActivationCodeUsage(conn, {
       code: activationCode,
       codeRowId: codeData.id || null,
-      eventType: 'registration-used',
+      eventType: 'registration_use',
       fromUid: Number(sponsorUid),
       toUid: Number(newUid),
       actorUid: Number(sponsorUid),
@@ -599,6 +635,7 @@ async function registerMember({
     await conn.rollback();
     throw err;
   } finally {
+    await releaseRegistrationAdvisoryLocks(conn, advisoryLocks);
     await releasePlacementLocks(conn, lockKeys);
     conn.release();
   }
