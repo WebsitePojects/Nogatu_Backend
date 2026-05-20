@@ -3,7 +3,7 @@
  * 1:1 port of PHP income-dref-fnc.php :: get_DREF($id)
  *
  * Income Type 1 (income1)
- * - Sums directreferral values from all paid direct referrals
+ * - Sums directreferral values from all package-entry direct referrals
  * - Adds Hi-Five bonus per 5 referrals of same account type
  * - Adds upgrade incentive points from direct referrals
  */
@@ -17,17 +17,7 @@ function toNumber(value) {
 function countsForDirectReferralSource(row) {
   if (!row) return false;
 
-  if (toNumber(row.codeid) === 1) {
-    return true;
-  }
-
-  if (
-    toNumber(row.codeid) === 3 &&
-    (
-      toNumber(row.cdstatus) === 2 ||
-      (toNumber(row.cdamount) > 0 && toNumber(row.cdtotal) >= toNumber(row.cdamount))
-    )
-  ) {
+  if ([1, 2, 3].includes(toNumber(row.codeid))) {
     return true;
   }
 

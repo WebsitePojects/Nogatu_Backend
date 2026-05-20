@@ -1,10 +1,14 @@
 const crypto = require('crypto');
 const { pool } = require('../../config/database');
-const { ACCOUNT_TYPES, PRODUCT_TYPES, previousMonthRange, nowMySQL } = require('../../utils/helpers');
+const { ACCOUNT_TYPES, PRODUCT_TYPES, currentMonthRange, nowMySQL } = require('../../utils/helpers');
 const { writeAuditLog } = require('../audit');
 const { createProcessKey, createPublicId } = require('../../utils/security');
 const { getEffectiveAccountState } = require('../accountState');
 const { countsForDirectReferralSource } = require('./directReferral');
+const {
+  HIFIVE_PRODUCT_TYPE_TO_KEY,
+  HIFIVE_PRODUCT_METADATA,
+} = require('../../constants/maintenanceProductCatalog');
 
 const PRODUCT_COLS = {
   bl: 'prod0',
@@ -18,29 +22,9 @@ const PRODUCT_COLS = {
   bkc: 'prod8',
 };
 
-const PRODUCT_TYPE_TO_KEY = {
-  100: 'bl',
-  101: 'gl',
-  102: 'glc',
-  103: 'cm',
-  104: 'cd',
-  105: 'mgt',
-  106: 'vz',
-  107: 'cmm',
-  108: 'bkc',
-};
+const PRODUCT_TYPE_TO_KEY = HIFIVE_PRODUCT_TYPE_TO_KEY;
 
-const PRODUCT_METADATA = {
-  bl: { code: 100, name: 'Nogatu Barley Juice', purchasePoints: 50 },
-  gl: { code: 101, name: 'Nogatu Glow', purchasePoints: 45 },
-  glc: { code: 102, name: 'Nogatu Collagen Vitamin C', purchasePoints: 40 },
-  cm: { code: 103, name: 'Nogatu Coffee Mix', purchasePoints: 40 },
-  cd: { code: 104, name: 'Chocolate Drink Mix', purchasePoints: 45 },
-  mgt: { code: 105, name: 'Mangosteen Coffee Mix', purchasePoints: 30 },
-  vz: { code: 106, name: 'Vitamin C', purchasePoints: 40 },
-  cmm: { code: 107, name: 'Max Fuel Coffee Drink Mix', purchasePoints: 100 },
-  bkc: { code: 108, name: 'Black Coffee', purchasePoints: 10 },
-};
+const PRODUCT_METADATA = HIFIVE_PRODUCT_METADATA;
 
 const PACKAGE_RULES = [
   { key: 'bronze', code: 10, name: 'Bronze' },
@@ -229,7 +213,7 @@ async function getDirectReferralProductPurchases(uid) {
 }
 
 async function getMaintenanceProductPoints(uid) {
-  const { start, end } = previousMonthRange();
+  const { start, end } = currentMonthRange();
 
   const [rows] = await pool.query(
     `SELECT SUM(incentivepoints1) AS ttlpoints
@@ -368,7 +352,7 @@ function formatPackageClaimRow(row, rewardAmounts = {}) {
   };
 }
 
-async function listPackageClaims({ page = 1, perPage = 30, status = '', startDate = '', endDate = '' } = {}) {
+async function listPackageClaims({ page = 1, perPage = 30, status = '', startDate = '', endDate = '', packageKey = '' } = {}) {
   if (!(await hasHiFiveQualificationTable())) {
     return { records: [], total: 0, page: 1, totalPages: 0 };
   }
@@ -377,6 +361,7 @@ async function listPackageClaims({ page = 1, perPage = 30, status = '', startDat
   const safePerPage = Math.min(100, Math.max(1, Number(perPage) || 30));
   const offset = (safePage - 1) * safePerPage;
   const safeStatus = String(status || '').trim();
+  const safePackageKey = String(packageKey || '').trim().toLowerCase();
 
   const where = [`hq.hifive_type = 'package'`];
   const params = [];
@@ -384,6 +369,10 @@ async function listPackageClaims({ page = 1, perPage = 30, status = '', startDat
   if (safeStatus) {
     where.push('hq.status = ?');
     params.push(safeStatus);
+  }
+  if (safePackageKey) {
+    where.push('LOWER(hq.package_or_product) = ?');
+    params.push(safePackageKey);
   }
   if (startDate) {
     where.push("DATE_FORMAT(hq.created_at, '%Y-%m-%d') >= ?");
@@ -423,6 +412,105 @@ async function listPackageClaims({ page = 1, perPage = 30, status = '', startDat
     total,
     page: safePage,
     totalPages: Math.ceil(total / safePerPage),
+  };
+}
+
+async function getPackageClaimDetails(qualificationUid) {
+  if (!(await hasHiFiveQualificationTable())) {
+    throw new Error('Package Hi-Five claims are not ready because the qualification table is missing.');
+  }
+
+  const [claimRows, rewardAmounts] = await Promise.all([
+    pool.query(
+      `SELECT hq.*, m.username, m.firstname, m.lastname
+       FROM hifive_qualificationstab hq
+       LEFT JOIN memberstab m ON m.uid = hq.member_uid
+       WHERE hq.qualification_uid = ?
+       LIMIT 1`,
+      [qualificationUid]
+    ).then(([rows]) => rows),
+    getPackageRewardAmounts(),
+  ]);
+
+  if (claimRows.length === 0) {
+    throw new Error('Package claim not found.');
+  }
+
+  const claim = formatPackageClaimRow(claimRows[0], rewardAmounts);
+  const status = await buildHiFiveStatus(claim.memberUid);
+  const packageContributors = (status.packageBonus?.packages || []).find((item) => item.key === claim.packageKey)?.contributors || [];
+  const contributorUids = packageContributors.map((item) => Number(item.uid || 0)).filter((value) => value > 0);
+
+  let registrationAuditRows = [];
+  let codeUsageRows = [];
+  if (contributorUids.length > 0) {
+    const placeholders = contributorUids.map(() => '?').join(',');
+    registrationAuditRows = await pool.query(
+      `SELECT new_member_uid, sponsor_uid, referral_slug, activation_code, requested_position,
+              enforced_position, placement_policy_mode, placement_policy_reason,
+              registration_ip, device_fingerprint, status, consumed_at
+       FROM public_registration_audittab
+       WHERE new_member_uid IN (${placeholders})`,
+      contributorUids
+    ).then(([rows]) => rows).catch(() => []);
+
+    codeUsageRows = await pool.query(
+      `SELECT to_uid, code, event_type, from_uid, actor_uid, referral_token, notes, process_key
+       FROM activation_code_usagetab
+       WHERE to_uid IN (${placeholders})`,
+      contributorUids
+    ).then(([rows]) => rows).catch(() => []);
+  }
+
+  const auditByUid = new Map();
+  for (const row of registrationAuditRows) {
+    auditByUid.set(Number(row.new_member_uid || 0), row);
+  }
+  const usageByUid = new Map();
+  for (const row of codeUsageRows) {
+    usageByUid.set(Number(row.to_uid || 0), row);
+  }
+
+  return {
+    claim,
+    summary: {
+      totalContributors: packageContributors.length,
+      totalQualifiedSets: Math.floor(packageContributors.length / 5),
+      currentStatus: claim.status,
+      currentStatusLabel: claim.statusLabel,
+      totalPayout: claim.totalPayout,
+    },
+    contributors: packageContributors.map((contributor, index) => {
+      const audit = auditByUid.get(Number(contributor.uid || 0)) || null;
+      const usage = usageByUid.get(Number(contributor.uid || 0)) || null;
+      return {
+        orderNo: index + 1,
+        ...contributor,
+        registrationAudit: audit ? {
+          activationCode: audit.activation_code || null,
+          referralSlug: audit.referral_slug || null,
+          requestedPosition: audit.requested_position ?? null,
+          enforcedPosition: audit.enforced_position ?? null,
+          placementPolicyMode: audit.placement_policy_mode || null,
+          placementPolicyReason: audit.placement_policy_reason || null,
+          registrationIp: audit.registration_ip || null,
+          consumedAt: audit.consumed_at || null,
+        } : null,
+        codeUsage: usage ? {
+          code: usage.code || null,
+          eventType: usage.event_type || null,
+          referralToken: usage.referral_token || null,
+          processKey: usage.process_key || null,
+          notes: (() => {
+            try {
+              return usage.notes ? JSON.parse(usage.notes) : null;
+            } catch {
+              return usage.notes || null;
+            }
+          })(),
+        } : null,
+      };
+    }),
   };
 }
 
@@ -802,4 +890,5 @@ module.exports = {
   approvePackageClaim,
   rejectPackageClaim,
   formatPackageClaimRow,
+  getPackageClaimDetails,
 };

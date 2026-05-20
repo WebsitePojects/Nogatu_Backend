@@ -34,8 +34,7 @@ router.get('/', memberAuth, async (req, res) => {
       `SELECT COUNT(*) AS rankPosition
        FROM rankingstab r
        INNER JOIN usertab u ON u.uid = r.uid
-       WHERE u.codeid = 1
-         AND u.uid = u.mainid
+       WHERE u.uid = u.mainid
          AND (
            GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) > ?
            OR (
@@ -90,10 +89,14 @@ router.get('/', memberAuth, async (req, res) => {
       isCurrentUser: Number(row.uid) === uid,
     }));
 
+    const aheadCount = Number(rankRows[0]?.rankPosition || 0);
+    const userLeaderboardPosition = leaderboardResult.total > 0 ? aheadCount + 1 : 0;
+
     res.json({
       leaderboard,
       rankDefinitions,
-      userRank: Number(rankRows[0]?.rankPosition || null),
+      userRank: userLeaderboardPosition,
+      userLeaderboardPosition,
       userPoints: userGross,
       userRepurchasePoints: userGross,
       userGrossRankablePoints: userGross,

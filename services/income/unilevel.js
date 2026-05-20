@@ -18,9 +18,7 @@ const { getPackagePolicy } = require('../packagePolicy');
  * Get total repurchase points for a user in previous month
  * Mirrors PHP get_totalpoints()
  */
-async function getTotalPoints(uid) {
-  const { start, end } = previousMonthRange();
-
+async function getTotalPointsForRange(uid, start, end) {
   const [rows] = await pool.query(
     `SELECT SUM(incentivepoints1) as ttlpoints
      FROM repurchasetab
@@ -32,6 +30,11 @@ async function getTotalPoints(uid) {
   );
 
   return Number(rows[0]?.ttlpoints || 0);
+}
+
+async function getTotalPoints(uid) {
+  const { start, end } = previousMonthRange();
+  return getTotalPointsForRange(uid, start, end);
 }
 
 /**
@@ -86,7 +89,7 @@ async function updateIncomeTransDate(uid, incomeType) {
  * @param {number} level - Current level (1-10)
  * @param {{ ctlLevel: number, totals: { lev1: number, lev23: number, lev45: number, lev610: number } }} state
  */
-async function calculateUnilevel(parent, level, state) {
+async function calculateUnilevel(parent, level, state, getPointsForUid) {
   if (level > 10 || level > Number(state.maxReach || 10)) return;
 
   const [rows] = await pool.query(
@@ -96,7 +99,7 @@ async function calculateUnilevel(parent, level, state) {
 
   for (const row of rows) {
     if (level >= 1 && level <= 10) {
-      const uidPurchases = await getTotalPoints(row.uid);
+      const uidPurchases = await getPointsForUid(row.uid);
 
       if (uidPurchases > 0 && state.ctlLevel <= 10 && state.ctlLevel <= level) {
         state.ctlLevel += 1;
@@ -112,23 +115,29 @@ async function calculateUnilevel(parent, level, state) {
       }
     }
 
-    await calculateUnilevel(row.uid, level + 1, state);
+    await calculateUnilevel(row.uid, level + 1, state, getPointsForUid);
   }
 }
 
-/**
- * Get unilevel income for a user
- * @param {number} uid - User ID
- * @returns {number} Total unilevel income
- */
-async function getUnilevel(uid) {
-  // Check maintenance requirement
-  const hasMaintenance = await checkLastMaintenance(uid);
-  if (!hasMaintenance) return 0;
+async function calculateUnilevelForWindow(uid, options = {}) {
+  const {
+    start,
+    end,
+    requireMaintenance = true,
+    preventDuplicateCredit = true,
+  } = options;
 
-  // Check if already calculated this month
-  const alreadyCalculated = await checkUnilevelTransDate(uid);
-  if (alreadyCalculated) return 0;
+  if (!start || !end) return 0;
+
+  if (requireMaintenance) {
+    const selfPoints = await getTotalPointsForRange(uid, start, end);
+    if (selfPoints < 200) return 0;
+  }
+
+  if (preventDuplicateCredit) {
+    const alreadyCalculated = await checkUnilevelTransDate(uid);
+    if (alreadyCalculated) return 0;
+  }
 
   const [packageRows] = await pool.query(
     'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
@@ -141,25 +150,56 @@ async function getUnilevel(uid) {
     maxReach: Number(packagePolicy.unilevelReach || 0) || 0,
     totals: { lev1: 0, lev23: 0, lev45: 0, lev610: 0 },
   };
+
   if (state.maxReach <= 0) {
     return 0;
   }
-  await calculateUnilevel(uid, 1, state);
 
-  // Apply percentage rates
-  const unilevel1 = state.totals.lev1 * 0.05;    // 5%
-  const unilevel23 = state.totals.lev23 * 0.03;  // 3%
-  const unilevel45 = state.totals.lev45 * 0.02;  // 2%
-  const unilevel610 = state.totals.lev610 * 0.01; // 1%
+  await calculateUnilevel(uid, 1, state, (memberUid) => getTotalPointsForRange(memberUid, start, end));
+
+  const unilevel1 = state.totals.lev1 * 0.05;
+  const unilevel23 = state.totals.lev23 * 0.03;
+  const unilevel45 = state.totals.lev45 * 0.02;
+  const unilevel610 = state.totals.lev610 * 0.01;
 
   const total = unilevel1 + unilevel23 + unilevel45 + unilevel610;
 
-  // Update transaction date
-  if (total > 0) {
+  if (preventDuplicateCredit && total > 0) {
     await updateIncomeTransDate(uid, 4);
   }
 
   return total;
 }
 
-module.exports = { getUnilevel, checkLastMaintenance, checkUnilevelTransDate };
+/**
+ * Get unilevel income for a user
+ * @param {number} uid - User ID
+ * @returns {number} Total unilevel income
+ */
+async function getUnilevel(uid) {
+  const { start, end } = previousMonthRange();
+  return calculateUnilevelForWindow(uid, {
+    start,
+    end,
+    requireMaintenance: true,
+    preventDuplicateCredit: true,
+  });
+}
+
+async function getProjectedCurrentMonthUnilevel(uid) {
+  const { start, end } = currentMonthRange();
+  return calculateUnilevelForWindow(uid, {
+    start,
+    end,
+    requireMaintenance: false,
+    preventDuplicateCredit: false,
+  });
+}
+
+module.exports = {
+  getUnilevel,
+  checkLastMaintenance,
+  checkUnilevelTransDate,
+  getProjectedCurrentMonthUnilevel,
+  getTotalPointsForRange,
+};

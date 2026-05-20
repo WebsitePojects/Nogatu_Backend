@@ -196,15 +196,6 @@ function writeWorkbook(res, filename, sheets, format = 'xlsx') {
     addSheet(workbook, name, rows.rows, rows.widths || []);
   }
 
-  if (format === 'csv') {
-    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-    const csv = XLSX.utils.sheet_to_csv(firstSheet);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
-    res.send(csv);
-    return;
-  }
-
   const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
@@ -219,6 +210,14 @@ function money(value) {
 }
 
 function buildEncashmentPdfDefinition(records, summary, filters) {
+  const dailyRows = summary.daily || [];
+  const dailyScale = Math.max(1, ...dailyRows.map((row) => Number(row.grossEncashment || 0)));
+  const payoutMix = records.reduce((acc, row) => {
+    const key = row.payoutOption || 'N/A';
+    acc[key] = (acc[key] || 0) + Number(row.encashment || 0);
+    return acc;
+  }, {});
+  const payoutScale = Math.max(1, ...Object.values(payoutMix), 1);
   return {
     fileName: `encashment-report-${filters.startDate || 'all'}-${filters.endDate || 'latest'}`,
     title: 'Encashment Management Report',
@@ -238,6 +237,28 @@ function buildEncashmentPdfDefinition(records, summary, filters) {
       { label: 'Paid Requests', value: String(summary.overview.paidCount || 0), color: '#15803d' },
       { label: 'Pending Requests', value: String(summary.overview.pendingCount || 0), color: '#b45309' },
       { label: 'Members Covered', value: String(summary.overview.uniqueMembers || 0), color: '#1d4ed8' },
+    ],
+    charts: [
+      {
+        title: 'Daily Gross Encashment',
+        note: 'Gross request volume by day for the current filter scope.',
+        bars: dailyRows.slice(0, 10).map((row) => ({
+          label: row.date,
+          valueLabel: money(row.grossEncashment),
+          percent: Math.max(4, Math.round((Number(row.grossEncashment || 0) / dailyScale) * 100)),
+          color: '#d97706',
+        })),
+      },
+      {
+        title: 'Payout Option Mix',
+        note: 'Requested encashment amount grouped by payout option.',
+        bars: Object.entries(payoutMix).map(([label, value]) => ({
+          label,
+          valueLabel: money(value),
+          percent: Math.max(4, Math.round((Number(value || 0) / payoutScale) * 100)),
+          color: '#1d4ed8',
+        })),
+      },
     ],
     tables: [
       {
@@ -322,7 +343,7 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
     const endDate = (req.query.endDate || '').trim();
     const q = (req.query.q || '').trim();
     const rawFormat = String(req.query.format || 'xlsx').toLowerCase();
-    const format = rawFormat === 'csv' ? 'csv' : rawFormat === 'pdf' || rawFormat === 'crystal' ? rawFormat : 'xlsx';
+    const format = rawFormat === 'pdf' || rawFormat === 'crystal' ? rawFormat : 'xlsx';
     const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q });
     const records = await fetchEncashmentRows({ whereSql, whereParams });
     const summary = buildEncashmentSummary(records);

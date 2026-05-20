@@ -17,7 +17,7 @@ const { getPairing, savePairingReport } = require('./pairing');
 const { getLeadershipBonus } = require('./leadership');
 const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('./unilevel');
 const { insertIncome } = require('./insertIncome');
-const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
+const { getEffectiveAccountState } = require('../accountState');
 const { getPackagePolicy } = require('../packagePolicy');
 const { applyLifetimeIncomeCeiling } = require('./incomeCapPolicy');
 
@@ -51,9 +51,10 @@ async function calculateAndStoreIncome(uid, accttype) {
     const stored = totals[0] || {};
     const beginningBalance = Number(stored.ttlcashbalance || 0);
 
-    // Pairing income eligibility mirrors production ewallet.php rules.
-    const member = await getEffectiveAccountState(uid);
-    const canEarnPairing = countsForPairingSource(member);
+    // Production ewallet.php allows all accounts to receive pairing income
+    // when eligible source nodes exist on both legs; only source-node
+    // contribution is restricted by effective account state.
+    await getEffectiveAccountState(uid);
 
     // ── Continuous income (deduplication via Math.max) ───────────────
     const drefResult = await getDREF(uid);
@@ -61,11 +62,12 @@ async function calculateAndStoreIncome(uid, accttype) {
     const leadershipAmount = await getLeadershipBonus(uid);
 
     const newDref = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
-    const newPairing = canEarnPairing
-      ? Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0))
-      : 0;
+    const newPairing = Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0));
     const newLeadership = Math.max(0, leadershipAmount - Number(stored.ttlincome3 || 0));
-    const newHifive = Math.max(0, drefResult.hifive - Number(stored.ttlincome5 || 0));
+    // Package Hi-Five cash is release-controlled through the claim-review flow.
+    // Keep wallet/dashboard calculation from auto-crediting income5, or the same
+    // entitlement can be credited again when admin approves the claim.
+    const newHifive = 0;
 
     // ── Monthly income — unilevel (incometype=4) ─────────────────────
     let activeUnilevel = 0;
@@ -117,7 +119,7 @@ async function calculateAndStoreIncome(uid, accttype) {
     }
 
     // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
-    if (canEarnPairing && pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
+    if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
       await savePairingReport(uid, pairingResult.dailyReports);
     }
 
