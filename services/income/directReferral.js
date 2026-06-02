@@ -8,21 +8,10 @@
  * - Adds upgrade incentive points from direct referrals
  */
 const { pool } = require('../../config/database');
-const { getEffectiveAccountState } = require('../accountState');
-
-function toNumber(value) {
-  return Number(value || 0);
-}
-
-function countsForDirectReferralSource(row) {
-  if (!row) return false;
-
-  if ([1, 2, 3].includes(toNumber(row.codeid))) {
-    return true;
-  }
-
-  return false;
-}
+const {
+  getEffectiveAccountState,
+  countsForDirectReferralSource,
+} = require('../accountState');
 
 /**
  * Calculate Direct Referral income for a user

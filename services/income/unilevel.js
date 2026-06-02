@@ -11,7 +11,7 @@
  * - Requires monthly maintenance (>= 200 points)
  */
 const { pool } = require('../../config/database');
-const { previousMonthRange, currentMonthRange } = require('../../utils/helpers');
+const { previousMonthRange, currentMonthRange, PRODUCT_TYPES } = require('../../utils/helpers');
 const { getPackagePolicy } = require('../packagePolicy');
 
 /**
@@ -196,10 +196,117 @@ async function getProjectedCurrentMonthUnilevel(uid) {
   });
 }
 
+function getUnilevelRateForLevel(level) {
+  const numericLevel = Number(level || 0);
+  if (numericLevel === 1) return 0.05;
+  if (numericLevel >= 2 && numericLevel <= 3) return 0.03;
+  if (numericLevel >= 4 && numericLevel <= 5) return 0.02;
+  if (numericLevel >= 6 && numericLevel <= 10) return 0.01;
+  return 0;
+}
+
+function buildInClause(values = []) {
+  return values.map(() => '?').join(', ');
+}
+
+async function getUnilevelProductPointContributors(uid, options = {}) {
+  const { start, end } = options.start && options.end ? options : currentMonthRange();
+  const [packageRows] = await pool.query(
+    'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
+    [uid]
+  );
+  const policy = getPackagePolicy(packageRows[0]?.currentaccttype || 0);
+  const maxReach = Math.max(0, Math.min(10, Number(options.maxReach || policy.unilevelReach || 0)));
+
+  if (!maxReach) {
+    return {
+      rows: [],
+      totalPoints: 0,
+      projectedAmount: 0,
+      maxReach,
+    };
+  }
+
+  let parents = [Number(uid)];
+  const rows = [];
+
+  for (let level = 1; level <= maxReach && parents.length > 0; level += 1) {
+    const parentPlaceholders = buildInClause(parents);
+    const [children] = await pool.query(
+      `SELECT u.uid, u.drefid, u.currentaccttype,
+              m.username, m.firstname, m.lastname
+         FROM usertab u
+         LEFT JOIN memberstab m ON m.uid = u.uid
+        WHERE u.drefid IN (${parentPlaceholders})
+        ORDER BY u.id ASC`,
+      parents
+    );
+
+    const childUids = children.map((child) => Number(child.uid || 0)).filter(Boolean);
+    if (childUids.length === 0) {
+      parents = [];
+      continue;
+    }
+
+    const childByUid = new Map(children.map((child) => [Number(child.uid), child]));
+    const childPlaceholders = buildInClause(childUids);
+    const [pointRows] = await pool.query(
+      `SELECT uid, producttype,
+              COALESCE(SUM(incentivepoints1), 0) AS product_points,
+              COUNT(*) AS purchase_count,
+              MAX(transdate) AS last_transdate
+         FROM repurchasetab
+        WHERE uid IN (${childPlaceholders})
+          AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+          AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
+          AND producttype >= 100
+        GROUP BY uid, producttype
+        HAVING product_points > 0
+        ORDER BY last_transdate DESC`,
+      [...childUids, start, end]
+    );
+
+    const rate = getUnilevelRateForLevel(level);
+    for (const pointRow of pointRows) {
+      const source = childByUid.get(Number(pointRow.uid)) || {};
+      const points = Number(pointRow.product_points || 0);
+      rows.push({
+        uid: Number(pointRow.uid || 0),
+        username: source.username || null,
+        fullname: `${source.firstname || ''} ${source.lastname || ''}`.trim() || source.username || 'Not available',
+        level,
+        producttype: Number(pointRow.producttype || 0),
+        productName: PRODUCT_TYPES[Number(pointRow.producttype || 0)] || `Product ${pointRow.producttype}`,
+        productPoints: points,
+        purchaseCount: Number(pointRow.purchase_count || 0),
+        ratePercent: rate * 100,
+        amount: points * rate,
+        projectedAmount: points * rate,
+        transdate: pointRow.last_transdate,
+        rowType: 'downline_product_points',
+      });
+    }
+
+    parents = childUids;
+  }
+
+  const totalPoints = rows.reduce((sum, row) => sum + Number(row.productPoints || 0), 0);
+  const projectedAmount = rows.reduce((sum, row) => sum + Number(row.projectedAmount || row.amount || 0), 0);
+
+  return {
+    rows,
+    totalPoints,
+    projectedAmount,
+    maxReach,
+  };
+}
+
 module.exports = {
   getUnilevel,
   checkLastMaintenance,
   checkUnilevelTransDate,
   getProjectedCurrentMonthUnilevel,
+  getUnilevelProductPointContributors,
+  getUnilevelRateForLevel,
   getTotalPointsForRange,
 };

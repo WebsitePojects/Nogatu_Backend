@@ -3,7 +3,13 @@ const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAccountTypeName } = require('../../utils/helpers');
-const { PACKAGE_AMOUNTS, grantVouchersToExistingMembers } = require('../../services/voucher');
+const {
+  PACKAGE_AMOUNTS,
+  buildVoucherExpiryLabel,
+  grantVouchersToExistingMembers,
+  getVoucherExpiryMode,
+  UNUSED_VOUCHER_EXPIRY_MONTHS,
+} = require('../../services/voucher');
 
 async function ensureVoucherTables() {
   await pool.query(
@@ -15,9 +21,8 @@ async function ensureVoucherTables() {
       remaining_balance DECIMAL(12,2) NOT NULL,
       issued_date DATETIME NOT NULL,
       expiry_date DATETIME NOT NULL,
-      first_use_at DATETIME DEFAULT NULL,
-      first_use_expires_at DATETIME DEFAULT NULL,
-      first_use_status TINYINT NOT NULL DEFAULT 0,
+      first_used_at DATETIME DEFAULT NULL,
+      use_expires_at DATETIME DEFAULT NULL,
       status INT DEFAULT 1,
       redeemed_date DATETIME DEFAULT NULL,
       suspend_reason VARCHAR(500) DEFAULT NULL,
@@ -92,6 +97,8 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               v.suspend_reason,
               DATE_FORMAT(v.issued_date, '%Y-%m-%d %H:%i') AS issued_at,
               DATE_FORMAT(v.expiry_date, '%Y-%m-%d %H:%i') AS expiry_at,
+              DATE_FORMAT(v.first_used_at, '%Y-%m-%d %H:%i') AS first_used_at,
+              DATE_FORMAT(v.use_expires_at, '%Y-%m-%d %H:%i') AS use_expires_at,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
        LEFT JOIN memberstab m ON m.uid = v.uid
@@ -111,19 +118,31 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
     );
 
     res.json({
-      vouchers: rows.map((row) => ({
-        id: Number(row.id),
-        uid: Number(row.uid),
-        username: row.username,
-        fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,
-        package: getAccountTypeName(row.package_type),
-        amount: Number(row.voucher_amount || 0),
-        remaining: Number(row.remaining_balance || 0),
-        status: Number(row.status || 0),
-        issuedAt: row.issued_at,
-        expiryAt: row.expiry_at,
-        suspendReason: row.suspend_reason,
-      })),
+      vouchers: rows.map((row) => {
+        const expiryMode = getVoucherExpiryMode(row);
+        return {
+          id: Number(row.id),
+          uid: Number(row.uid),
+          username: row.username,
+          fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,
+          package: getAccountTypeName(row.package_type),
+          amount: Number(row.voucher_amount || 0),
+          remaining: Number(row.remaining_balance || 0),
+          status: Number(row.status || 0),
+          issuedAt: row.issued_at,
+          expiryAt: row.expiry_at,
+          firstUsedAt: row.first_used_at,
+          useExpiresAt: row.use_expires_at,
+          expiryMode,
+          expiryLabel: buildVoucherExpiryLabel({
+            unusedExpiryDate: row.expiry_at,
+            usedExpiryDate: row.use_expires_at,
+            firstUsedAt: row.first_used_at,
+            status: row.status,
+          }),
+          suspendReason: row.suspend_reason,
+        };
+      }),
       counts: {
         all: Number(countsRows[0]?.allCount || 0),
         active: Number(countsRows[0]?.activeCount || 0),
@@ -370,16 +389,9 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
 
       const accttype = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
       const voucherAmount = Number(PACKAGE_AMOUNTS[accttype] || 0);
-      const expiryDays = {
-        10: 30,
-        20: 40,
-        30: 45,
-        40: 50,
-        50: 55,
-        60: 60,
-      }[accttype];
+      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[accttype] || 0);
 
-      if (!voucherAmount || !expiryDays) {
+      if (!voucherAmount || !expiryMonths) {
         skippedCount += 1;
         continue;
       }
@@ -387,8 +399,8 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
       await connection.query(
         `INSERT INTO voucherstab
            (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY), 1)`,
-        [uid, accttype, voucherAmount, voucherAmount, expiryDays]
+         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
+        [uid, accttype, voucherAmount, voucherAmount, expiryMonths]
       );
 
       granted += 1;

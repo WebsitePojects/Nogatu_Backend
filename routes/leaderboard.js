@@ -25,7 +25,6 @@ router.get('/', memberAuth, async (req, res) => {
     ]);
     const rankDefinitions = userProgress.rankDefinitions || [];
 
-    const userRankRank = Number(userProgress.currentRank || 0);
     const userRemaining = Number(userProgress.remainingRankablePoints || 0);
     const userGross = Number(userProgress.grossRankablePoints || 0);
     const userAwardedAt = String(userProgress.qualifiedDate || '9999-12-31 23:59:59');
@@ -35,37 +34,22 @@ router.get('/', memberAuth, async (req, res) => {
        FROM rankingstab r
        INNER JOIN usertab u ON u.uid = r.uid
        WHERE u.uid = u.mainid
-         AND (
-           GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) > ?
+        AND (
+           COALESCE(r.remaining_rankable_points, 0) > ?
            OR (
-             GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) = ?
-             AND COALESCE(r.remaining_rankable_points, 0) > ?
-           )
-           OR (
-             GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) = ?
-             AND COALESCE(r.remaining_rankable_points, 0) = ?
-             AND COALESCE(r.basis_points, 0) > ?
-           )
-           OR (
-             GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) = ?
-             AND COALESCE(r.remaining_rankable_points, 0) = ?
-             AND COALESCE(r.basis_points, 0) = ?
+             COALESCE(r.remaining_rankable_points, 0) = ?
              AND COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') < ?
            )
            OR (
-             GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) = ?
-             AND COALESCE(r.remaining_rankable_points, 0) = ?
-             AND COALESCE(r.basis_points, 0) = ?
+             COALESCE(r.remaining_rankable_points, 0) = ?
              AND COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') = ?
-             AND r.uid <= ?
+             AND r.uid < ?
            )
          )`,
       [
-        userRankRank,
-        userRankRank, userRemaining,
-        userRankRank, userRemaining, userGross,
-        userRankRank, userRemaining, userGross, userAwardedAt,
-        userRankRank, userRemaining, userGross, userAwardedAt, uid,
+        userRemaining,
+        userRemaining, userAwardedAt,
+        userRemaining, userAwardedAt, uid,
       ]
     );
 
@@ -102,7 +86,7 @@ router.get('/', memberAuth, async (req, res) => {
       userGrossRankablePoints: userGross,
       userRemainingRankablePoints: userRemaining,
       userConsumedPoints: Number(userProgress.consumedPoints || 0),
-      pointsBasis: 'Repurchase points',
+      pointsBasis: 'Product Repurchase Points',
       rankingScope: 'Self + full downline',
       payoutReleaseMode: 'Manual admin release',
       userCurrentRank: Number(userProgress.currentRank || 0),

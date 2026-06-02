@@ -2,6 +2,7 @@ const TAX_RATE = 0.10;
 const PROCESSING_FEE = 50;
 const MAINTENANCE_FEE = 20;
 const CD_DEDUCTION_RATE = 0.25;
+const { resolvePayoutOption } = require('../services/payoutOptions');
 
 function roundMoney(value) {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -39,10 +40,10 @@ function calculateEncashmentBreakdown({
 }
 
 function validatePayoutDetails({ payoutId, payoutDetails } = {}) {
-  const normalizedPayoutId = Number(payoutId || 0);
+  const resolvedPayout = resolvePayoutOption(payoutId, { allowUnknown: false });
   const normalizedDetails = String(payoutDetails || '').trim();
 
-  if (!normalizedPayoutId || normalizedPayoutId < 1) {
+  if (!resolvedPayout) {
     return {
       ok: false,
       code: 'PAYOUT_OPTION_REQUIRED',
@@ -60,7 +61,9 @@ function validatePayoutDetails({ payoutId, payoutDetails } = {}) {
 
   return {
     ok: true,
-    payoutId: normalizedPayoutId,
+    payoutId: resolvedPayout.id,
+    payoutLabel: resolvedPayout.label,
+    payoutStorageValue: resolvedPayout.storageValue,
     payoutDetails: normalizedDetails,
   };
 }

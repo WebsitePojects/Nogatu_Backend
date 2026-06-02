@@ -15,29 +15,7 @@ const {
   renderAdminPdfReport,
   sendPdfReport,
 } = require('../../services/jsreportExport');
-
-const PAYOUT_OPTION_LABELS = {
-  1: 'Pickup',
-  2: 'GCash',
-  3: 'Remittance Center',
-  4: 'Bank Deposit',
-  5: 'Others',
-};
-
-const PAYOUT_OPTION_ID_BY_LABEL = Object.entries(PAYOUT_OPTION_LABELS).reduce((acc, [id, label]) => {
-  acc[label.toLowerCase()] = Number(id);
-  return acc;
-}, {});
-
-const PAYOUT_OPTION_ALIASES = {
-  pickup: 'Pickup',
-  gcash: 'GCash',
-  'g cash': 'GCash',
-  'remittance center': 'Remittance Center',
-  'remittance centers': 'Remittance Center',
-  'bank deposit': 'Bank Deposit',
-  others: 'Others',
-};
+const { resolvePayoutOption: resolveSinglePayoutOption } = require('../../services/payoutOptions');
 
 const PACKAGE_LABELS = {
   10: 'Bronze',
@@ -79,38 +57,10 @@ function buildEncashmentWhereClause({ startDate = '', endDate = '', q = '' }) {
 }
 
 function normalizePayoutOption(rawValue) {
-  if (rawValue == null) return null;
-
-  const trimmed = String(rawValue).trim();
-  if (!trimmed) return null;
-
-  const numericId = Number(trimmed);
-  if (Number.isFinite(numericId) && PAYOUT_OPTION_LABELS[numericId]) {
-    return {
-      id: numericId,
-      label: PAYOUT_OPTION_LABELS[numericId],
-      raw: trimmed,
-    };
-  }
-
-  const normalizedKey = trimmed.toLowerCase().replace(/\s+/g, ' ');
-  const canonicalLabel = PAYOUT_OPTION_ALIASES[normalizedKey];
-  if (canonicalLabel) {
-    return {
-      id: PAYOUT_OPTION_ID_BY_LABEL[canonicalLabel.toLowerCase()] || null,
-      label: canonicalLabel,
-      raw: trimmed,
-    };
-  }
-
-  return {
-    id: null,
-    label: trimmed,
-    raw: trimmed,
-  };
+  return resolveSinglePayoutOption(rawValue, { allowUnknown: true });
 }
 
-function resolvePayoutOption(historyOption, profileOption) {
+function resolvePreferredPayoutOption(historyOption, profileOption) {
   return normalizePayoutOption(historyOption) || normalizePayoutOption(profileOption);
 }
 
@@ -135,7 +85,7 @@ function mapEncashmentRow(r) {
   const fee = Number(r.encashmentfee || 0);
   const cdDeduction = Number(r.cddeduction || 0);
   const fullName = `${r.firstname || ''} ${r.lastname || ''}`.trim() || `Unknown Account (UID: ${r.uid})`;
-  const payout = resolvePayoutOption(r.paymentoptions, r.payoutid);
+  const payout = resolvePreferredPayoutOption(r.paymentoptions, r.payoutid);
   const payoutOption = payout?.label || 'N/A';
   const payoutRaw = String(r.paymentdetails || r.payoutdetails || '').trim();
   const payoutDetails = buildPayoutDisplay(payout?.label, payoutRaw);
@@ -459,7 +409,7 @@ router.get('/:pid/details', adminAuth, adminRights([1, 3]), async (req, res) => 
       legacyIncome6: Number(row.income6 || 0),
     };
 
-    const payout = resolvePayoutOption(row.paymentoptions, row.payoutid);
+    const payout = resolvePreferredPayoutOption(row.paymentoptions, row.payoutid);
     const paymentOption = payout?.label || 'N/A';
     const paymentDetails = String(row.paymentdetails || row.payoutdetails || '').trim() || null;
 

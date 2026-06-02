@@ -63,6 +63,38 @@ function normalizeCountMap(keys) {
   return Object.fromEntries(keys.map((key) => [key, 0]));
 }
 
+function normalizeContributorTimestamp(value) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return 0;
+  return date.getTime();
+}
+
+function splitContributorsByClaimUsage(contributors = [], usedCount = 0, timestampKey = 'joinedAt') {
+  const safeUsedCount = Math.max(0, Number(usedCount) || 0);
+  const sortedAsc = [...contributors].sort((left, right) => {
+    const leftTs = normalizeContributorTimestamp(left?.[timestampKey]);
+    const rightTs = normalizeContributorTimestamp(right?.[timestampKey]);
+    if (leftTs !== rightTs) return leftTs - rightTs;
+    return Number(left?.uid || 0) - Number(right?.uid || 0);
+  });
+
+  const clampedUsedCount = Math.min(sortedAsc.length, safeUsedCount);
+  const used = sortedAsc.slice(0, clampedUsedCount);
+  const available = sortedAsc.slice(clampedUsedCount);
+  const sortDesc = (items) => [...items].sort((left, right) => {
+    const leftTs = normalizeContributorTimestamp(left?.[timestampKey]);
+    const rightTs = normalizeContributorTimestamp(right?.[timestampKey]);
+    if (leftTs !== rightTs) return rightTs - leftTs;
+    return Number(right?.uid || 0) - Number(left?.uid || 0);
+  });
+
+  return {
+    used: sortDesc(used),
+    available: sortDesc(available),
+    all: sortDesc(sortedAsc),
+  };
+}
+
 function summarizeProductReferralRows(rows = []) {
   const qualifyingReferralsByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
   const rawPurchasesByKey = normalizeCountMap(Object.keys(PRODUCT_METADATA));
@@ -108,6 +140,11 @@ function buildProductSummary({
     const qualifiedSets = Math.floor(qualifyingReferrals / 5);
     const availableClaims = eligible ? Math.max(0, qualifiedSets - claimed) : 0;
     const remainder = qualifyingReferrals % 5;
+    const contributorSplit = splitContributorsByClaimUsage(
+      contributorsByKey[key] || [],
+      claimed * 5,
+      'lastTransdate'
+    );
 
     return {
       key,
@@ -122,7 +159,11 @@ function buildProductSummary({
       blockedClaims: eligible ? 0 : Math.max(0, qualifiedSets - claimed),
       remainingToNextSet: remainder === 0 ? 5 : 5 - remainder,
       eligible,
-      contributors: contributorsByKey[key] || [],
+      contributors: contributorSplit.all,
+      availableContributors: contributorSplit.available,
+      contributorHistory: contributorSplit.used,
+      availableContributorCount: contributorSplit.available.length,
+      usedContributorCount: contributorSplit.used.length,
     };
   });
 
@@ -145,6 +186,11 @@ function buildPackageSummary({ directReferralPackages, claimedPackageSets, rewar
     const availableClaims = Math.max(0, qualifiedSets - claimedSets);
     const rewardAmount = Number(rewardAmounts[rule.key] || 0);
     const remainder = referralCount % 5;
+    const contributorSplit = splitContributorsByClaimUsage(
+      contributorsByPackage[rule.key] || [],
+      claimedSets * 5,
+      'joinedAt'
+    );
 
     return {
       key: rule.key,
@@ -157,7 +203,11 @@ function buildPackageSummary({ directReferralPackages, claimedPackageSets, rewar
       availableClaims,
       availableCashAmount: availableClaims * rewardAmount,
       remainingToNextSet: remainder === 0 ? 5 : 5 - remainder,
-      contributors: contributorsByPackage[rule.key] || [],
+      contributors: contributorSplit.all,
+      availableContributors: contributorSplit.available,
+      contributorHistory: contributorSplit.used,
+      availableContributorCount: contributorSplit.available.length,
+      usedContributorCount: contributorSplit.used.length,
     };
   });
 

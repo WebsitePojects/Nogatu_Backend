@@ -10,6 +10,7 @@ const { memberAuth } = require('../middleware/auth');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
 const { resolveTin, isValidTin } = require('../utils/tin');
 const { listPackagePolicies } = require('../services/packagePolicy');
+const { normalizePayoutStorageValue, resolvePayoutOption, listPayoutOptions } = require('../services/payoutOptions');
 
 let memberTinColumnsReady = false;
 let memberHasTinNoColumn = false;
@@ -86,10 +87,13 @@ router.get('/', memberAuth, async (req, res) => {
       contactnos: user.contactnos,
       email: user.email,
       emailRequired: !normalizeEmail(user.email),
+      tinRequired: !resolvedTin,
       tin: resolvedTin,
       tinno: resolvedTin,
       payoutid: user.payoutid,
+      payoutOption: resolvePayoutOption(user.payoutid, { allowUnknown: true }),
       payoutdetails: user.payoutdetails,
+      payoutOptions: listPayoutOptions(),
       accttype: user.currentaccttype,
       codeid: user.codeid,
       datereg: user.datereg,
@@ -137,6 +141,8 @@ router.put('/', memberAuth, async (req, res) => {
       }
     }
 
+    const normalizedPayoutOption = normalizePayoutStorageValue(payoutoptions);
+
     const setClauses = [
       'address = ?',
       'payoutdetails = ?',
@@ -144,7 +150,7 @@ router.put('/', memberAuth, async (req, res) => {
       'contactnos = ?',
       'email = ?',
     ];
-    const values = [address, payoutdetails, payoutoptions, contactnos, normalizedEmail];
+    const values = [address, payoutdetails, normalizedPayoutOption, contactnos, normalizedEmail];
 
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);

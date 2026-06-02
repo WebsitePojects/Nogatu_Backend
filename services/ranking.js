@@ -13,7 +13,7 @@ const {
   summarizeAchievementStatus,
 } = require('./rankingRace');
 
-const RANKING_BASIS_LABEL = 'Repurchase points';
+const RANKING_BASIS_LABEL = 'Product Repurchase Points';
 const RACE_BASIS_MODE = 'repurchase-event';
 const RANK_REFRESH_MAX_AGE_MINUTES = 15;
 
@@ -1098,9 +1098,7 @@ async function getAllRankings(page = 1, perPage = 30) {
      LEFT JOIN rankingstab r ON r.uid = u.uid
      WHERE u.uid = u.mainid
      ORDER BY
-       GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) DESC,
        COALESCE(r.remaining_rankable_points, 0) DESC,
-       COALESCE(r.basis_points, 0) DESC,
        COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') ASC,
        u.uid ASC
      LIMIT ?, ?`,
@@ -1161,9 +1159,7 @@ async function getAllRankings(page = 1, perPage = 30) {
   }
 
   hydrated.sort((a, b) => {
-    if (toNumber(b.currentRank) !== toNumber(a.currentRank)) return toNumber(b.currentRank) - toNumber(a.currentRank);
     if (toNumber(b.remainingRankablePoints) !== toNumber(a.remainingRankablePoints)) return toNumber(b.remainingRankablePoints) - toNumber(a.remainingRankablePoints);
-    if (toNumber(b.grossRankablePoints) !== toNumber(a.grossRankablePoints)) return toNumber(b.grossRankablePoints) - toNumber(a.grossRankablePoints);
     const dateA = String(a.qualifiedDate || '9999-12-31 23:59:59');
     const dateB = String(b.qualifiedDate || '9999-12-31 23:59:59');
     const dateCompare = dateA.localeCompare(dateB);

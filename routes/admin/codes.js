@@ -137,7 +137,7 @@ router.get('/history/export', adminAuth, adminRights([1, 2, 3]), async (req, res
       const report = await renderAdminPdfReport({
         fileName: 'activation-code-history',
         title: 'Activation Code History Report',
-        subtitle: 'Generated, released, transferred, upgraded, and maintenance activity audit for activation codes.',
+        subtitle: 'Generated, released, transferred, upgraded, and repurchase activity audit for activation codes.',
         generatedAt: new Date().toLocaleString('en-PH', { hour12: true }),
         filterChips: [`Code Search: ${q || 'All codes'}`],
         summaryCards: [
@@ -336,6 +336,86 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
     res.json({ success: true, transferred });
   } catch (err) {
     console.error('[Admin Codes] Transfer error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/release-transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const { targetUsername, codes: selectedCodes } = req.body;
+    const targetSanitized = sanitizeAlphaNum(targetUsername);
+    const [targetRows] = await pool.query(
+      'SELECT uid, username, firstname, lastname FROM memberstab WHERE username = ?',
+      [targetSanitized]
+    );
+
+    if (targetRows.length === 0) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const targetUid = Number(targetRows[0].uid);
+    let released = 0;
+    let transferred = 0;
+
+    for (const code of selectedCodes || []) {
+      const [codeRows] = await pool.query(
+        'SELECT * FROM codestab WHERE code = ? AND codestatus <= 1 LIMIT 1',
+        [code]
+      );
+      if (codeRows.length === 0) continue;
+
+      const codeRow = codeRows[0];
+      if (Number(codeRow.codestatus || 0) === 0) {
+        const [releaseResult] = await pool.query(
+          "UPDATE codestab SET releasedate = 1, codestatus = 1 WHERE code = ? AND codestatus = 0 LIMIT 1",
+          [code]
+        );
+        if (releaseResult.affectedRows === 1) {
+          released += 1;
+          await appendActivationCodeUsage(pool, {
+            code,
+            codeRowId: codeRow.id,
+            eventType: 'release',
+            toUid: codeRow.uid || null,
+            actorAdminId: Number(req.session.adminid) || null,
+            processKey: createProcessKey(['code-release', code, req.session.adminid, 'release-transfer', Date.now()]),
+          });
+        }
+      }
+
+      await pool.query(
+        'UPDATE codestab SET uid = ? WHERE code = ? AND codestatus = 1 LIMIT 1',
+        [targetUid, code]
+      );
+
+      const history = `(${req.session.adminid}).${targetSanitized}`;
+      await pool.query(
+        `INSERT INTO codehistorytab (id, code, dategen, history, datetransfer, processid)
+         VALUES (?, ?, ?, ?, NOW(), NULL)
+         ON DUPLICATE KEY UPDATE history = CONCAT(history, ' -> ', ?), datetransfer = NOW()`,
+        [codeRow.id, code, codeRow.dategen, history, history]
+      );
+
+      await appendActivationCodeUsage(pool, {
+        code,
+        codeRowId: codeRow.id,
+        eventType: 'admin_transfer',
+        fromUid: codeRow.uid || null,
+        toUid: targetUid,
+        actorAdminId: Number(req.session.adminid) || null,
+        notes: {
+          targetUsername: targetSanitized,
+          releasedAndTransferred: true,
+        },
+        processKey: createProcessKey(['admin-code-release-transfer', code, req.session.adminid, targetUid, Date.now()]),
+      });
+
+      transferred += 1;
+    }
+
+    res.json({ success: true, released, transferred });
+  } catch (err) {
+    console.error('[Admin Codes] Release+Transfer error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

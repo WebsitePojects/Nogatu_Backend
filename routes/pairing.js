@@ -7,9 +7,15 @@ const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
 const { getPairingCounts } = require('../services/network');
-const { backfillHistoricalBinaryPointEvents, getPairingTrace } = require('../services/income/pairingTracker');
+const {
+  backfillHistoricalBinaryPointEvents,
+  getPairingTrace,
+  getPairingLegAccounts,
+  buildPairingHistoryRows,
+} = require('../services/income/pairingTracker');
 const { getPackagePolicy } = require('../services/packagePolicy');
 const { getEffectiveAccountState, countsForPairingSource, getAccountStateLabel } = require('../services/accountState');
+const { getBinaryPairingEligibility } = require('../services/binaryEligibility');
 
 router.get('/sources', memberAuth, async (req, res) => {
   try {
@@ -70,6 +76,34 @@ router.get('/sources', memberAuth, async (req, res) => {
   }
 });
 
+router.get('/leg/:side', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    const accttype = Number(req.session.currentaccttype || req.session.accttype || 0);
+    const side = req.params.side === 'right' ? 'right' : 'left';
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = Math.min(100, Math.max(10, Number(req.query.perPage) || 50));
+    const payload = await getPairingLegAccounts(uid, accttype, side, { page, perPage });
+
+    res.json({
+      side,
+      page: payload.pagination.page,
+      perPage: payload.pagination.perPage,
+      totalPages: payload.pagination.totalPages,
+      total: payload.pagination.totalRows,
+      summary: payload.summary,
+      rows: payload.rows,
+      formula: side === 'left'
+        ? 'These are the current left-leg pairing source accounts under your subtree, grouped by source account and ordered by level.'
+        : 'These are the current right-leg pairing source accounts under your subtree, grouped by source account and ordered by level.',
+      asOf: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[Pairing] Leg detail error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 /**
  * GET /api/pairing
  * Get pairing report data
@@ -81,23 +115,14 @@ router.get('/', memberAuth, async (req, res) => {
     const packagePolicy = getPackagePolicy(accttype);
     const effectiveAccount = await getEffectiveAccountState(uid);
     const sourceEligible = countsForPairingSource(effectiveAccount);
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = Math.min(100, Math.max(10, Number(req.query.perPage) || 50));
-    const offset = (page - 1) * perPage;
+    const historyPage = Math.max(1, Number(req.query.historyPage || req.query.page) || 1);
+    const historyPerPage = Math.min(100, Math.max(10, Number(req.query.historyPerPage || req.query.perPage) || 50));
+    const tracePage = Math.max(1, Number(req.query.tracePage) || 1);
+    const tracePerPage = Math.min(100, Math.max(10, Number(req.query.tracePerPage) || 50));
 
-    const [totalRows, reports, counts, trace, walletRows] = await Promise.all([
-      pool.query('SELECT COUNT(*) AS total FROM pairingstab WHERE uid = ? AND totalpoints >= 1', [uid]).then(([rows]) => rows),
-      pool.query(
-        `SELECT *
-         FROM pairingstab
-         WHERE uid = ?
-           AND totalpoints >= 1
-         ORDER BY transdate DESC, id DESC
-         LIMIT ? OFFSET ?`,
-        [uid, perPage, offset]
-      ).then(([rows]) => rows),
+    const [counts, trace, walletRows, binaryEligibility] = await Promise.all([
       getPairingCounts(uid),
-      getPairingTrace(uid, accttype, { limit: 50 })
+      getPairingTrace(uid, accttype, { page: tracePage, perPage: tracePerPage })
         .catch((error) => {
           if (error.code === 'ER_NO_SUCH_TABLE') {
             return {
@@ -107,40 +132,76 @@ router.get('/', memberAuth, async (req, res) => {
                 totalPairPoints: 0,
                 totalGrossIncome: 0,
                 totalCreditedIncome: 0,
+                lockedEvents: 0,
                 cappedEvents: 0,
                 uncappedEvents: 0,
               },
               weeklyCap: 0,
               packageName: null,
               sourceBackfill: { inserted: 0, skipped: 0 },
+              pagination: { page: 1, perPage: tracePerPage, totalRows: 0, totalPages: 1 },
             };
           }
           throw error;
         }),
       pool.query('SELECT ttlincome2 FROM payouttotaltab WHERE uid = ? LIMIT 1', [uid]).then(([rows]) => rows),
+      getBinaryPairingEligibility(uid).catch(() => ({
+        canEarnPairing: true,
+        leftQualifiedCount: 0,
+        rightQualifiedCount: 0,
+        leftQualified: false,
+        rightQualified: false,
+        missingLegs: [],
+        qualifyingDirects: { left: [], right: [] },
+        reason: null,
+      })),
     ]);
 
-    const total = Number(totalRows[0]?.total || 0);
-    const totalPages = Math.max(1, Math.ceil(total / perPage));
     const walletPairingTotal = Number(walletRows[0]?.ttlincome2 || 0);
+    const balances = trace?.balances || {};
+    const historyRowsAll = buildPairingHistoryRows(trace?.allRows || trace?.rows || []);
+    const historyTotal = Number(historyRowsAll.length || 0);
+    const historyTotalPages = Math.max(1, Math.ceil(historyTotal / historyPerPage));
+    const safeHistoryPage = Math.min(historyTotalPages, Math.max(1, historyPage));
+    const historyOffset = (safeHistoryPage - 1) * historyPerPage;
+    const historyRows = historyRowsAll.slice(historyOffset, historyOffset + historyPerPage);
+    const displayCounts = {
+      ...counts,
+      totalPointsLeft: Number(balances.availableLeftPoints || 0),
+      totalPointsRight: Number(balances.availableRightPoints || 0),
+      rawTotalPointsLeft: Number(balances.totalLeftPoints || 0),
+      rawTotalPointsRight: Number(balances.totalRightPoints || 0),
+      pairedPointsConsumed: Number(balances.pairedPoints || 0),
+      strongLegPoints: Number(balances.strongLegPoints || 0),
+      weakLegPoints: Number(balances.weakLegPoints || 0),
+    };
 
     res.json({
-      reports,
-      counts,
-      page,
-      perPage,
-      totalPages,
-      total,
+      history: {
+        rows: historyRows,
+        page: safeHistoryPage,
+        perPage: historyPerPage,
+        total: historyTotal,
+        totalPages: historyTotalPages,
+      },
+      counts: displayCounts,
       trace,
       packagePolicy,
       walletPairingTotal,
       eligibility: {
-        canEarnPairing: true,
+        canEarnPairing: Boolean(binaryEligibility.canEarnPairing),
         sourceEligible,
         accountState: getAccountStateLabel(effectiveAccount),
-        reason: sourceEligible
+        reason: binaryEligibility.reason || null,
+        qualifiedDirects: {
+          left: Number(binaryEligibility.leftQualifiedCount || 0),
+          right: Number(binaryEligibility.rightQualifiedCount || 0),
+        },
+        missingLegs: binaryEligibility.missingLegs || [],
+        sourceReason: sourceEligible
           ? null
-          : 'This account cannot pass its own BP to its sponsor and uplines yet, but it can still earn pairing from eligible paid-direct or fully paid CD downlines on both legs.',
+          : 'This account cannot pass its own BP to its sponsor and uplines yet, but it can still receive SMB from eligible paid or fully paid CD downlines when both sides of the subtree have qualified BP.',
+        rule: 'Binary payout now unlocks only after you personally recruit at least one qualified direct on the left leg and one on the right leg. Spillover placements from your upline do not count toward this unlock.',
       },
     });
   } catch (err) {

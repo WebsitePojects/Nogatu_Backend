@@ -13,6 +13,7 @@ const { getPairingTrace } = require('../../services/income/pairingTracker');
 const { getEffectiveAccountState, getAccountEntryAuditInfo } = require('../../services/accountState');
 const { writeAuditLog } = require('../../services/audit');
 const { resolveTin, isValidTin } = require('../../utils/tin');
+const { normalizePayoutStorageValue, resolvePayoutOption, listPayoutOptions } = require('../../services/payoutOptions');
 
 const PACKAGE_MAP = {
   10: 'Bronze',
@@ -168,7 +169,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
       entryType: ENTRY_TYPES[r.codeid] || 'Unknown',
       datereg: r.datereg,
       accountStatus: String(r.account_status || 'active').toLowerCase() === 'frozen'
-        ? 'suspended'
+        ? 'frozen'
         : String(r.account_status || 'active').toLowerCase(),
     }));
 
@@ -228,6 +229,8 @@ router.get('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       ...row,
       tin: resolvedTin,
       tinno: resolvedTin,
+      payoutOption: resolvePayoutOption(row.payoutid, { allowUnknown: true }),
+      payoutOptions: listPayoutOptions(),
       account_status: String(row.account_status || 'active').toLowerCase(),
       account_status_reason: row.account_status_reason || null,
     });
@@ -260,6 +263,8 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       }
     }
 
+    const normalizedPayoutOption = normalizePayoutStorageValue(payoutoptions);
+
     const setClauses = [
       'firstname = ?',
       'lastname = ?',
@@ -275,7 +280,7 @@ router.put('/:uid', adminAuth, adminRights([1, 3]), async (req, res) => {
       middlename,
       address,
       payoutdetails,
-      payoutoptions,
+      normalizedPayoutOption,
       contactnos,
     ];
 
@@ -323,12 +328,12 @@ router.put('/:uid/status', adminAuth, adminRights([1, 3]), async (req, res) => {
     const nextStatus = String(req.body?.status || '').trim().toLowerCase();
     const reason = String(req.body?.reason || '').trim();
 
-    if (!['active', 'suspended'].includes(nextStatus)) {
+    if (!['active', 'suspended', 'frozen'].includes(nextStatus)) {
       return res.status(400).json({ error: 'Invalid account status' });
     }
 
     if (nextStatus !== 'active' && !reason) {
-      return res.status(400).json({ error: 'Reason is required for suspension.' });
+      return res.status(400).json({ error: 'Reason is required for suspension or freeze.' });
     }
 
     conn = await pool.getConnection();

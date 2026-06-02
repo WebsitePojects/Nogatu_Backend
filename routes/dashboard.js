@@ -9,9 +9,15 @@ const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
-const { getProjectedCurrentMonthUnilevel } = require('../services/income/unilevel');
+const {
+  getProjectedCurrentMonthUnilevel,
+  getUnilevelProductPointContributors,
+} = require('../services/income/unilevel');
 const { getLeadershipTraceability } = require('../services/income/leadership');
-const { getEffectiveAccountState, getAccountEntryAuditInfo } = require('../services/accountState');
+const {
+  getEffectiveAccountState,
+  getAccountEntryAuditInfo,
+} = require('../services/accountState');
 
 async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
   const safePage = Math.max(1, Number(page) || 1);
@@ -32,6 +38,11 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
     amount: row.leadershipBonus,
     directReferralCount: row.directReferralCount,
   }));
+  const levelRows = [...allRows].sort((left, right) =>
+    Number(left.level || 0) - Number(right.level || 0)
+    || String(left.fullname || left.username || '').localeCompare(String(right.fullname || right.username || ''))
+    || Number(left.uid || 0) - Number(right.uid || 0)
+  );
   const total = allRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
   const totalPages = Math.max(1, Math.ceil(allRows.length / safePerPage));
   const offset = (safePage - 1) * safePerPage;
@@ -48,7 +59,9 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
     summary: {
       totalSources: trace.totalSources,
       directReferralCount: Number(directCountRows[0]?.total || 0),
+      byLevel: trace.byLevel,
     },
+    levelRows,
   };
 }
 
@@ -297,7 +310,17 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
         };
       }));
       response.rows = [...contributorRows, ...upgradeContributorRows]
-        .filter((row) => Number(row.amount || 0) > 0)
+        .filter((row) => {
+          if (Number(row.amount || 0) <= 0) {
+            return false;
+          }
+
+          if (row.rowType === 'referral_signup') {
+            return Boolean(row.sponsorCreditEligible);
+          }
+
+          return true;
+        })
         .sort((left, right) => new Date(right.transdate || 0) - new Date(left.transdate || 0))
         .slice(0, limit);
       response.total = response.rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
@@ -342,18 +365,32 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
          LIMIT ?`,
         [uid, limit]
       );
+      const productPointTrace = await getUnilevelProductPointContributors(uid, { start, end });
       const points = Number(maintRows[0]?.ttlpoints || 0);
-      response.formula = 'Unilevel requires at least 200 product points in the current month.';
+      response.formula = 'Unilevel requires at least 200 own product points in the current month; downline product-point rows show the members and purchases that can create unilevel value.';
       response.eligibility = {
         requiredPoints: 200,
         currentPoints: points,
         neededPoints: Math.max(0, 200 - points),
         eligible: points >= 200,
+        downlineProductPoints: productPointTrace.totalPoints,
+        projectedDownlineAmount: productPointTrace.projectedAmount,
+        packageReach: productPointTrace.maxReach,
       };
-      response.rows = incomeRows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
-      response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
+      const creditedRows = incomeRows.map((row) => ({
+        ...row,
+        amount: Number(row.amount || 0),
+        rowType: 'credited_unilevel_payout',
+      }));
+      response.rows = [...productPointTrace.rows, ...creditedRows].slice(0, limit);
+      response.total = creditedRows.reduce((sum, row) => sum + row.amount, 0);
+      response.summary = {
+        creditedTotal: response.total,
+        downlineProductPoints: productPointTrace.totalPoints,
+        projectedDownlineAmount: productPointTrace.projectedAmount,
+      };
     } else if (metric === 'lpc') {
-      response.formula = 'LPC is disabled for launch; legacy income6 is reserved for Ranking Bonus.';
+      response.formula = 'LPC is disabled for launch; the reserved ranking-bonus ledger remains separate from this feature.';
       response.rows = [];
       response.total = 0;
     } else if (metric === 'leadership-bonus') {
@@ -362,6 +399,7 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
       response.rows = leadership.rows;
       response.total = leadership.total;
       response.summary = leadership.summary;
+      response.levelRows = leadership.levelRows || [];
       response.pagination = {
         page: leadership.page,
         perPage: leadership.perPage,
@@ -374,11 +412,13 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
         `SELECT pid, ${incomeColumn} AS amount, transdate, processid
          FROM payouthistorytab
          WHERE uid = ? AND ${incomeColumn} > 0
-         ORDER BY transdate DESC, pid DESC
-         LIMIT ?`,
+        ORDER BY transdate DESC, pid DESC
+        LIMIT ?`,
         [uid, limit]
       );
-      response.formula = `${incomeColumn} rows from payouthistorytab with positive amounts.`;
+      response.formula = metric.includes('ranking')
+        ? 'Credited ranking bonus entries from payout history with positive released amounts.'
+        : 'Credited Hi-Five bonus entries from payout history with positive released amounts.';
       response.rows = rows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
       response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
     } else if (['left-accounts', 'right-accounts'].includes(metric)) {

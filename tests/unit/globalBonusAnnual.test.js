@@ -5,6 +5,7 @@ const {
   normalizeAnnualYear,
   assertClosedDistributionYear,
   getLastClosedYear,
+  buildGlobalBonusVisibility,
 } = require('../../services/globalBonus');
 const { normalizeFinanceYear } = require('../../services/adminFinance');
 
@@ -27,4 +28,30 @@ test('finance year normalization falls back to the current year', () => {
   const fakeNow = new Date('2026-05-15T08:00:00.000Z');
   assert.equal(normalizeFinanceYear(undefined, fakeNow), 2026);
   assert.equal(normalizeFinanceYear(2024, fakeNow), 2024);
+});
+
+test('global bonus visibility metadata unlocks with the qualifying labels', () => {
+  assert.deepEqual(
+    buildGlobalBonusVisibility({ eligible: true, labels: ['Diamond', 'Ambassador'] }),
+    {
+      visibilityState: 'unlocked',
+      interactive: true,
+      fullVisibility: true,
+      lockedReason: null,
+      unlockedBy: ['Diamond', 'Ambassador'],
+    }
+  );
+});
+
+test('global bonus visibility metadata stays locked for non-qualifying accounts', () => {
+  assert.deepEqual(
+    buildGlobalBonusVisibility({ eligible: false, labels: ['Bronze'] }),
+    {
+      visibilityState: 'locked',
+      interactive: false,
+      fullVisibility: false,
+      lockedReason: 'Global bonus unlocks for qualified Diamond, Ambassador, or eligible Stockist accounts.',
+      unlockedBy: [],
+    }
+  );
 });

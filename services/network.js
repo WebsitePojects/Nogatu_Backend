@@ -6,7 +6,7 @@
  */
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
-const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo } = require('./accountState');
+const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo, countsForPairingSource } = require('./accountState');
 const { getPackageBinaryValue } = require('./packagePolicy');
 
 function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
@@ -238,28 +238,100 @@ async function getDirectReferrals(uid) {
  * Used in dashboard
  */
 async function getPairingCounts(uid) {
-  const [rows] = await pool.query(
-    `SELECT position, COUNT(*) as total, SUM(binarypoints) as totalpoints
-     FROM usertab WHERE refid = ? GROUP BY position`,
-    [uid]
-  );
-
   const result = {
     totalLeft: 0, totalPointsLeft: 0,
     totalRight: 0, totalPointsRight: 0,
   };
 
-  for (const row of rows) {
-    if (Number(row.position) === 1) {
-      result.totalLeft = Number(row.total);
-      result.totalPointsLeft = Number(row.totalpoints || 0);
-    } else if (Number(row.position) === 2) {
-      result.totalRight = Number(row.total);
-      result.totalPointsRight = Number(row.totalpoints || 0);
+  try {
+    const [rows] = await pool.query(
+      `SELECT c.descendant_uid AS uid, c.leg, u.currentaccttype, u.binarypoints,
+              u.codeid, u.cdamount, u.cdtotal, u.cdstatus
+         FROM binary_tree_closuretab c
+         INNER JOIN usertab u ON u.uid = c.descendant_uid
+        WHERE c.ancestor_uid = ?
+          AND c.depth > 0
+          AND c.leg IN ('left', 'right')
+        ORDER BY c.depth ASC, u.uid ASC`,
+      [uid]
+    );
+
+    for (const row of rows) {
+      const effectiveRow = await getEffectiveAccountState(row.uid, row);
+      if (!effectiveRow || !countsForPairingSource(effectiveRow)) continue;
+      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (row.leg === 'left') {
+        result.totalLeft += 1;
+        result.totalPointsLeft += Number(points || 0);
+      } else if (row.leg === 'right') {
+        result.totalRight += 1;
+        result.totalPointsRight += Number(points || 0);
+      }
+    }
+
+    return result;
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') {
+      throw error;
     }
   }
 
+  await _collectSubtreePairingCounts(uid, 'left', result);
+  await _collectSubtreePairingCounts(uid, 'right', result);
   return result;
+}
+
+async function _collectSubtreePairingCounts(parentUid, leg, result) {
+  const position = leg === 'left' ? 1 : 2;
+  const [rows] = await pool.query(
+    `SELECT uid, refid, drefid, position, currentaccttype, binarypoints,
+            codeid, cdamount, cdtotal, cdstatus
+       FROM usertab
+      WHERE refid = ? AND position = ?`,
+    [parentUid, position]
+  );
+
+  for (const row of rows) {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    if (effectiveRow && countsForPairingSource(effectiveRow)) {
+      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (leg === 'left') {
+        result.totalLeft += 1;
+        result.totalPointsLeft += Number(points || 0);
+      } else {
+        result.totalRight += 1;
+        result.totalPointsRight += Number(points || 0);
+      }
+    }
+
+    await _collectDescendantPairingCounts(row.uid, leg, result);
+  }
+}
+
+async function _collectDescendantPairingCounts(uid, rootLeg, result) {
+  const [rows] = await pool.query(
+    `SELECT uid, refid, drefid, position, currentaccttype, binarypoints,
+            codeid, cdamount, cdtotal, cdstatus
+       FROM usertab
+      WHERE refid = ?`,
+    [uid]
+  );
+
+  for (const row of rows) {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    if (effectiveRow && countsForPairingSource(effectiveRow)) {
+      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (rootLeg === 'left') {
+        result.totalLeft += 1;
+        result.totalPointsLeft += Number(points || 0);
+      } else {
+        result.totalRight += 1;
+        result.totalPointsRight += Number(points || 0);
+      }
+    }
+
+    await _collectDescendantPairingCounts(row.uid, rootLeg, result);
+  }
 }
 
 module.exports = {

@@ -19,14 +19,7 @@ const {
   maskSensitiveValue,
 } = require('../../utils/security');
 const { writeAuditLog } = require('../audit');
-
-const PAYOUT_OPTION_LABELS = {
-  1: 'Pickup',
-  2: 'GCash',
-  3: 'Remittance Center',
-  4: 'Bank Deposit',
-  5: 'Others',
-};
+const { resolvePayoutOption } = require('../payoutOptions');
 
 function getNextPayoutDate(baseDate = new Date()) {
   const payoutDate = new Date(baseDate);
@@ -168,7 +161,7 @@ async function getEncashmentPreview(uid, encashmentAmount, userInfo, conn = pool
     net: breakdown.net,
     newBalance: currentBalance - amount,
     paymentOptionId: Number(profile.payoutid || 0) || null,
-    paymentOption: PAYOUT_OPTION_LABELS[Number(profile.payoutid || 0)] || null,
+    paymentOption: resolvePayoutOption(profile.payoutid, { allowUnknown: true })?.label || null,
     paymentDetailsMasked: maskSensitiveValue(profile.payoutdetails),
     asOf: new Date().toISOString(),
   };
@@ -267,9 +260,10 @@ async function insertEncashment(uid, encashmentAmount, userInfo, options = {}) {
       );
     }
 
-    const payoutId = Number(profile.payoutid || 0);
+    const payoutOptionInfo = resolvePayoutOption(profile.payoutid, { allowUnknown: true });
+    const payoutId = Number(payoutOptionInfo?.id || 0);
     const payoutDetails = String(profile.payoutdetails || '').trim();
-    const payoutOption = PAYOUT_OPTION_LABELS[payoutId] || 'Others';
+    const payoutOption = payoutOptionInfo?.label || 'Others';
 
     const [insertResult] = await conn.query(
       `INSERT INTO payouthistorytab
@@ -293,7 +287,7 @@ async function insertEncashment(uid, encashmentAmount, userInfo, options = {}) {
         tax,
         fee,
         cdDeduction,
-        payoutId || null,
+        payoutOption || null,
         payoutDetails || null,
         now,
         now,

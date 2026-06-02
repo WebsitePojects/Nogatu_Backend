@@ -113,7 +113,30 @@ async function findFirstOpenSlot(startUid, conn = pool) {
   throw new Error('No available placement position was found for this branch.');
 }
 
-async function recommendPlacementForSponsor(sponsorUid, conn = pool) {
+async function findExtremeOpenSlot(startUid, side, conn = pool) {
+  const targetSide = toNumber(side) === 2 ? 2 : 1;
+  let placementUid = toNumber(startUid);
+  const visited = new Set();
+
+  while (placementUid && visited.size < 5000) {
+    if (visited.has(placementUid)) {
+      throw new Error('Binary placement loop detected while finding an extreme slot.');
+    }
+    visited.add(placementUid);
+
+    const children = await getDirectChildren(placementUid, conn);
+    const next = children.find((row) => toNumber(row.position) === targetSide);
+    if (!next) {
+      return { placementUid, position: targetSide };
+    }
+
+    placementUid = toNumber(next.uid);
+  }
+
+  throw new Error('No available extreme placement position was found for this branch.');
+}
+
+async function recommendPlacementForSponsor(sponsorUid, conn = pool, options = {}) {
   const normalizedSponsorUid = toNumber(sponsorUid);
   const children = await getDirectChildren(normalizedSponsorUid, conn);
   const leftChild = children.find((row) => toNumber(row.position) === 1);
@@ -124,7 +147,8 @@ async function recommendPlacementForSponsor(sponsorUid, conn = pool) {
     getBranchStats(rightChild?.uid, conn),
   ]);
 
-  const preferredSide = choosePlacementPreference({
+  const forcedSide = [1, 2].includes(toNumber(options.forcedSide)) ? toNumber(options.forcedSide) : null;
+  const preferredSide = forcedSide || choosePlacementPreference({
     leftOpen: !leftChild,
     rightOpen: !rightChild,
     leftPoints: leftStats.pointTotal,
@@ -140,7 +164,7 @@ async function recommendPlacementForSponsor(sponsorUid, conn = pool) {
       side: 'left',
       branchPointTotal: leftStats.pointTotal,
       branchMemberCount: leftStats.memberCount,
-      strategy: 'weak-leg',
+      strategy: forcedSide ? 'forced-extreme-left' : 'extreme-left',
     };
   }
 
@@ -151,13 +175,13 @@ async function recommendPlacementForSponsor(sponsorUid, conn = pool) {
       side: 'right',
       branchPointTotal: rightStats.pointTotal,
       branchMemberCount: rightStats.memberCount,
-      strategy: 'weak-leg',
+      strategy: forcedSide ? 'forced-extreme-right' : 'extreme-right',
     };
   }
 
   const branchRootUid = preferredSide === 1 ? toNumber(leftChild?.uid) : toNumber(rightChild?.uid);
   const branchStats = preferredSide === 1 ? leftStats : rightStats;
-  const openSlot = await findFirstOpenSlot(branchRootUid, conn);
+  const openSlot = await findExtremeOpenSlot(branchRootUid, preferredSide, conn);
 
   return {
     placementUid: openSlot.placementUid,
@@ -165,11 +189,15 @@ async function recommendPlacementForSponsor(sponsorUid, conn = pool) {
     side: preferredSide === 1 ? 'left' : 'right',
     branchPointTotal: branchStats.pointTotal,
     branchMemberCount: branchStats.memberCount,
-    strategy: 'weak-leg',
+    strategy: preferredSide === 1
+      ? (forcedSide ? 'forced-extreme-left' : 'extreme-left')
+      : (forcedSide ? 'forced-extreme-right' : 'extreme-right'),
   };
 }
 
 module.exports = {
   choosePlacementPreference,
+  findExtremeOpenSlot,
+  findFirstOpenSlot,
   recommendPlacementForSponsor,
 };

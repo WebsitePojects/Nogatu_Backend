@@ -170,6 +170,26 @@ function getStockistPortion(stockistId) {
   return { points: 0, label: null };
 }
 
+function buildGlobalBonusVisibility({ eligible, labels = [] }) {
+  if (eligible) {
+    return {
+      visibilityState: 'unlocked',
+      interactive: true,
+      fullVisibility: true,
+      lockedReason: null,
+      unlockedBy: labels,
+    };
+  }
+
+  return {
+    visibilityState: 'locked',
+    interactive: false,
+    fullVisibility: false,
+    lockedReason: 'Global bonus unlocks for qualified Diamond, Ambassador, or eligible Stockist accounts.',
+    unlockedBy: [],
+  };
+}
+
 function getPortionDetails(userRow, rankLevel) {
   const labels = [];
   let portions = 0;
@@ -441,6 +461,11 @@ async function getMemberGlobalBonus(uid, yearInput) {
     }
     : null;
 
+  const visibility = buildGlobalBonusVisibility({
+    eligible: detail.portions > 0,
+    labels: detail.labels,
+  });
+
   return {
     periodScope: 'annual',
     year,
@@ -454,6 +479,7 @@ async function getMemberGlobalBonus(uid, yearInput) {
     distributedDate: shareRow?.distributed_date || null,
     pool: poolRecord,
     latestShare,
+    ...visibility,
   };
 }
 
@@ -537,4 +563,5 @@ module.exports = {
   normalizeAnnualYear,
   assertClosedDistributionYear,
   getLastClosedYear,
+  buildGlobalBonusVisibility,
 };

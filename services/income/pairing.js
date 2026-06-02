@@ -10,6 +10,7 @@
 const { pool } = require('../../config/database');
 const { getISOWeek } = require('../../utils/helpers');
 const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
+const { getBinaryPairingEligibility } = require('../binaryEligibility');
 const {
   getPackagePairingDepthLimit,
   getPackagePairingWeeklyCap,
@@ -286,18 +287,6 @@ async function getPairing(uid, accttype) {
 
   await getNumLevels(uid, 1, leftPoints, rightPoints, allDates, sideMap, accttype, totals, pairingDepthLimit);
 
-  if (allDates.size === 0) {
-    return {
-      totalPay: 0,
-      leftCount: 0,
-      leftPts: 0,
-      rightCount: 0,
-      rightPts: 0,
-      pairedPts: 0,
-      dailyReports: [],
-    };
-  }
-
   const leftPts = leftPoints.reduce(function sumPoints(total, point) {
     return total + Number(point.points || 0);
   }, 0);
@@ -305,6 +294,34 @@ async function getPairing(uid, accttype) {
     return total + Number(point.points || 0);
   }, 0);
   const pairedPts = Math.min(leftPts, rightPts);
+  const eligibility = await getBinaryPairingEligibility(uid);
+
+  if (allDates.size === 0) {
+    return {
+      totalPay: 0,
+      leftCount: totals.totalleft,
+      leftPts,
+      rightCount: totals.totalright,
+      rightPts,
+      pairedPts,
+      dailyReports: [],
+      eligibility,
+    };
+  }
+
+  if (!eligibility.canEarnPairing) {
+    return {
+      totalPay: 0,
+      leftCount: totals.totalleft,
+      leftPts,
+      rightCount: totals.totalright,
+      rightPts,
+      pairedPts,
+      dailyReports: [],
+      eligibility,
+    };
+  }
+
   const pairingResult = totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals);
 
   return {
@@ -315,6 +332,7 @@ async function getPairing(uid, accttype) {
     rightPts: rightPts,
     pairedPts: pairedPts,
     dailyReports: pairingResult.dailyReports,
+    eligibility,
   };
 }
 

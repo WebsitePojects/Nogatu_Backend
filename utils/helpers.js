@@ -57,6 +57,7 @@ const PAYOUT_OPTIONS = {
   Gcash: 'Gcash',
   'Remittance Center': 'Remittance Center',
   Others: 'Others',
+  PSBank: 'PSBank',
 };
 
 // Codeid to entry type mapping

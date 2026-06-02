@@ -95,18 +95,18 @@ async function ensureReferralSlug(uid) {
 async function buildPlacementPreview(sponsorUid, conn = pool) {
   const placementPolicy = await getPlacementPolicyForSponsor(Number(sponsorUid), conn);
   if (placementPolicy.mode === 'forced') {
+    const placement = await recommendPlacementForSponsor(Number(sponsorUid), conn, {
+      forcedSide: Number(placementPolicy.forcedPosition),
+    });
     const [rows] = await conn.query(
       'SELECT username FROM memberstab WHERE uid = ? LIMIT 1',
-      [Number(sponsorUid)]
+      [placement.placementUid]
     );
 
     return {
-      placementUid: Number(sponsorUid),
-      position: Number(placementPolicy.forcedPosition),
-      side: Number(placementPolicy.forcedPosition) === 2 ? 'right' : 'left',
-      strategy: 'first-direct-safetynet',
+      ...placement,
       placementUsername: rows[0]?.username || null,
-      positionLabel: placementPolicy.forcedPositionLabel,
+      positionLabel: Number(placement.position) === 2 ? 'Right' : 'Left',
       note: placementPolicyMessage(placementPolicy),
       placementPolicy,
     };
@@ -273,11 +273,7 @@ router.get('/check-duplicate-name', memberAuth, async (req, res) => {
 router.get('/available-codes', memberAuth, async (req, res) => {
   try {
     const sponsorUid = req.session.uid;
-    const packageType = Number(req.query.package_type);
-
-    if (!packageType) {
-      return res.status(400).json({ error: 'Package type is required' });
-    }
+    const packageType = Number(req.query.package_type || 0);
 
     const codes = await registrationService.getAvailableCodes(sponsorUid, packageType);
     res.json({ codes });
@@ -444,7 +440,7 @@ router.post('/public-register', async (req, res) => {
       firstname, lastname, middlename, tin, email, address, deviceFingerprint, contactno, dob
     } = req.body;
 
-    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname || !email || !contactno || !dob) {
+    if (!(token || slug) || !activationCode || !username || !password || !firstname || !lastname || !email || !contactno || !dob || !address) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -512,6 +508,7 @@ router.post('/public-register', async (req, res) => {
       placementPolicy: placement?.placementPolicy || null,
       referralToken: invite.referral_slug || String(token || '').slice(0, 80),
       requestId: req.requestId || null,
+      autoPlacement: true,
     });
 
     if (!reusableSlug) {
@@ -571,13 +568,24 @@ router.post('/public-register', async (req, res) => {
         email: req.body?.email,
         contactno: req.body?.contactno,
         dob: req.body?.dob,
+        address: req.body?.address,
       });
       return res.status(400).json({
         error: err.message,
+        errorCode: 'DUPLICATE_ACCOUNT',
+        popup: true,
         duplicatePolicy: {
           blocked: true,
           reason: err.details?.reason || 'name-plus-strong-signal-match',
         },
+      });
+    }
+    if (err.code === 'USERNAME_TAKEN') {
+      return res.status(400).json({
+        error: err.message,
+        errorCode: err.code,
+        popup: true,
+        field: 'username',
       });
     }
     res.status(400).json({ error: err.message });
@@ -598,7 +606,7 @@ router.post('/register', memberAuth, async (req, res) => {
     const rawTin = resolveTin({ tin, tinno });
 
     // Input validation
-    if (!activationCode || !username || !password || !firstname || !lastname || !rawTin || !email || !contactno || !dob) {
+    if (!activationCode || !username || !password || !firstname || !lastname || !email || !contactno || !dob || !address) {
       return res.status(400).json({ error: 'All required fields must be filled' });
     }
     if (username.length < 3 || username.length > 30) {
@@ -611,7 +619,7 @@ router.post('/register', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Name fields must be under 50 characters' });
     }
 
-    if (!isValidTin(rawTin)) {
+    if (rawTin && !isValidTin(rawTin)) {
       return res.status(400).json({ error: 'TIN must contain 9-15 digits and will be saved in grouped format.' });
     }
 
@@ -641,6 +649,7 @@ router.post('/register', memberAuth, async (req, res) => {
       requestedPosition: Number(position),
       placementPolicy: recommendedPlacement?.placementPolicy || null,
       requestId: req.requestId || null,
+      autoPlacement: !placementUid || recommendedPlacement?.placementPolicy?.mode === 'forced',
     });
 
     await refreshSponsorIncomeAfterRegistration(
@@ -660,13 +669,24 @@ router.post('/register', memberAuth, async (req, res) => {
         email: req.body?.email,
         contactno: req.body?.contactno,
         dob: req.body?.dob,
+        address: req.body?.address,
       });
       return res.status(400).json({
         error: err.message,
+        errorCode: 'DUPLICATE_ACCOUNT',
+        popup: true,
         duplicatePolicy: {
           blocked: true,
           reason: err.details?.reason || 'name-plus-strong-signal-match',
         },
+      });
+    }
+    if (err.code === 'USERNAME_TAKEN') {
+      return res.status(400).json({
+        error: err.message,
+        errorCode: err.code,
+        popup: true,
+        field: 'username',
       });
     }
     res.status(400).json({ error: err.message });

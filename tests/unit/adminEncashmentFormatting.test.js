@@ -13,18 +13,21 @@ test('normalizePayoutOption accepts both numeric ids and legacy string labels', 
   assert.deepEqual(normalizePayoutOption(2), {
     id: 2,
     label: 'GCash',
+    storageValue: 'GCash',
     raw: '2',
   });
 
   assert.deepEqual(normalizePayoutOption('Gcash'), {
     id: 2,
     label: 'GCash',
+    storageValue: 'GCash',
     raw: 'Gcash',
   });
 
   assert.deepEqual(normalizePayoutOption('Remittance Centers'), {
     id: 3,
     label: 'Remittance Center',
+    storageValue: 'Remittance Center',
     raw: 'Remittance Centers',
   });
 });
