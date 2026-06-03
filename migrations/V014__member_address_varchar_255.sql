@@ -1,0 +1,2 @@
+ALTER TABLE memberstab
+  MODIFY COLUMN address VARCHAR(255) NULL;
