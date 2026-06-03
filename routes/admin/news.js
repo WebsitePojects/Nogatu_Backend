@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { pool } = require('../../config/database');
-const { adminAuth } = require('../../middleware/auth');
+const { adminAuth, adminRights } = require('../../middleware/auth');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 const { cloudinary } = require('../../utils/cloudinary');
 
 const upload = multer({
@@ -76,7 +77,18 @@ async function uploadToCloudinary(file) {
 }
 
 // All admin news routes require admin authentication
-router.use(adminAuth);
+router.use(adminAuth, adminRights([1, 3]));
+router.use(async (_req, res, next) => {
+  try {
+    await assertSchemaRequirements(SCHEMA_REQUIREMENTS.NEWS, 'Admin news');
+    next();
+  } catch (error) {
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return next(error);
+  }
+});
 
 // GET /api/admin/news - List all news (including unpublished)
 router.get('/', async (req, res) => {

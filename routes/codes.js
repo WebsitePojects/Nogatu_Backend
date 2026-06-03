@@ -204,26 +204,22 @@ router.post('/upgrade', memberAuth, async (req, res) => {
 
     // Update account state based on the actual code type used for the upgrade.
     if (Number(codeData.codetype) === 1) {
-      if (Number(member.codeid) === 3) {
-        await conn.query(
-          `UPDATE usertab
-              SET currentaccttype = ?,
-                  cdtotal = cdamount,
-                  cdstatus = 2
-            WHERE uid = ?
-            LIMIT 1`,
-          [codeData.producttype, uid]
-        );
-      } else {
-        await conn.query(
-          'UPDATE usertab SET currentaccttype = ? WHERE uid = ? LIMIT 1',
-          [codeData.producttype, uid]
-        );
-      }
+      await conn.query(
+        `UPDATE usertab
+            SET currentaccttype = ?,
+                codeid = 1,
+                cdamount = 0,
+                cdtotal = 0,
+                cdstatus = 0
+          WHERE uid = ?
+          LIMIT 1`,
+        [codeData.producttype, uid]
+      );
     } else if (Number(codeData.codetype) === 2) {
       await conn.query(
         `UPDATE usertab
             SET currentaccttype = ?,
+                codeid = 2,
                 cdamount = 0,
                 cdtotal = 0,
                 cdstatus = 0
@@ -235,6 +231,7 @@ router.post('/upgrade', memberAuth, async (req, res) => {
       await conn.query(
         `UPDATE usertab
             SET currentaccttype = ?,
+                codeid = 3,
                 cdamount = ?,
                 cdtotal = 0,
                 cdstatus = 1
@@ -303,9 +300,7 @@ router.post('/upgrade', memberAuth, async (req, res) => {
     // Update session
     req.session.currentaccttype = codeData.producttype;
     req.session.caccttype = ACCOUNT_TYPES[codeData.producttype] || 'Unknown';
-    if (Number(codeData.codetype) === 1 && Number(member.codeid) === 3) {
-      req.session.cdstatus = 2;
-    } else if (Number(codeData.codetype) === 2) {
+    if (Number(codeData.codetype) === 2 || Number(codeData.codetype) === 1) {
       req.session.cdstatus = 0;
     } else if (Number(codeData.codetype) === 3) {
       req.session.cdstatus = 1;

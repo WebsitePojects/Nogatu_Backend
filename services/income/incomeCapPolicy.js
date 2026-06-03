@@ -24,14 +24,13 @@ function getLifetimeIncomeHeadroom({ packagePolicy = {}, storedTotals = {} }) {
 }
 
 function applyLifetimeIncomeCeiling({ packagePolicy = {}, storedTotals = {}, proposedIncome = {} }) {
-  const categories = ['dref', 'paircash', 'leadership', 'unilevel', 'hifive', 'lpc'];
+  const categories = ['dref', 'paircash', 'leadership', 'unilevel', 'hifive'];
   const allowedIncome = {
     dref: 0,
     paircash: 0,
     leadership: 0,
     unilevel: 0,
     hifive: 0,
-    lpc: 0,
   };
 
   const ceiling = toNumber(packagePolicy.lifetimeIncomeCeiling);

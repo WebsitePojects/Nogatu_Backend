@@ -5,42 +5,28 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 
 async function ensureContactMessagesTable() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS contact_messagestab (
-      id INT NOT NULL AUTO_INCREMENT,
-      name VARCHAR(150) NOT NULL,
-      email VARCHAR(200) DEFAULT NULL,
-      subject VARCHAR(255) DEFAULT NULL,
-      message TEXT NOT NULL,
-      status TINYINT NOT NULL DEFAULT 0,
-      ip_address VARCHAR(45) DEFAULT NULL,
-      submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_status (status),
-      KEY idx_submitted_at (submitted_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.CONTACT, 'Admin messages');
 }
 
 async function ensureContactBlocklistTable() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS contact_blockedtab (
-      id INT NOT NULL AUTO_INCREMENT,
-      email VARCHAR(200) DEFAULT NULL,
-      ip_address VARCHAR(45) DEFAULT NULL,
-      reason VARCHAR(255) DEFAULT NULL,
-      blocked_by VARCHAR(120) DEFAULT NULL,
-      active TINYINT NOT NULL DEFAULT 1,
-      blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_email (email),
-      KEY idx_ip_address (ip_address),
-      KEY idx_active (active)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.CONTACT, 'Admin messages');
 }
+
+router.use(adminAuth, adminRights([1, 3]));
+router.use(async (_req, res, next) => {
+  try {
+    await assertSchemaRequirements(SCHEMA_REQUIREMENTS.CONTACT, 'Admin messages');
+    next();
+  } catch (error) {
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return next(error);
+  }
+});
 
 function normalizeStatusFilter(raw) {
   const v = String(raw || 'all').toLowerCase();

@@ -19,14 +19,7 @@ const {
   maskSensitiveValue,
 } = require('../../utils/security');
 const { writeAuditLog } = require('../audit');
-
-const PAYOUT_OPTION_LABELS = {
-  1: 'Pickup',
-  2: 'GCash',
-  3: 'Remittance Center',
-  4: 'Bank Deposit',
-  5: 'Others',
-};
+const { resolvePayoutOption } = require('../payoutOptions');
 
 function getNextPayoutDate(baseDate = new Date()) {
   const payoutDate = new Date(baseDate);
@@ -51,8 +44,8 @@ function getNextPayoutDate(baseDate = new Date()) {
  * Insert income record
  * @param {number} uid - User ID
  * @param {Object} income - Income breakdown object
- *   { dref, paircash, leadership, unilevel, hifive, lpc, beginningbalance, endingbalance }
- *   income6 is reserved for Ranking Bonus fulfillment; calculateAndStoreIncome sends lpc=0.
+ *   { dref, paircash, leadership, unilevel, hifive, beginningbalance, endingbalance }
+ *   income6 is reserved for Ranking Bonus fulfillment and is not written by the shared income calculator.
  */
 async function insertIncome(uid, income) {
   const {
@@ -62,7 +55,6 @@ async function insertIncome(uid, income) {
     unilevel = 0,
     hifive = 0,
     ppctemp = 0,
-    lpc = 0,
     pairproduct = 0,
     beginningbalance = 0,
     endingbalance = 0,
@@ -84,7 +76,7 @@ async function insertIncome(uid, income) {
       0, 0, 0, 0, 0, 0,
       0, ?, 1, 0, NULL)`,
     [uid, beginningbalance, endingbalance,
-     dref, paircash, leadership, unilevel, hifive, lpc, now]
+     dref, paircash, leadership, unilevel, hifive, 0, now]
   );
 
   // Upsert into payouttotaltab (cumulative totals)
@@ -104,7 +96,7 @@ async function insertIncome(uid, income) {
       ttlcashbalance = VALUES(ttlcashbalance),
       ttlpointsbalance = ttlpointsbalance + VALUES(ttlpointsbalance),
       transdate = VALUES(transdate)`,
-    [uid, dref, paircash, leadership, unilevel, hifive, ppctemp, lpc, endingbalance, pairproduct, now]
+    [uid, dref, paircash, leadership, unilevel, hifive, ppctemp, 0, endingbalance, pairproduct, now]
   );
 
   return true;
@@ -168,7 +160,7 @@ async function getEncashmentPreview(uid, encashmentAmount, userInfo, conn = pool
     net: breakdown.net,
     newBalance: currentBalance - amount,
     paymentOptionId: Number(profile.payoutid || 0) || null,
-    paymentOption: PAYOUT_OPTION_LABELS[Number(profile.payoutid || 0)] || null,
+    paymentOption: resolvePayoutOption(profile.payoutid, { allowUnknown: true })?.label || null,
     paymentDetailsMasked: maskSensitiveValue(profile.payoutdetails),
     asOf: new Date().toISOString(),
   };
@@ -267,9 +259,10 @@ async function insertEncashment(uid, encashmentAmount, userInfo, options = {}) {
       );
     }
 
-    const payoutId = Number(profile.payoutid || 0);
+    const payoutOptionInfo = resolvePayoutOption(profile.payoutid, { allowUnknown: true });
+    const payoutId = Number(payoutOptionInfo?.id || 0);
     const payoutDetails = String(profile.payoutdetails || '').trim();
-    const payoutOption = PAYOUT_OPTION_LABELS[payoutId] || 'Others';
+    const payoutOption = payoutOptionInfo?.label || 'Others';
 
     const [insertResult] = await conn.query(
       `INSERT INTO payouthistorytab
@@ -293,7 +286,7 @@ async function insertEncashment(uid, encashmentAmount, userInfo, options = {}) {
         tax,
         fee,
         cdDeduction,
-        payoutId || null,
+        payoutOption || null,
         payoutDetails || null,
         now,
         now,

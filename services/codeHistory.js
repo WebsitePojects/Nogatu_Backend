@@ -12,7 +12,7 @@ const EVENT_LABELS = {
   registration_use: 'Registration Used',
   'registration-used': 'Registration Used',
   upgrade_use: 'Upgrade Used',
-  maintenance_use: 'Maintenance Used',
+  maintenance_use: 'Repurchase Used',
 };
 
 function pickName(username, fallback) {
@@ -59,10 +59,10 @@ function formatActivationHistoryEntry(row) {
         : 'Used this code for account upgrade.';
   } else if (eventType === 'maintenance_use') {
     summary = actorName !== 'Unknown'
-      ? `${actorName} used this code for maintenance.`
+      ? `${actorName} used this code for repurchase.`
       : toName !== 'Unknown'
-        ? `${toName} used this code for maintenance.`
-        : 'Used this code for maintenance.';
+        ? `${toName} used this code for repurchase.`
+        : 'Used this code for repurchase.';
   }
 
   return {

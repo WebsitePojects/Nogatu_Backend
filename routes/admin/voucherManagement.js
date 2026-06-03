@@ -1,374 +1,398 @@
-/**
- * Admin Voucher Management Routes
- * Handles voucher listing, suspension, reactivation, and transaction history.
- * Accessible by all admin roles: admin (1), cashier (2), BOD (3).
- */
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
+const { getAccountTypeName } = require('../../utils/helpers');
 const {
-  ensureVoucherTable,
-  ensureVoucherTxTable,
+  PACKAGE_AMOUNTS,
+  buildVoucherExpiryLabel,
   grantVouchersToExistingMembers,
-  getGrantEligibleMembers,
-  grantVouchersToMembers,
+  getVoucherExpiryMode,
+  UNUSED_VOUCHER_EXPIRY_MONTHS,
 } = require('../../services/voucher');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 
-const PER_PAGE = 30;
+async function ensureVoucherTables() {
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
+}
 
-const STATUS_MAP = {
-  1: 'Active',
-  2: 'Expired',
-  3: 'Fully Used',
-  4: 'Suspended',
-};
+router.use(adminAuth, adminRights([1, 2, 3]));
+router.use(async (_req, res, next) => {
+  try {
+    await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
+    next();
+  } catch (error) {
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return next(error);
+  }
+});
 
-const PACKAGE_MAP = {
-  10: 'Bronze',
-  20: 'Silver',
-  30: 'Gold',
-  40: 'Platinum',
-  50: 'Garnet',
-  60: 'Diamond',
-};
-
-const STATUS_CODE_BY_FILTER = {
-  active: 1,
-  expired: 2,
-  used: 3,
-  suspended: 4,
-  '1': 1,
-  '2': 2,
-  '3': 3,
-  '4': 4,
-};
+function normalizeVoucherStatus(raw) {
+  const value = String(raw || 'all').toLowerCase();
+  return ['1', '2', '3', '4'].includes(value) ? Number(value) : 'all';
+}
 
 /**
- * GET /api/admin/voucher-management?page=1&search=keyword&status=all|active|expired|used|suspended
- * List all vouchers with pagination, filtering, and summary counts
+ * GET /api/admin/voucher-management
  */
 router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
-    await ensureVoucherTable();
+    await ensureVoucherTables();
 
     const page = Math.max(1, Number(req.query.page) || 1);
-    const offset = (page - 1) * PER_PAGE;
-    const search = (req.query.search || '').trim();
-    const statusFilter = (req.query.status || 'all').toLowerCase();
+    const perPage = 30;
+    const offset = (page - 1) * perPage;
+    const search = String(req.query.search || '').trim();
+    const status = normalizeVoucherStatus(req.query.status);
 
-    // Build WHERE clauses
-    const conditions = [];
+    const filters = [];
     const params = [];
 
+    if (status !== 'all') {
+      filters.push('v.status = ?');
+      params.push(status);
+    }
+
     if (search) {
-      conditions.push('(m.username LIKE ? OR m.firstname LIKE ? OR m.lastname LIKE ?)');
-      const like = `%${search}%`;
-      params.push(like, like, like);
+      filters.push('(m.username LIKE ? OR CONCAT(v.id, \'\') LIKE ?)');
+      const pattern = `%${search}%`;
+      params.push(pattern, pattern);
     }
 
-    if (statusFilter !== 'all') {
-      const statusCode = STATUS_CODE_BY_FILTER[statusFilter];
-      if (statusCode) {
-        conditions.push('v.status = ?');
-        params.push(statusCode);
-      }
-    }
+    const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
 
-    const whereClause = conditions.length > 0
-      ? 'WHERE ' + conditions.join(' AND ')
-      : '';
-
-    // Summary counts (unfiltered by status/search — gives overall totals)
-    const [summaryRows] = await pool.query(
-      `SELECT
-        COUNT(*) AS total,
-        SUM(v.status = 1) AS active,
-        SUM(v.status = 2) AS expired,
-        SUM(v.status = 3) AS used,
-        SUM(v.status = 4) AS suspended
-      FROM voucherstab v`
-    );
-    const summary = {
-      total: Number(summaryRows[0].total) || 0,
-      active: Number(summaryRows[0].active) || 0,
-      expired: Number(summaryRows[0].expired) || 0,
-      used: Number(summaryRows[0].used) || 0,
-      suspended: Number(summaryRows[0].suspended) || 0,
-    };
-
-    // Count query (with filters applied)
     const [countRows] = await pool.query(
       `SELECT COUNT(*) AS total
        FROM voucherstab v
-       LEFT JOIN memberstab m ON v.uid = m.uid
-       ${whereClause}`,
+       LEFT JOIN memberstab m ON m.uid = v.uid
+       ${whereSql}`,
       params
     );
-    const totalFiltered = Number(countRows[0].total) || 0;
-    const totalPages = Math.ceil(totalFiltered / PER_PAGE) || 1;
 
-    // List query
-    const [vouchers] = await pool.query(
-      `SELECT v.id, v.uid, v.package_type, v.voucher_amount, v.remaining_balance,
-              v.issued_date, v.expiry_date, v.status, v.redeemed_date,
-              v.suspend_reason, v.suspended_by, v.suspended_at,
+    const [rows] = await pool.query(
+      `SELECT v.id, v.uid, v.package_type, v.voucher_amount, v.remaining_balance, v.status,
+              v.suspend_reason,
+              DATE_FORMAT(v.issued_date, '%Y-%m-%d %H:%i') AS issued_at,
+              DATE_FORMAT(v.expiry_date, '%Y-%m-%d %H:%i') AS expiry_at,
+              DATE_FORMAT(v.first_used_at, '%Y-%m-%d %H:%i') AS first_used_at,
+              DATE_FORMAT(v.use_expires_at, '%Y-%m-%d %H:%i') AS use_expires_at,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
-       LEFT JOIN memberstab m ON v.uid = m.uid
-       ${whereClause}
+       LEFT JOIN memberstab m ON m.uid = v.uid
+       ${whereSql}
        ORDER BY v.id DESC
-       LIMIT ? OFFSET ?`,
-      [...params, PER_PAGE, offset]
+       LIMIT ?, ?`,
+      [...params, offset, perPage]
     );
 
-    const formatted = vouchers.map((v) => {
-      const fullName = `${v.firstname || ''} ${v.lastname || ''}`.trim();
-      const packageName = PACKAGE_MAP[v.package_type] || `Type ${v.package_type}`;
-
-      return {
-        ...v,
-        status_label: STATUS_MAP[v.status] || 'Unknown',
-        package_name: packageName,
-
-        // Compatibility fields consumed by current frontend page.
-        fullName,
-        package: packageName,
-        amount: Number(v.voucher_amount || 0),
-        remaining: Number(v.remaining_balance || 0),
-        issuedAt: v.issued_date,
-        expiryAt: v.expiry_date,
-        suspendReason: v.suspend_reason,
-      };
-    });
-
-    const counts = {
-      all: summary.total,
-      active: summary.active,
-      expired: summary.expired,
-      fullyUsed: summary.used,
-      suspended: summary.suspended,
-    };
+    const [countsRows] = await pool.query(
+      `SELECT COUNT(*) AS allCount,
+              SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS activeCount,
+              SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) AS expiredCount,
+              SUM(CASE WHEN status = 3 THEN 1 ELSE 0 END) AS fullyUsedCount,
+              SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) AS suspendedCount
+       FROM voucherstab`
+    );
 
     res.json({
-      vouchers: formatted,
+      vouchers: rows.map((row) => {
+        const expiryMode = getVoucherExpiryMode(row);
+        return {
+          id: Number(row.id),
+          uid: Number(row.uid),
+          username: row.username,
+          fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,
+          package: getAccountTypeName(row.package_type),
+          amount: Number(row.voucher_amount || 0),
+          remaining: Number(row.remaining_balance || 0),
+          status: Number(row.status || 0),
+          issuedAt: row.issued_at,
+          expiryAt: row.expiry_at,
+          firstUsedAt: row.first_used_at,
+          useExpiresAt: row.use_expires_at,
+          expiryMode,
+          expiryLabel: buildVoucherExpiryLabel({
+            unusedExpiryDate: row.expiry_at,
+            usedExpiryDate: row.use_expires_at,
+            firstUsedAt: row.first_used_at,
+            status: row.status,
+          }),
+          suspendReason: row.suspend_reason,
+        };
+      }),
+      counts: {
+        all: Number(countsRows[0]?.allCount || 0),
+        active: Number(countsRows[0]?.activeCount || 0),
+        expired: Number(countsRows[0]?.expiredCount || 0),
+        fullyUsed: Number(countsRows[0]?.fullyUsedCount || 0),
+        suspended: Number(countsRows[0]?.suspendedCount || 0),
+      },
       pagination: {
         page,
-        perPage: PER_PAGE,
-        totalFiltered,
-        totalPages,
+        perPage,
+        total: Number(countRows[0]?.total || 0),
+        totalPages: Math.max(1, Math.ceil(Number(countRows[0]?.total || 0) / perPage)),
       },
-      counts,
-      summary,
     });
-  } catch (err) {
-    console.error('[Voucher Mgmt] List error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * POST /api/admin/voucher-management/grant-existing
- * Grant one-time vouchers to existing members that have no voucher yet.
- */
-router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  try {
-    const inserted = await grantVouchersToExistingMembers();
-    res.json({
-      success: true,
-      inserted,
-      message: `Granted ${inserted} voucher(s) to existing members without vouchers.`,
-    });
-  } catch (err) {
-    console.error('[Voucher Mgmt] Grant existing error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * GET /api/admin/voucher-management/grant-candidates?page=1&search=keyword
- * List members who have no voucher history and can be granted manually.
- */
-router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = Math.max(1, Math.min(100, Number(req.query.perPage) || 30));
-    const search = (req.query.search || '').trim();
-
-    const result = await getGrantEligibleMembers(page, perPage, search);
-    res.json(result);
-  } catch (err) {
-    console.error('[Voucher Mgmt] Grant candidates error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * POST /api/admin/voucher-management/grant
- * Body: { uids: number[] }
- * Grant vouchers to selected eligible members.
- */
-router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  try {
-    const rawUids = Array.isArray(req.body?.uids) ? req.body.uids : [];
-    const uids = Array.from(new Set(
-      rawUids
-        .map((value) => Number(value))
-        .filter((value) => Number.isFinite(value) && value > 0)
-    ));
-
-    if (uids.length === 0) {
-      return res.status(400).json({ error: 'Select at least one valid user account' });
-    }
-
-    const result = await grantVouchersToMembers(uids);
-
-    res.json({
-      ...result,
-      message: `Voucher grant finished. Granted: ${result.granted}, Skipped: ${result.skippedCount}.`,
-    });
-  } catch (err) {
-    console.error('[Voucher Mgmt] Grant selected error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * PUT /api/admin/voucher-management/:id/suspend
- * Suspend an active voucher
- * Body: { reason }
- */
-router.put('/:id/suspend', adminAuth, adminRights([1, 3]), async (req, res) => {
-  try {
-    await ensureVoucherTable();
-
-    const voucherId = Number(req.params.id);
-    const { reason } = req.body;
-
-    if (!reason || !reason.trim()) {
-      return res.status(400).json({ error: 'Suspend reason is required' });
-    }
-
-    // Verify voucher exists and is active
-    const [rows] = await pool.query(
-      'SELECT id, status FROM voucherstab WHERE id = ?',
-      [voucherId]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Voucher not found' });
-    }
-
-    if (rows[0].status !== 1) {
-      return res.status(400).json({
-        error: `Cannot suspend voucher with status "${STATUS_MAP[rows[0].status] || rows[0].status}". Only active vouchers can be suspended.`,
-      });
-    }
-
-    const adminUsername = req.session.adminusername || req.session.adminid;
-
-    await pool.query(
-      `UPDATE voucherstab
-       SET status = 4, suspend_reason = ?, suspended_by = ?, suspended_at = NOW()
-       WHERE id = ?`,
-      [reason.trim(), adminUsername, voucherId]
-    );
-
-    res.json({ message: 'Voucher suspended successfully' });
-  } catch (err) {
-    console.error('[Voucher Mgmt] Suspend error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * PUT /api/admin/voucher-management/:id/unsuspend
- * Reactivate a suspended voucher (only if not expired)
- */
-router.put('/:id/unsuspend', adminAuth, adminRights([1, 3]), async (req, res) => {
-  try {
-    await ensureVoucherTable();
-
-    const voucherId = Number(req.params.id);
-
-    // Verify voucher exists, is suspended, and not expired
-    const [rows] = await pool.query(
-      'SELECT id, status, expiry_date FROM voucherstab WHERE id = ?',
-      [voucherId]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Voucher not found' });
-    }
-
-    if (rows[0].status !== 4) {
-      return res.status(400).json({
-        error: `Cannot unsuspend voucher with status "${STATUS_MAP[rows[0].status] || rows[0].status}". Only suspended vouchers can be reactivated.`,
-      });
-    }
-
-    const expiryDate = new Date(rows[0].expiry_date);
-    if (expiryDate < new Date()) {
-      return res.status(400).json({
-        error: 'Cannot unsuspend voucher — it has already expired.',
-      });
-    }
-
-    await pool.query(
-      `UPDATE voucherstab
-       SET status = 1, suspend_reason = NULL, suspended_by = NULL, suspended_at = NULL
-       WHERE id = ?`,
-      [voucherId]
-    );
-
-    res.json({ message: 'Voucher reactivated successfully' });
-  } catch (err) {
-    console.error('[Voucher Mgmt] Unsuspend error:', err);
+  } catch (error) {
+    console.error('[Admin Voucher Management] List error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 /**
  * GET /api/admin/voucher-management/:id/transactions
- * Get transaction history for a specific voucher
  */
 router.get('/:id/transactions', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
-    await ensureVoucherTable();
-    await ensureVoucherTxTable();
-
+    await ensureVoucherTables();
     const voucherId = Number(req.params.id);
 
-    // Verify voucher exists
-    const [voucherRows] = await pool.query(
-      'SELECT id FROM voucherstab WHERE id = ?',
-      [voucherId]
-    );
-
-    if (voucherRows.length === 0) {
-      return res.status(404).json({ error: 'Voucher not found' });
-    }
-
-    const [transactions] = await pool.query(
-      `SELECT id, uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date
+    const [rows] = await pool.query(
+      `SELECT id,
+              DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') AS transaction_date,
+              cash_paid, voucher_used, total_value
        FROM voucher_transactionstab
        WHERE voucher_id = ?
-       ORDER BY transaction_date DESC`,
+       ORDER BY transaction_date DESC, id DESC`,
       [voucherId]
     );
 
     res.json({
-      transactions: transactions.map((t) => ({
-        ...t,
-        date: t.transaction_date,
-        type: 'Voucher',
-        amount: Number(t.total_value || 0),
-        reference: `V-${t.voucher_id}-${t.id}`,
+      transactions: rows.map((row) => ({
+        id: Number(row.id),
+        date: row.transaction_date,
+        type: 'Voucher Redemption',
+        amount: Number(row.voucher_used || row.total_value || 0),
+        reference: `VTX-${row.id}`,
       })),
     });
-  } catch (err) {
-    console.error('[Voucher Mgmt] Transactions error:', err);
+  } catch (error) {
+    console.error('[Admin Voucher Management] Transactions error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * PUT /api/admin/voucher-management/:id/suspend
+ */
+router.put('/:id/suspend', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const voucherId = Number(req.params.id);
+    const reason = String(req.body?.reason || '').trim();
+
+    if (!reason) {
+      return res.status(400).json({ error: 'Suspension reason is required' });
+    }
+
+    const [result] = await pool.query(
+      `UPDATE voucherstab
+       SET status = 4, suspend_reason = ?, suspended_by = ?, suspended_at = NOW()
+       WHERE id = ? AND status = 1
+       LIMIT 1`,
+      [reason, req.session.adminusername || String(req.session.adminid || 'admin'), voucherId]
+    );
+
+    if (result.affectedRows !== 1) {
+      return res.status(404).json({ error: 'Active voucher not found' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Suspend error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * PUT /api/admin/voucher-management/:id/unsuspend
+ */
+router.put('/:id/unsuspend', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const voucherId = Number(req.params.id);
+
+    const [result] = await pool.query(
+      `UPDATE voucherstab
+       SET status = 1, suspend_reason = NULL, suspended_by = NULL, suspended_at = NULL
+       WHERE id = ? AND status = 4
+       LIMIT 1`,
+      [voucherId]
+    );
+
+    if (result.affectedRows !== 1) {
+      return res.status(404).json({ error: 'Suspended voucher not found' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Unsuspend error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/admin/voucher-management/grant-existing
+ */
+router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const inserted = await grantVouchersToExistingMembers();
+
+    res.json({
+      success: true,
+      inserted,
+      message: `Granted ${inserted} voucher(s) to existing members without vouchers.`,
+    });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Grant existing error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/voucher-management/grant-candidates
+ */
+router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = 30;
+    const offset = (page - 1) * perPage;
+    const search = String(req.query.search || '').trim();
+
+    const filters = ['u.uid = u.mainid'];
+    const params = [];
+
+    if (search) {
+      filters.push('(m.username LIKE ? OR m.firstname LIKE ? OR m.lastname LIKE ? OR CONCAT(u.uid, \'\') LIKE ?)');
+      const pattern = `%${search}%`;
+      params.push(pattern, pattern, pattern, pattern);
+    }
+
+    const whereSql = `WHERE ${filters.join(' AND ')}`;
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total
+       FROM usertab u
+       INNER JOIN memberstab m ON m.uid = u.uid
+       LEFT JOIN voucherstab v ON v.uid = u.uid
+       ${whereSql} AND v.id IS NULL`,
+      params
+    );
+
+    const [rows] = await pool.query(
+      `SELECT u.uid, u.currentaccttype, u.accttype,
+              DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg,
+              m.username, m.firstname, m.lastname
+       FROM usertab u
+       INNER JOIN memberstab m ON m.uid = u.uid
+       LEFT JOIN voucherstab v ON v.uid = u.uid
+       ${whereSql} AND v.id IS NULL
+       ORDER BY u.datereg DESC
+       LIMIT ?, ?`,
+      [...params, offset, perPage]
+    );
+
+    res.json({
+      users: rows.map((row) => {
+        const accttype = Number(row.currentaccttype || row.accttype || 0);
+        return {
+          uid: Number(row.uid),
+          username: row.username,
+          fullname: `${row.firstname} ${row.lastname}`.trim(),
+          accttype,
+          datereg: row.datereg,
+          voucherAmount: Number(PACKAGE_AMOUNTS[accttype] || 0),
+        };
+      }),
+      total: Number(countRows[0]?.total || 0),
+      page,
+      totalPages: Math.max(1, Math.ceil(Number(countRows[0]?.total || 0) / perPage)),
+    });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Grant candidates error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/admin/voucher-management/grant
+ */
+router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  const connection = await pool.getConnection();
+
+  try {
+    await ensureVoucherTables();
+
+    const uids = Array.isArray(req.body?.uids)
+      ? req.body.uids.map((uid) => Number(uid)).filter((uid) => Number.isFinite(uid) && uid > 0)
+      : [];
+
+    if (uids.length === 0) {
+      return res.status(400).json({ error: 'At least one UID is required' });
+    }
+
+    await connection.beginTransaction();
+
+    let granted = 0;
+    let skippedCount = 0;
+
+    for (const uid of uids) {
+      const [existing] = await connection.query(
+        'SELECT id FROM voucherstab WHERE uid = ? LIMIT 1',
+        [uid]
+      );
+
+      if (existing.length > 0) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const [accountRows] = await connection.query(
+        `SELECT currentaccttype, accttype
+         FROM usertab
+         WHERE uid = ? AND uid = mainid
+         LIMIT 1`,
+        [uid]
+      );
+
+      if (accountRows.length === 0) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const accttype = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
+      const voucherAmount = Number(PACKAGE_AMOUNTS[accttype] || 0);
+      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[accttype] || 0);
+
+      if (!voucherAmount || !expiryMonths) {
+        skippedCount += 1;
+        continue;
+      }
+
+      await connection.query(
+        `INSERT INTO voucherstab
+           (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
+         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
+        [uid, accttype, voucherAmount, voucherAmount, expiryMonths]
+      );
+
+      granted += 1;
+    }
+
+    await connection.commit();
+    res.json({ success: true, granted, skippedCount });
+  } catch (error) {
+    await connection.rollback();
+    console.error('[Admin Voucher Management] Grant error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    connection.release();
   }
 });
 

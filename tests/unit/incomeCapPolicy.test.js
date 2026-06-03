@@ -23,7 +23,6 @@ test('applyLifetimeIncomeCeiling blocks all further income once a bronze account
       leadership: 200,
       unilevel: 100,
       hifive: 300,
-      lpc: 0,
     },
   });
 
@@ -34,7 +33,6 @@ test('applyLifetimeIncomeCeiling blocks all further income once a bronze account
     leadership: 0,
     unilevel: 0,
     hifive: 0,
-    lpc: 0,
   });
   assert.equal(adjusted.blockedTotal, 2100);
 });
@@ -56,7 +54,6 @@ test('applyLifetimeIncomeCeiling clips mixed income deterministically against re
       leadership: 800,
       unilevel: 500,
       hifive: 700,
-      lpc: 0,
     },
   });
 
@@ -66,7 +63,6 @@ test('applyLifetimeIncomeCeiling clips mixed income deterministically against re
     leadership: 0,
     unilevel: 0,
     hifive: 0,
-    lpc: 0,
   });
   assert.equal(adjusted.allowedTotal, 3000);
   assert.equal(adjusted.blockedTotal, 3000);

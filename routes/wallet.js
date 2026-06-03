@@ -7,6 +7,8 @@ const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
 const { insertEncashment, getEncashmentPreview } = require('../services/income/insertIncome');
+const { getMemberGlobalBonus } = require('../services/globalBonus');
+const { assertTinPresentForEncashment } = require('../services/memberTinPolicy');
 
 /**
  * GET /api/wallet
@@ -20,6 +22,15 @@ router.get('/', memberAuth, async (req, res) => {
     const currentaccttype = req.session.currentaccttype;
 
     const updated = await calculateAndStoreIncome(uid, currentaccttype);
+    const globalBonus = await getMemberGlobalBonus(uid).catch(() => ({
+      eligible: false,
+      visibilityState: 'locked',
+      interactive: false,
+      fullVisibility: false,
+      lockedReason: 'Global bonus status is unavailable right now.',
+      labels: [],
+      portions: 0,
+    }));
 
     res.json({
       directReferral: Number(updated.ttlincome1 || 0),
@@ -28,8 +39,16 @@ router.get('/', memberAuth, async (req, res) => {
       unilevel:       Number(updated.ttlincome4 || 0),
       hifive:         Number(updated.ttlincome5 || 0),
       rankingBonus:   Number(updated.ttlincome6 || 0),
-      legacyIncome6:  Number(updated.ttlincome6 || 0),
       cashBalance:    Number(updated.ttlcashbalance || 0),
+      globalBonusStatus: {
+        eligible: Boolean(globalBonus.eligible),
+        visibilityState: globalBonus.visibilityState || (globalBonus.eligible ? 'unlocked' : 'locked'),
+        interactive: Boolean(globalBonus.interactive),
+        fullVisibility: Boolean(globalBonus.fullVisibility),
+        lockedReason: globalBonus.lockedReason || null,
+        labels: Array.isArray(globalBonus.labels) ? globalBonus.labels : [],
+        portions: Number(globalBonus.portions || 0),
+      },
       totalIncome:    Number(updated.ttlincome1 || 0) + Number(updated.ttlincome2 || 0) +
                       Number(updated.ttlincome3 || 0) + Number(updated.ttlincome4 || 0) +
                       Number(updated.ttlincome5 || 0) + Number(updated.ttlincome6 || 0),
@@ -52,6 +71,8 @@ router.post('/preview-encash', memberAuth, async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
+
+    await assertTinPresentForEncashment(uid);
 
     const preview = await getEncashmentPreview(uid, amount);
     if (!preview.payout.ok) {
@@ -76,6 +97,9 @@ router.post('/preview-encash', memberAuth, async (req, res) => {
     if (err.message === 'Invalid encashment amount') {
       return res.status(400).json({ error: err.message });
     }
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message, code: err.code });
+    }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -92,6 +116,8 @@ router.post('/encash', memberAuth, async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
+
+    await assertTinPresentForEncashment(uid);
 
     const result = await insertEncashment(uid, amount, null, {
       req,

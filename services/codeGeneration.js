@@ -14,6 +14,9 @@ const { MAINTENANCE_PRODUCT_CONFIG } = require('../constants/maintenanceProductC
 // Product configuration - 1:1 from PHP codeInsert()
 const PRODUCT_CONFIG = {
   // Account types (10-60)
+  // Keep persisted binarypoints aligned with the live PHP/DB shape:
+  // peso-equivalent pairing values are stored in codestab/usertab/upgradetab,
+  // while human-readable BP counts live in helpers/package metadata.
   10: { name: 'Bronze', directreferral: 250, binarypoints: 250, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 2500 },
   20: { name: 'Silver', directreferral: 500, binarypoints: 500, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 5000 },
   30: { name: 'Gold', directreferral: 1000, binarypoints: 1000, unilevelpoints: 0, incentivepoints: 0, profitsharing: 0, productamount: 10000 },
@@ -26,6 +29,31 @@ const PRODUCT_CONFIG = {
 
 // Code type prefixes
 const CODE_PREFIXES = { 1: 'PD', 2: 'FS', 3: 'CD' };
+const PACKAGE_ABBREVIATIONS = {
+  10: 'BR',
+  20: 'SI',
+  30: 'GO',
+  40: 'PL',
+  50: 'GA',
+  60: 'DI',
+};
+
+function buildEntryCodePrefix(productType, codeType) {
+  if (Number(productType) >= 100) {
+    return 'MC';
+  }
+
+  const typePrefix = CODE_PREFIXES[Number(codeType)] || 'PD';
+  const packagePrefix = PACKAGE_ABBREVIATIONS[Number(productType)] || 'PK';
+  return `${typePrefix}${packagePrefix}`;
+}
+
+function buildGeneratedCode(num, productType, codeType) {
+  const prefix = buildEntryCodePrefix(productType, codeType);
+  const hashLength = Number(productType) >= 100 ? 10 : 8;
+  const hash = PseudoCrypt.hash(num, hashLength).toUpperCase();
+  return prefix + hash;
+}
 
 /**
  * Generate activation codes
@@ -53,20 +81,23 @@ async function generateCodes(noOfCodes, productType, codeType, stockistId, admin
   const generatedCodes = [];
 
   for (let i = 0; i < noOfCodes; i++) {
-    const num = startNum + i;
-    let hash = PseudoCrypt.hash(num, 10).toUpperCase();
+    let num = startNum + i;
+    let code = buildGeneratedCode(num, productType, codeType);
+    let duplicateGuard = 0;
 
-    // Add prefix based on code type or product type
-    let prefix;
-    if (productType >= 100) {
-      prefix = 'MC';
-    } else {
-      prefix = CODE_PREFIXES[codeType] || 'PD';
+    while (duplicateGuard < 20) {
+      const [existingRows] = await pool.query(
+        'SELECT id FROM codestab WHERE code = ? LIMIT 1',
+        [code]
+      );
+      if (existingRows.length === 0) {
+        break;
+      }
+      duplicateGuard += 1;
+      num += 1;
+      code = buildGeneratedCode(num, productType, codeType);
     }
 
-    const code = prefix + hash;
-
-    // Insert into database
     await codeInsert(code, productType, codeType, stockistId, adminId);
     generatedCodes.push(code);
   }
@@ -107,4 +138,11 @@ async function codeInsert(code, productType, codeType, stockistId, adminId) {
   });
 }
 
-module.exports = { generateCodes, PRODUCT_CONFIG, CODE_PREFIXES };
+module.exports = {
+  generateCodes,
+  PRODUCT_CONFIG,
+  CODE_PREFIXES,
+  PACKAGE_ABBREVIATIONS,
+  buildEntryCodePrefix,
+  buildGeneratedCode,
+};

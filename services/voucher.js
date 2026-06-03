@@ -5,75 +5,40 @@
  * - One voucher per new member at registration based on package tier
  * - Voucher amount = package amount
  * - Buy 1 Take 1: cash paid = voucher deducted, member receives double products
- * - Expiry: Bronze=30d, Silver=40d, Gold=45d, Platinum=50d, Garnet=55d, Diamond=60d
+ * - Unused voucher expiry: 224466 month ladder by package
+ * - Used voucher expiry: first-use countdown keeps the existing day-based ladder
  */
 const { pool } = require('../config/database');
 const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
 
 async function ensureVoucherTable() {
   if (voucherTableReady) return;
-
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS voucherstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      package_type INT NOT NULL,
-      voucher_amount DECIMAL(12,2) NOT NULL,
-      remaining_balance DECIMAL(12,2) NOT NULL,
-      issued_date DATETIME NOT NULL,
-      expiry_date DATETIME NOT NULL,
-      status INT NOT NULL DEFAULT 1,
-      redeemed_date DATETIME DEFAULT NULL,
-      suspend_reason VARCHAR(500) DEFAULT NULL,
-      suspended_by VARCHAR(120) DEFAULT NULL,
-      suspended_at DATETIME DEFAULT NULL,
-      PRIMARY KEY (id),
-      KEY idx_uid (uid),
-      KEY idx_status (status),
-      KEY idx_expiry_date (expiry_date)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
-  // Add suspend columns if table existed before this update
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN suspend_reason VARCHAR(500) DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN suspended_by VARCHAR(120) DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN suspended_at DATETIME DEFAULT NULL');
-  } catch { /* column exists */ }
-
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Vouchers');
   voucherTableReady = true;
 }
 
 async function ensureVoucherTxTable() {
   if (voucherTxTableReady) return;
-
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS voucher_transactionstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      voucher_id INT NOT NULL,
-      cash_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
-      voucher_used DECIMAL(12,2) NOT NULL DEFAULT 0,
-      total_value DECIMAL(12,2) NOT NULL DEFAULT 0,
-      transaction_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_uid (uid),
-      KEY idx_voucher_id (voucher_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Vouchers');
   voucherTxTableReady = true;
 }
 
-// Voucher expiry days by package type
-const VOUCHER_EXPIRY_DAYS = {
+// Unused voucher expiry month ladder follows the approved 224466 rule.
+const UNUSED_VOUCHER_EXPIRY_MONTHS = {
+  10: 2,   // Bronze
+  20: 2,   // Silver
+  30: 4,   // Gold
+  40: 4,   // Platinum
+  50: 6,   // Garnet
+  60: 6,   // Diamond
+};
+
+// Once a voucher is first used, keep the existing day-based countdown.
+const USED_VOUCHER_EXPIRY_DAYS = {
   10: 30,   // Bronze
   20: 40,   // Silver
   30: 45,   // Gold
@@ -111,6 +76,35 @@ function normalizeVoucherProductSelection(options = {}) {
 }
 
 /**
+ * Business rule:
+ * Voucher-funded product purchases must never earn repurchase points.
+ */
+function getVoucherRepurchasePoints() {
+  return 0;
+}
+
+function buildVoucherExpiryLabel({ unusedExpiryDate, usedExpiryDate, firstUsedAt, status }) {
+  if (Number(status || 0) === 2) return 'Expired';
+  if (Number(status || 0) === 3) return 'Fully used';
+  if (Number(status || 0) === 4) return 'Suspended';
+
+  const targetDate = firstUsedAt ? usedExpiryDate : unusedExpiryDate;
+  if (!targetDate) return firstUsedAt ? 'In use' : 'Active';
+
+  const expiry = new Date(targetDate);
+  if (Number.isNaN(expiry.getTime())) return 'Active';
+  const diffMs = expiry.getTime() - Date.now();
+  const daysRemaining = Math.max(0, Math.ceil(diffMs / 86400000));
+  if (daysRemaining === 0) return 'Expires today';
+  if (daysRemaining === 1) return '1 day left';
+  return `${daysRemaining} days left`;
+}
+
+function getVoucherExpiryMode(row) {
+  return row?.first_used_at ? 'used' : 'unused';
+}
+
+/**
  * Issue a voucher for a new member at registration
  * @param {object} conn - DB connection (for use within transaction)
  * @param {number} uid - Member UID
@@ -120,32 +114,18 @@ async function issueVoucher(conn, uid, packageType) {
   await ensureVoucherTable();
 
   const amount = PACKAGE_AMOUNTS[packageType];
-  const expiryDays = VOUCHER_EXPIRY_DAYS[packageType];
+  const expiryMonths = UNUSED_VOUCHER_EXPIRY_MONTHS[packageType];
 
-  if (!amount || !expiryDays) return null;
+  if (!amount || !expiryMonths) return null;
 
   const [result] = await conn.query(
     `INSERT INTO voucherstab (uid, package_type, voucher_amount, remaining_balance,
      issued_date, expiry_date, status)
-     VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY), 1)`,
-    [uid, packageType, amount, amount, expiryDays]
+     VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
+    [uid, packageType, amount, amount, expiryMonths]
   );
 
   return result.insertId;
-}
-
-function buildVoucherExpiryLabel(expiryDate, status) {
-  if (!expiryDate || Number(status || 0) === 2) return 'Expired';
-  if (Number(status || 0) === 3) return 'Fully used';
-  if (Number(status || 0) === 4) return 'Suspended';
-
-  const expiry = new Date(expiryDate);
-  if (Number.isNaN(expiry.getTime())) return 'Active';
-  const diffMs = expiry.getTime() - Date.now();
-  const daysRemaining = Math.max(0, Math.ceil(diffMs / 86400000));
-  if (daysRemaining === 0) return 'Expires today';
-  if (daysRemaining === 1) return '1 day left';
-  return `${daysRemaining} days left`;
 }
 
 /**
@@ -155,7 +135,15 @@ async function getVouchers(uid) {
   await ensureVoucherTable();
 
   await pool.query(
-    'UPDATE voucherstab SET status = 2 WHERE uid = ? AND status = 1 AND expiry_date < NOW()',
+    `UPDATE voucherstab
+        SET status = 2
+      WHERE uid = ?
+        AND status = 1
+        AND (
+          (first_used_at IS NULL AND expiry_date < NOW())
+          OR
+          (first_used_at IS NOT NULL AND use_expires_at IS NOT NULL AND use_expires_at < NOW())
+        )`,
     [uid]
   );
 
@@ -163,11 +151,14 @@ async function getVouchers(uid) {
     `SELECT id, uid, package_type, voucher_amount, remaining_balance,
             DATE_FORMAT(issued_date, '%Y-%m-%d') as issued_date,
             DATE_FORMAT(expiry_date, '%Y-%m-%d') as expiry_date,
+            DATE_FORMAT(first_used_at, '%Y-%m-%d') as first_used_at,
+            DATE_FORMAT(use_expires_at, '%Y-%m-%d') as use_expires_at,
             status,
             CASE
               WHEN status = 4 THEN 'Suspended'
               WHEN status = 3 THEN 'Fully Used'
-              WHEN expiry_date < NOW() THEN 'Expired'
+              WHEN first_used_at IS NULL AND expiry_date < NOW() THEN 'Expired'
+              WHEN first_used_at IS NOT NULL AND use_expires_at IS NOT NULL AND use_expires_at < NOW() THEN 'Expired'
               ELSE 'Active'
             END as status_label
      FROM voucherstab WHERE uid = ? ORDER BY id DESC`,
@@ -176,7 +167,13 @@ async function getVouchers(uid) {
 
   return rows.map((row) => ({
     ...row,
-    expiry_label: buildVoucherExpiryLabel(row.expiry_date, row.status),
+    expiry_mode: getVoucherExpiryMode(row),
+    expiry_label: buildVoucherExpiryLabel({
+      unusedExpiryDate: row.expiry_date,
+      usedExpiryDate: row.use_expires_at,
+      firstUsedAt: row.first_used_at,
+      status: row.status,
+    }),
   }));
 }
 
@@ -223,7 +220,13 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     if (selectedVoucherId > 0) {
       const [voucherRows] = await conn.query(
         `SELECT * FROM voucherstab
-         WHERE id = ? AND uid = ? AND status = 1 AND expiry_date >= NOW() AND remaining_balance > 0
+         WHERE id = ? AND uid = ? AND status = 1
+           AND remaining_balance > 0
+           AND (
+             (first_used_at IS NULL AND expiry_date >= NOW())
+             OR
+             (first_used_at IS NOT NULL AND use_expires_at IS NOT NULL AND use_expires_at >= NOW())
+           )
          LIMIT 1
          FOR UPDATE`,
         [selectedVoucherId, memberUid]
@@ -232,8 +235,14 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     } else {
       const [voucherRows] = await conn.query(
         `SELECT * FROM voucherstab
-         WHERE uid = ? AND status = 1 AND expiry_date >= NOW() AND remaining_balance > 0
-         ORDER BY expiry_date ASC, id ASC
+         WHERE uid = ? AND status = 1
+           AND remaining_balance > 0
+           AND (
+             (first_used_at IS NULL AND expiry_date >= NOW())
+             OR
+             (first_used_at IS NOT NULL AND use_expires_at IS NOT NULL AND use_expires_at >= NOW())
+           )
+         ORDER BY COALESCE(use_expires_at, expiry_date) ASC, id ASC
          LIMIT 1
          FOR UPDATE`,
         [memberUid]
@@ -271,14 +280,21 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     const newBalance = remaining - voucherDeduction;
     const newStatus = newBalance <= 0 ? 3 : 1;
     const newWalletBalance = currentWalletBalance - cashPaid;
+    const firstUseDays = Number(USED_VOUCHER_EXPIRY_DAYS[Number(voucher.package_type || 0)] || 0);
+    const startsFirstUseWindow = !voucher.first_used_at && voucherDeduction > 0 && firstUseDays > 0;
 
     await conn.query(
       `UPDATE voucherstab
           SET remaining_balance = ?,
               status = ?,
+              first_used_at = CASE WHEN ? THEN NOW() ELSE first_used_at END,
+              use_expires_at = CASE
+                WHEN ? THEN DATE_ADD(NOW(), INTERVAL ? DAY)
+                ELSE use_expires_at
+              END,
               redeemed_date = CASE WHEN ? = 3 THEN NOW() ELSE redeemed_date END
         WHERE id = ? LIMIT 1`,
-      [newBalance, newStatus, newStatus, resolvedVoucherId]
+      [newBalance, newStatus, startsFirstUseWindow ? 1 : 0, startsFirstUseWindow ? 1 : 0, firstUseDays, newStatus, resolvedVoucherId]
     );
 
     const [walletUpdate] = await conn.query(
@@ -298,10 +314,11 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
 
     if (selectedProduct) {
       const voucherReferenceCode = `VCHR-${resolvedVoucherId}-${Date.now()}`;
+      const repurchasePoints = getVoucherRepurchasePoints();
       await conn.query(
         `INSERT INTO repurchasetab (id, uid, producttype, code, transtype, codeid, incentivepoints1, transdate)
          VALUES (NULL, ?, ?, ?, 1, 1, ?, NOW())`,
-        [memberUid, selectedProduct.code, voucherReferenceCode, selectedProduct.incentivePoints]
+        [memberUid, selectedProduct.code, voucherReferenceCode, repurchasePoints]
       );
     }
 
@@ -362,7 +379,16 @@ async function getVoucherTransactions(uid) {
 async function getAllVouchers(page = 1, perPage = 30) {
   await ensureVoucherTable();
 
-  await pool.query('UPDATE voucherstab SET status = 2 WHERE status = 1 AND expiry_date < NOW()');
+  await pool.query(
+    `UPDATE voucherstab
+        SET status = 2
+      WHERE status = 1
+        AND (
+          (first_used_at IS NULL AND expiry_date < NOW())
+          OR
+          (first_used_at IS NOT NULL AND use_expires_at IS NOT NULL AND use_expires_at < NOW())
+        )`
+  );
 
   const offset = (page - 1) * perPage;
 
@@ -514,15 +540,15 @@ async function grantVouchersToMembers(uids = []) {
       const uid = Number(row.uid);
       const packageType = Number(row.currentaccttype || 0);
       const amount = Number(PACKAGE_AMOUNTS[packageType] || 0);
-      const expiryDays = Number(VOUCHER_EXPIRY_DAYS[packageType] || 0);
+      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[packageType] || 0);
 
-      if (!uid || !amount || !expiryDays) continue;
+      if (!uid || !amount || !expiryMonths) continue;
 
       await conn.query(
         `INSERT INTO voucherstab
           (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY), 1)`,
-        [uid, packageType, amount, amount, expiryDays]
+         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
+        [uid, packageType, amount, amount, expiryMonths]
       );
 
       grantedUids.push(uid);
@@ -580,13 +606,13 @@ async function grantVouchersToExistingMembers() {
        DATE_ADD(
          NOW(),
          INTERVAL CASE u.currentaccttype
-           WHEN 10 THEN 30
-           WHEN 20 THEN 40
-           WHEN 30 THEN 45
-           WHEN 40 THEN 50
-           WHEN 50 THEN 55
-           WHEN 60 THEN 60
-         END DAY
+           WHEN 10 THEN 2
+           WHEN 20 THEN 2
+           WHEN 30 THEN 4
+           WHEN 40 THEN 4
+           WHEN 50 THEN 6
+           WHEN 60 THEN 6
+         END MONTH
        ),
        1
      FROM usertab u
@@ -612,6 +638,10 @@ module.exports = {
   ensureVoucherTxTable,
   normalizeVoucherProductSelection,
   VOUCHER_PRODUCT_CATALOG,
-  VOUCHER_EXPIRY_DAYS,
+  UNUSED_VOUCHER_EXPIRY_MONTHS,
+  USED_VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,
+  buildVoucherExpiryLabel,
+  getVoucherExpiryMode,
+  getVoucherRepurchasePoints,
 };

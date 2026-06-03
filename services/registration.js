@@ -13,43 +13,15 @@ const { createPublicId, createReferralSlug, createProcessKey } = require('../uti
 const { normalizeEmail, isValidEmail } = require('../utils/email');
 const { evaluateDuplicateIdentity, normalizeContactNo, normalizeDob } = require('./identityIntegrity');
 const { appendPlacementAudit, appendActivationCodeUsage } = require('./registrationAudit');
+const { getPlacementPolicyForSponsor } = require('./binaryPlacementPolicy');
+const { recommendPlacementForSponsor } = require('./placementRecommendation');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 let memberTinColumnReady = false;
 
 async function ensureMemberTinColumn() {
   if (memberTinColumnReady) return;
-
-  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
-  if (columns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
-  }
-
-  const [emailColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'email'");
-  if (emailColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN email VARCHAR(180) DEFAULT NULL');
-  } else if (!String(emailColumns[0].Type || '').toLowerCase().includes('180')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN email VARCHAR(180) DEFAULT NULL');
-  }
-
-  const [contactColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'contactnos'");
-  if (contactColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN contactnos VARCHAR(30) DEFAULT NULL');
-  } else if (!String(contactColumns[0].Type || '').toLowerCase().includes('30')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN contactnos VARCHAR(30) DEFAULT NULL');
-  }
-
-  const [addressColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'address'");
-  if (addressColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN address VARCHAR(255) DEFAULT NULL');
-  }
-
-  const [dobColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'dob'");
-  if (dobColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN dob VARCHAR(30) DEFAULT NULL');
-  } else if (!String(dobColumns[0].Type || '').toLowerCase().includes('30')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN dob VARCHAR(30) DEFAULT NULL');
-  }
-
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.MEMBER_PROFILE, 'Member registration');
   memberTinColumnReady = true;
 }
 
@@ -63,6 +35,15 @@ function createDuplicateRegistrationError(details) {
 function createPlacementBusyError(message = 'This placement is busy right now. Please try again.') {
   const error = new Error(message);
   error.code = 'PLACEMENT_LOCKED';
+  return error;
+}
+
+function createUsernameTakenError(username) {
+  const error = new Error('Username already exists. Please choose another username.');
+  error.code = 'USERNAME_TAKEN';
+  error.details = {
+    username: sanitizeAlphaNum(username),
+  };
   return error;
 }
 
@@ -101,7 +82,7 @@ async function acquireRegistrationAdvisoryLocks(conn, lockKeys = []) {
   for (const rawKey of lockKeys) {
     const lockKey = String(rawKey || '').trim();
     if (!lockKey) continue;
-    const [rows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
+    const [rows] = await conn.query('SELECT GET_LOCK(?, 30) AS lockState', [lockKey]);
     if (Number(rows[0]?.lockState || 0) !== 1) {
       throw new Error('Registration is busy right now. Please try again.');
     }
@@ -184,6 +165,7 @@ async function previewActivationCode(code) {
     packageLabel,
     productamount: Number(row.productamount || 0),
     accountLabel: `${packageLabel} - ${codeTypeLabel}`,
+    dropdownLabel: `${codeTypeLabel} - ${packageLabel}`,
     reason: !isAvailable
       ? 'Code is not available.'
       : !isPackageEntryCode
@@ -334,18 +316,53 @@ async function checkDuplicateName(firstname, lastname) {
   };
 }
 
+function formatAvailableCodeRow(row) {
+  const packageLabel = ACCOUNT_TYPES[Number(row.producttype || 0)] || `Type ${row.producttype}`;
+  const codeTypeLabel = CODE_PREFIXES[Number(row.codetype || 0)] || 'Unknown';
+  const dropdownLabel = `${codeTypeLabel} - ${packageLabel}`;
+
+  return {
+    id: Number(row.id || 0),
+    code: row.code,
+    value: row.code,
+    codeId: Number(row.id || 0),
+    producttype: Number(row.producttype || 0),
+    packageType: Number(row.producttype || 0),
+    productamount: Number(row.productamount || 0),
+    packageAmount: Number(row.productamount || 0),
+    codetype: Number(row.codetype || 0),
+    packageLabel,
+    codeTypeLabel,
+    accountLabel: `${packageLabel} - ${codeTypeLabel}`,
+    dropdownLabel,
+    legacyLabel: dropdownLabel,
+    displayName: `${dropdownLabel} - ${row.code}`,
+    label: `${dropdownLabel} - ${row.code}`,
+  };
+}
+
 /**
  * Get available codes for a sponsor by package type (DOC2 §4.5)
  * Used for auto-fill code dropdown on registration form
  */
 async function getAvailableCodes(sponsorUid, packageType) {
-  const [rows] = await pool.query(
-    `SELECT code, producttype FROM codestab
-     WHERE uid = ? AND codestatus = 1 AND producttype = ?
-     ORDER BY id ASC`,
-    [sponsorUid, packageType]
-  );
-  return rows;
+  const numericPackageType = Number(packageType || 0);
+  const params = [sponsorUid];
+  let sql = `SELECT id, code, producttype, codetype, productamount
+               FROM codestab
+              WHERE uid = ?
+                AND codestatus = 1
+                AND producttype BETWEEN 10 AND 60`;
+
+  if (numericPackageType > 0) {
+    sql += ' AND producttype = ?';
+    params.push(numericPackageType);
+  }
+
+  sql += ' ORDER BY producttype ASC, codetype ASC, id ASC';
+
+  const [rows] = await pool.query(sql, params);
+  return rows.map(formatAvailableCodeRow);
 }
 
 /**
@@ -431,6 +448,7 @@ async function registerMember({
   firstname, lastname, middlename, tin, email, position,
   requestedPosition = null, placementPolicy = null, referralToken = null,
   address = '', contactno = '', dob = '', requestId = null,
+  autoPlacement = true,
 }) {
   await ensureMemberTinColumn();
 
@@ -447,7 +465,10 @@ async function registerMember({
     const normalizedDob = normalizeDob(dob);
     const normalizedUsername = sanitizeAlphaNum(username);
 
-    if (!normalizedTin || !isValidTin(normalizedTin)) {
+    if (!normalizedAddress) {
+      throw new Error('Address is required.');
+    }
+    if (normalizedTin && !isValidTin(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
     if (!isValidEmail(normalizedEmail)) {
@@ -462,14 +483,15 @@ async function registerMember({
       email: normalizedEmail,
       contactno: normalizedContactNo,
       dob: normalizedDob,
+      address: normalizedAddress,
     }, conn);
     if (!duplicateResult.allowed) {
       throw createDuplicateRegistrationError(duplicateResult);
     }
 
-    const enforcedPosition = placementPolicy?.mode === 'forced'
-      ? Number(placementPolicy.forcedPosition)
-      : Number(position);
+    let finalPlacementUid = Number(placementUid);
+    let finalPosition = Number(position);
+    let finalPlacementPolicy = placementPolicy;
     const requestedPositionValue = requestedPosition == null ? Number(position) : Number(requestedPosition);
 
     advisoryLocks = await acquireRegistrationAdvisoryLocks(conn, [
@@ -479,8 +501,22 @@ async function registerMember({
       `registration:sponsor:${Number(sponsorUid || 0)}`,
     ]);
 
-    lockKeys.push(`placement:${Number(placementUid)}:${enforcedPosition}`);
-    if (placementPolicy?.mode === 'forced') {
+    const livePlacementPolicy = await getPlacementPolicyForSponsor(Number(sponsorUid), conn);
+    finalPlacementPolicy = livePlacementPolicy;
+    if (autoPlacement || livePlacementPolicy.mode === 'forced') {
+      const livePlacement = await recommendPlacementForSponsor(Number(sponsorUid), conn, {
+        forcedSide: livePlacementPolicy.mode === 'forced' ? Number(livePlacementPolicy.forcedPosition) : null,
+      });
+      finalPlacementUid = Number(livePlacement.placementUid);
+      finalPosition = Number(livePlacement.position);
+    }
+
+    if (!finalPlacementUid || ![1, 2].includes(finalPosition)) {
+      throw new Error('Invalid placement selection');
+    }
+
+    lockKeys.push(`placement:${finalPlacementUid}:${finalPosition}`);
+    if (finalPlacementPolicy?.mode === 'forced') {
       lockKeys.push(`sponsor-first:${Number(sponsorUid)}`);
     }
     for (const lockKey of lockKeys) {
@@ -496,7 +532,7 @@ async function registerMember({
       'SELECT uid FROM memberstab WHERE username = ?',
       [normalizedUsername]
     );
-    if (existingUser.length > 0) throw new Error('Username already taken');
+    if (existingUser.length > 0) throw createUsernameTakenError(normalizedUsername);
 
     const [existingEmail] = await conn.query(
       'SELECT uid FROM memberstab WHERE email = ? LIMIT 1',
@@ -506,7 +542,7 @@ async function registerMember({
 
     const [placementCheck] = await conn.query(
       'SELECT uid FROM usertab WHERE refid = ? AND position = ?',
-      [placementUid, enforcedPosition]
+      [finalPlacementUid, finalPosition]
     );
     if (placementCheck.length > 0) throw new Error('Placement position already taken');
 
@@ -524,9 +560,9 @@ async function registerMember({
        ?, ?, NULL, ?, ?,
        ?, NULL, ?, ?, ?,
        ?, ?, ?, ?, ?, 1, ?)`,
-      [newCountId, newUid, placementUid, sponsorUid, newUid, codeData.stockistid,
+      [newCountId, newUid, finalPlacementUid, sponsorUid, newUid, codeData.stockistid,
        codeData.producttype, codeData.producttype, codeData.codetype, activationCode,
-       now, enforcedPosition, codeData.binarypoints, codeData.directreferral,
+       now, finalPosition, codeData.binarypoints, codeData.directreferral,
        codeData.incentivepoints, cdAmount, cdTotal, cdStatus, codeData.profitsharing, sponsorUid]
     );
 
@@ -534,7 +570,7 @@ async function registerMember({
     await conn.query(
       `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email, address, contactnos, dob)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [newCountId, newUid, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin, normalizedEmail.slice(0, 180), normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
+      [newCountId, newUid, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin || null, normalizedEmail.slice(0, 180), normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
     );
 
     await conn.query(
@@ -554,7 +590,7 @@ async function registerMember({
               CASE WHEN ancestor_uid = ? THEN ? ELSE leg END
        FROM binary_tree_closuretab
        WHERE descendant_uid = ?`,
-      [newUid, placementUid, Number(enforcedPosition) === 1 ? 'left' : 'right', placementUid]
+      [newUid, finalPlacementUid, Number(finalPosition) === 1 ? 'left' : 'right', finalPlacementUid]
     ).catch(() => {});
 
     await conn.query(
@@ -567,22 +603,22 @@ async function registerMember({
         createPublicId(),
         newUid,
         sponsorUid,
-        placementUid,
-        Number(enforcedPosition) === 1 ? 'left' : 'right',
+        finalPlacementUid,
+        Number(finalPosition) === 1 ? 'left' : 'right',
         String(codeData.producttype || ''),
         Number(codeData.binarypoints || 0),
-        createProcessKey(['binary_point', 'registration', activationCode, newUid]),
+        createProcessKey(['binary-point-event', 'registration', newUid]),
       ]
     ).catch(() => {});
 
     await appendPlacementAudit(conn, {
       sponsorUid: Number(sponsorUid),
-      placementUid: Number(placementUid),
+      placementUid: Number(finalPlacementUid),
       createdUid: Number(newUid),
       requestedPosition: requestedPositionValue,
-      enforcedPosition,
-      policyMode: placementPolicy?.mode || 'manual',
-      policyReason: placementPolicy?.reason || 'manual',
+      enforcedPosition: finalPosition,
+      policyMode: finalPlacementPolicy?.mode || 'manual',
+      policyReason: finalPlacementPolicy?.reason || 'manual',
       referralToken,
       processKey: createProcessKey(['placement_audit', sponsorUid, newUid, activationCode]),
     }).catch((error) => {
@@ -602,11 +638,11 @@ async function registerMember({
       registrationUid: Number(newUid),
       upgradeUid: null,
       notes: {
-        placementUid: Number(placementUid),
+        placementUid: Number(finalPlacementUid),
         requestedPosition: requestedPositionValue,
-        enforcedPosition,
-        policyMode: placementPolicy?.mode || 'manual',
-        policyReason: placementPolicy?.reason || 'manual',
+        enforcedPosition: finalPosition,
+        policyMode: finalPlacementPolicy?.mode || 'manual',
+        policyReason: finalPlacementPolicy?.reason || 'manual',
       },
       processKey: createProcessKey(['activation_code_usage', 'registration', activationCode, newUid]),
     }).catch((error) => {
@@ -626,10 +662,10 @@ async function registerMember({
       success: true,
       uid: newUid,
       username: normalizedUsername,
-      placementUid,
-      position: enforcedPosition,
+      placementUid: finalPlacementUid,
+      position: finalPosition,
       requestedPosition: requestedPositionValue,
-      placementPolicy,
+      placementPolicy: finalPlacementPolicy,
     };
   } catch (err) {
     await conn.rollback();
@@ -653,6 +689,7 @@ module.exports = {
   checkAccountName,
   checkDuplicateName,
   getAvailableCodes,
+  formatAvailableCodeRow,
   normalizeName,
   generateUID,
   getNextCountId,
@@ -661,4 +698,5 @@ module.exports = {
   registerMember,
   ensureMemberTinColumn,
   previewActivationCode,
+  createUsernameTakenError,
 };

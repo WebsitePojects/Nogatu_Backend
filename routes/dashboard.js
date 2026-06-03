@@ -4,14 +4,23 @@
  */
 const express = require('express');
 const router = express.Router();
-const XLSX = require('xlsx');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
-const { getProjectedCurrentMonthUnilevel } = require('../services/income/unilevel');
+const {
+  getProjectedCurrentMonthUnilevel,
+  getUnilevelProductPointContributors,
+} = require('../services/income/unilevel');
 const { getLeadershipTraceability } = require('../services/income/leadership');
-const { getEffectiveAccountState, getAccountEntryAuditInfo } = require('../services/accountState');
+const {
+  getEffectiveAccountState,
+  getAccountEntryAuditInfo,
+} = require('../services/accountState');
+const {
+  buildSectionedCsv,
+  sendCsv,
+} = require('../services/csvExport');
 
 async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
   const safePage = Math.max(1, Number(page) || 1);
@@ -32,6 +41,11 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
     amount: row.leadershipBonus,
     directReferralCount: row.directReferralCount,
   }));
+  const levelRows = [...allRows].sort((left, right) =>
+    Number(left.level || 0) - Number(right.level || 0)
+    || String(left.fullname || left.username || '').localeCompare(String(right.fullname || right.username || ''))
+    || Number(left.uid || 0) - Number(right.uid || 0)
+  );
   const total = allRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
   const totalPages = Math.max(1, Math.ceil(allRows.length / safePerPage));
   const offset = (safePage - 1) * safePerPage;
@@ -48,7 +62,9 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
     summary: {
       totalSources: trace.totalSources,
       directReferralCount: Number(directCountRows[0]?.total || 0),
+      byLevel: trace.byLevel,
     },
+    levelRows,
   };
 }
 
@@ -297,7 +313,17 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
         };
       }));
       response.rows = [...contributorRows, ...upgradeContributorRows]
-        .filter((row) => Number(row.amount || 0) > 0)
+        .filter((row) => {
+          if (Number(row.amount || 0) <= 0) {
+            return false;
+          }
+
+          if (row.rowType === 'referral_signup') {
+            return Boolean(row.sponsorCreditEligible);
+          }
+
+          return true;
+        })
         .sort((left, right) => new Date(right.transdate || 0) - new Date(left.transdate || 0))
         .slice(0, limit);
       response.total = response.rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
@@ -342,26 +368,37 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
          LIMIT ?`,
         [uid, limit]
       );
+      const productPointTrace = await getUnilevelProductPointContributors(uid, { start, end });
       const points = Number(maintRows[0]?.ttlpoints || 0);
-      response.formula = 'Unilevel requires at least 200 product points in the current month.';
+      response.formula = 'Unilevel requires at least 200 own product points in the current month; downline product-point rows show the members and purchases that can create unilevel value.';
       response.eligibility = {
         requiredPoints: 200,
         currentPoints: points,
         neededPoints: Math.max(0, 200 - points),
         eligible: points >= 200,
+        downlineProductPoints: productPointTrace.totalPoints,
+        projectedDownlineAmount: productPointTrace.projectedAmount,
+        packageReach: productPointTrace.maxReach,
       };
-      response.rows = incomeRows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
-      response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
-    } else if (metric === 'lpc') {
-      response.formula = 'LPC is disabled for launch; legacy income6 is reserved for Ranking Bonus.';
-      response.rows = [];
-      response.total = 0;
+      const creditedRows = incomeRows.map((row) => ({
+        ...row,
+        amount: Number(row.amount || 0),
+        rowType: 'credited_unilevel_payout',
+      }));
+      response.rows = [...productPointTrace.rows, ...creditedRows].slice(0, limit);
+      response.total = creditedRows.reduce((sum, row) => sum + row.amount, 0);
+      response.summary = {
+        creditedTotal: response.total,
+        downlineProductPoints: productPointTrace.totalPoints,
+        projectedDownlineAmount: productPointTrace.projectedAmount,
+      };
     } else if (metric === 'leadership-bonus') {
       const leadership = await buildLeadershipBreakdown(uid, page, perPage);
       response.formula = leadership.formula;
       response.rows = leadership.rows;
       response.total = leadership.total;
       response.summary = leadership.summary;
+      response.levelRows = leadership.levelRows || [];
       response.pagination = {
         page: leadership.page,
         perPage: leadership.perPage,
@@ -374,11 +411,13 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
         `SELECT pid, ${incomeColumn} AS amount, transdate, processid
          FROM payouthistorytab
          WHERE uid = ? AND ${incomeColumn} > 0
-         ORDER BY transdate DESC, pid DESC
-         LIMIT ?`,
+        ORDER BY transdate DESC, pid DESC
+        LIMIT ?`,
         [uid, limit]
       );
-      response.formula = `${incomeColumn} rows from payouthistorytab with positive amounts.`;
+      response.formula = metric.includes('ranking')
+        ? 'Credited ranking bonus entries from payout history with positive released amounts.'
+        : 'Credited Hi-Five bonus entries from payout history with positive released amounts.';
       response.rows = rows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
       response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
     } else if (['left-accounts', 'right-accounts'].includes(metric)) {
@@ -412,7 +451,6 @@ router.get('/breakdown/:metric/export', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
     const metric = String(req.params.metric || '').trim().toLowerCase();
-    const format = String(req.query.format || 'xlsx').toLowerCase();
 
     if (metric !== 'leadership-bonus') {
       return res.status(400).json({ error: 'Export is only available for leadership bonus right now.' });
@@ -440,17 +478,13 @@ router.get('/breakdown/:metric/export', memberAuth, async (req, res) => {
       DirectReferrals: '',
     });
 
-    if (format !== 'xlsx') {
-      return res.status(400).json({ error: 'Only xlsx export is supported by this endpoint.' });
-    }
-
-    const workbook = XLSX.utils.book_new();
-    const worksheet = XLSX.utils.json_to_sheet(exportRows);
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Leadership Bonus');
-    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="leadership-bonus-breakdown.xlsx"');
-    res.send(buffer);
+    const csv = buildSectionedCsv([
+      {
+        title: 'Leadership Bonus',
+        rows: exportRows,
+      },
+    ]);
+    sendCsv(res, 'leadership-bonus-breakdown', csv);
   } catch (err) {
     console.error('[Dashboard] Breakdown export error:', err);
     res.status(500).json({ error: 'Unable to export the breakdown right now.' });

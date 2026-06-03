@@ -8,8 +8,13 @@ const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { ensureVoucherTxTable } = require('../services/voucher');
 const { getPairingTrace } = require('../services/income/pairingTracker');
-const { getEffectiveAccountState, getAccountStateLabel } = require('../services/accountState');
+const {
+  getEffectiveAccountState,
+  getAccountStateLabel,
+  getAccountEntryAuditInfo,
+} = require('../services/accountState');
 const { getPackageClaimDetails, getPackageRewardAmounts } = require('../services/income/hifiveBonus');
+const { pickRowsByExactAmount } = require('../services/transactionTrace');
 
 function normalizeAmount(value) {
   return Number(value || 0);
@@ -22,29 +27,71 @@ function normalizeDateValue(value) {
 }
 
 function pickPairingRowsForTransaction(rows = [], targetAmount = 0, transdate = null) {
-  const safeTarget = normalizeAmount(targetAmount);
-  if (safeTarget <= 0) return [];
+  return pickRowsByExactAmount(rows, targetAmount, transdate, {
+    amountKey: 'creditedIncome',
+    dateKey: 'pairedAt',
+    maxCandidates: 24,
+    maxRows: 8,
+  });
+}
 
-  const cutoff = normalizeDateValue(transdate);
-  const exactCandidates = rows
-    .filter((row) => normalizeAmount(row.creditedIncome) > 0)
-    .filter((row) => {
-      if (!cutoff) return true;
-      const pairedAt = normalizeDateValue(row.pairedAt);
-      return pairedAt && pairedAt.getTime() <= cutoff.getTime();
-    })
-    .sort((left, right) => new Date(right.pairedAt || 0) - new Date(left.pairedAt || 0));
-
-  const picked = [];
-  let running = 0;
-
-  for (const row of exactCandidates) {
-    if (running >= safeTarget) break;
-    picked.push(row);
-    running += normalizeAmount(row.creditedIncome);
+async function resolveDirectReferralSourcesForTransaction(uid, tx) {
+  const amount = normalizeAmount(tx?.directReferral);
+  if (amount <= 0 || !tx) {
+    return { rows: [], note: null };
   }
 
-  return running >= safeTarget ? picked : [];
+  const [rawRows] = await pool.query(
+    `SELECT u.uid, u.directreferral AS amount, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+            DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i:%s') AS transdate,
+            m.username,
+            TRIM(CONCAT(COALESCE(m.firstname, ''), ' ', COALESCE(m.lastname, ''))) AS fullname
+       FROM usertab u
+       LEFT JOIN memberstab m ON m.uid = u.uid
+      WHERE u.drefid = ?
+        AND u.directreferral > 0
+      ORDER BY u.datereg DESC, u.uid DESC`,
+    [uid]
+  ).catch(() => [[]]);
+
+  const rows = [];
+  for (const row of rawRows) {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row).catch(() => row);
+    const auditInfo = getAccountEntryAuditInfo(effectiveRow || row);
+    if (!auditInfo.sponsorCreditEligible) {
+      continue;
+    }
+
+    rows.push({
+      uid: Number(row.uid || 0),
+      amount: normalizeAmount(effectiveRow?.directreferral || row.amount),
+      transdate: row.transdate,
+      username: row.username || null,
+      fullname: row.fullname || row.username || `UID ${row.uid}`,
+      entryType: auditInfo.entryLabel || 'Unknown',
+    });
+  }
+
+  const picked = pickRowsByExactAmount(rows, amount, tx.transdate, {
+    amountKey: 'amount',
+    dateKey: 'transdate',
+    maxCandidates: 20,
+    maxRows: 6,
+  });
+
+  return {
+    rows: picked.map((row) => ({
+      uid: Number(row.uid || 0),
+      username: row.username || null,
+      fullname: row.fullname || row.username || `UID ${row.uid}`,
+      entryType: row.entryType || 'Unknown',
+      amount: normalizeAmount(row.amount),
+      transdate: row.transdate,
+    })),
+    note: picked.length === 0
+      ? 'This payout row does not preserve a perfect direct-referral contributor chain in every legacy case, so only exact amount matches are shown.'
+      : null,
+  };
 }
 
 async function resolveHiFiveSourcesForTransaction(uid, tx) {
@@ -193,7 +240,6 @@ router.get('/', memberAuth, async (req, res) => {
       unilevel: Number(r.income4 || 0),
       hifive: Number(r.income5 || 0),
       rankingBonus: Number(r.income6 || 0),
-      legacyIncome6: Number(r.income6 || 0),
       encashment: Number(r.encashment1 || 0),
       tax: Number(r.tax || 0),
       fee: Number(r.fee || 0),
@@ -303,7 +349,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
     const row = rows[0];
     const effectiveAccount = await getEffectiveAccountState(uid);
     const hasPairingIncome = Number(row.income2 || 0) > 0;
-    const [pairingTrace, hiFiveTrace] = await Promise.all([
+    const [pairingTrace, hiFiveTrace, directReferralTrace] = await Promise.all([
       hasPairingIncome
         ? getPairingTrace(uid, Number(req.session.currentaccttype || req.session.accttype || 0), { limit: 40 }).catch(() => ({ rows: [] }))
         : Promise.resolve({ rows: [] }),
@@ -311,6 +357,10 @@ router.get('/:pid', memberAuth, async (req, res) => {
         hifive: row.income5,
         transdate: row.transdate,
         processid: row.processid,
+      }),
+      resolveDirectReferralSourcesForTransaction(uid, {
+        directReferral: row.income1,
+        transdate: row.transdate,
       }),
     ]);
 
@@ -358,7 +408,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
         cdStatus: Number(effectiveAccount?.cdstatus || 0),
       },
       supporting: {
-        directReferrals: [],
+        directReferrals: directReferralTrace.rows || [],
         leadershipSources: [],
         pairingTrace: exactPairingRows,
         hiFiveSources: hiFiveTrace.claims || [],
@@ -366,7 +416,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
         unilevelSources: [],
         rankingSources: [],
         notes: {
-          directReferrals: Number(row.income1 || 0) > 0 ? 'This payout row does not store exact per-record direct-referral contributors yet, so unrelated names are intentionally hidden.' : null,
+          directReferrals: directReferralTrace.note,
           leadershipSources: Number(row.income3 || 0) > 0 ? 'This payout row does not store exact per-record leadership source rows yet, so unrelated names are intentionally hidden.' : null,
           pairingTrace: Number(row.income2 || 0) > 0 && exactPairingRows.length === 0 ? 'Pairing income exists on this record, but exact contributor rows were not fully preserved in the legacy ledger for this payout.' : null,
           hiFiveSources: Number(row.income5 || 0) > 0 && (hiFiveTrace.claims || []).length === 0 ? 'Hi-Five income exists on this record, but the exact paid claim source could not be matched from the current legacy data.' : null,

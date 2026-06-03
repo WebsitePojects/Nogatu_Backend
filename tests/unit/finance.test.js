@@ -40,6 +40,7 @@ test('encashment CD deduction is capped by remaining CD obligation', () => {
 
 test('payout validation requires both option and details', () => {
   assert.equal(validatePayoutDetails({ payoutId: 2, payoutDetails: '09123456789' }).ok, true);
+  assert.equal(validatePayoutDetails({ payoutId: 'PSBank', payoutDetails: '1234567890' }).ok, true);
   assert.equal(validatePayoutDetails({ payoutId: 0, payoutDetails: '09123456789' }).ok, false);
   assert.equal(validatePayoutDetails({ payoutId: 2, payoutDetails: '' }).ok, false);
 });

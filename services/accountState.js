@@ -94,7 +94,9 @@ async function getEffectiveAccountState(uid, row, executor) {
 
       if (accountRow.upgrade_codetype === 1) {
         accountRow.codeid = 1;
+
         if (accountRow.raw_codeid === 3) {
+          accountRow.cdamount = accountRow.raw_cdamount;
           accountRow.cdtotal = Math.max(accountRow.raw_cdtotal, accountRow.raw_cdamount);
           accountRow.cdstatus = 2;
         } else {
@@ -130,6 +132,20 @@ async function getEffectiveAccountState(uid, row, executor) {
 }
 
 function countsForPairingSource(row) {
+  if (!row) return false;
+
+  if (toNumber(row.codeid) === 1) {
+    return true;
+  }
+
+  if (toNumber(row.codeid) === 3 && isCdFullyPaid(row)) {
+    return true;
+  }
+
+  return false;
+}
+
+function countsForDirectReferralSource(row) {
   if (!row) return false;
 
   if (toNumber(row.codeid) === 1) {
@@ -182,7 +198,7 @@ function getAccountEntryAuditInfo(row) {
     return {
       entryCode: 'FS',
       entryLabel: 'Free Slot',
-      sponsorCreditEligible: true,
+      sponsorCreditEligible: false,
       sourceBinaryEligible: false,
     };
   }
@@ -200,7 +216,7 @@ function getAccountEntryAuditInfo(row) {
     return {
       entryCode: 'CD',
       entryLabel: 'CD Unpaid',
-      sponsorCreditEligible: true,
+      sponsorCreditEligible: false,
       sourceBinaryEligible: false,
     };
   }
@@ -218,6 +234,7 @@ module.exports = {
   getEffectiveAccountState,
   isCdFullyPaid,
   countsForPairingSource,
+  countsForDirectReferralSource,
   getAccountStateLabel,
   getAccountEntryAuditInfo,
 };

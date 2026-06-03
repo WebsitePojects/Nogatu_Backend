@@ -33,7 +33,7 @@ function summarizeLeadershipTraceability(rows = []) {
         directReferralCount: toNumber(row.directReferralCount),
       };
     })
-    .filter((row) => row.level > 0 && row.rate > 0);
+    .filter((row) => row.level > 0 && row.rate > 0 && row.leadershipBonus > 0);
 
   return {
     rows: normalizedRows,
