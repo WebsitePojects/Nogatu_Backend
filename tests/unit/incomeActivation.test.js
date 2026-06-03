@@ -7,5 +7,5 @@ const {
 
 test('approved Node launch enables Unilevel payout while reserving income6 for ranking', () => {
   assert.equal(INCOME_PAYOUT_FLAGS.unilevel, true);
-  assert.equal(INCOME_PAYOUT_FLAGS.lpc, false);
+  assert.equal('lpc' in INCOME_PAYOUT_FLAGS, false);
 });

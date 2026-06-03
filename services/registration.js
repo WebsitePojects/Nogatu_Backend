@@ -15,43 +15,13 @@ const { evaluateDuplicateIdentity, normalizeContactNo, normalizeDob } = require(
 const { appendPlacementAudit, appendActivationCodeUsage } = require('./registrationAudit');
 const { getPlacementPolicyForSponsor } = require('./binaryPlacementPolicy');
 const { recommendPlacementForSponsor } = require('./placementRecommendation');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 let memberTinColumnReady = false;
 
 async function ensureMemberTinColumn() {
   if (memberTinColumnReady) return;
-
-  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
-  if (columns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
-  }
-
-  const [emailColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'email'");
-  if (emailColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN email VARCHAR(180) DEFAULT NULL');
-  } else if (!String(emailColumns[0].Type || '').toLowerCase().includes('180')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN email VARCHAR(180) DEFAULT NULL');
-  }
-
-  const [contactColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'contactnos'");
-  if (contactColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN contactnos VARCHAR(30) DEFAULT NULL');
-  } else if (!String(contactColumns[0].Type || '').toLowerCase().includes('30')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN contactnos VARCHAR(30) DEFAULT NULL');
-  }
-
-  const [addressColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'address'");
-  if (addressColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN address VARCHAR(255) DEFAULT NULL');
-  }
-
-  const [dobColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'dob'");
-  if (dobColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN dob VARCHAR(30) DEFAULT NULL');
-  } else if (!String(dobColumns[0].Type || '').toLowerCase().includes('30')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN dob VARCHAR(30) DEFAULT NULL');
-  }
-
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.MEMBER_PROFILE, 'Member registration');
   memberTinColumnReady = true;
 }
 

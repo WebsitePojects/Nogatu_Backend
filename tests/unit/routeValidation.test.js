@@ -139,6 +139,54 @@ function loadAdminAccountsRouter({ connection }) {
   }, () => require(routePath));
 }
 
+function loadWalletRouter({ calculateAndStoreIncome, getMemberGlobalBonus, assertTinPresentForEncashment, getEncashmentPreview, insertEncashment }) {
+  const routePath = path.join(repoRoot, 'routes', 'wallet.js');
+  delete require.cache[routePath];
+
+  return withStubbedModules({
+    [path.join(repoRoot, 'middleware', 'auth.js')]: {
+      memberAuth: (req, res, next) => next(),
+    },
+    [path.join(repoRoot, 'services', 'income', 'calculateAndStoreIncome.js')]: {
+      calculateAndStoreIncome: calculateAndStoreIncome || (async () => ({
+        ttlincome1: 100,
+        ttlincome2: 200,
+        ttlincome3: 300,
+        ttlincome4: 400,
+        ttlincome5: 500,
+        ttlincome6: 600,
+        ttlcashbalance: 2100,
+      })),
+    },
+    [path.join(repoRoot, 'services', 'income', 'insertIncome.js')]: {
+      getEncashmentPreview: getEncashmentPreview || (async () => ({
+        payout: { ok: true },
+        sufficientBalance: true,
+      })),
+      insertEncashment: insertEncashment || (async () => ({
+        pid: 1,
+        cdDeduction: 0,
+        maintenanceFee: 20,
+        netReceivable: 100,
+        newBalance: 500,
+      })),
+    },
+    [path.join(repoRoot, 'services', 'globalBonus.js')]: {
+      getMemberGlobalBonus: getMemberGlobalBonus || (async () => ({
+        eligible: false,
+        visibilityState: 'locked',
+        interactive: false,
+        fullVisibility: false,
+        labels: [],
+        portions: 0,
+      })),
+    },
+    [path.join(repoRoot, 'services', 'memberTinPolicy.js')]: {
+      assertTinPresentForEncashment: assertTinPresentForEncashment || (async () => '123-456-789'),
+    },
+  }, () => require(routePath));
+}
+
 function getRouteHandlers(router, method, routePath) {
   const layer = router.stack.find((entry) => entry.route
     && entry.route.path === routePath
@@ -207,6 +255,70 @@ test('member registration requires an address but allows TIN to be omitted', asy
   assert.equal(calls.length, 1);
   assert.equal(calls[0].tin, '');
   assert.equal(calls[0].address, '123 Sampaguita St.');
+});
+
+test('wallet summary exposes rankingBonus but not deprecated LPC fields', async () => {
+  const router = loadWalletRouter({});
+  const handlers = getRouteHandlers(router, 'get', '/');
+  const req = {
+    session: { uid: 44, currentaccttype: 30 },
+  };
+  const res = createResponse();
+
+  await runHandlers(handlers, req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.rankingBonus, 600);
+  assert.equal('lpc' in res.body, false);
+  assert.equal('legacyIncome6' in res.body, false);
+});
+
+test('wallet encashment preview returns 422 when TIN is missing', async () => {
+  const tinError = new Error('TIN is required before encashment. Please complete your account profile first.');
+  tinError.code = 'TIN_REQUIRED_FOR_ENCASHMENT';
+  tinError.statusCode = 422;
+
+  const router = loadWalletRouter({
+    assertTinPresentForEncashment: async () => { throw tinError; },
+  });
+  const handlers = getRouteHandlers(router, 'post', '/preview-encash');
+  const req = {
+    body: { amount: 1000 },
+    session: { uid: 44, currentaccttype: 30 },
+  };
+  const res = createResponse();
+
+  await runHandlers(handlers, req, res);
+
+  assert.equal(res.statusCode, 422);
+  assert.deepEqual(res.body, {
+    error: 'TIN is required before encashment. Please complete your account profile first.',
+    code: 'TIN_REQUIRED_FOR_ENCASHMENT',
+  });
+});
+
+test('wallet encashment submit returns 422 when TIN is missing', async () => {
+  const tinError = new Error('TIN is required before encashment. Please complete your account profile first.');
+  tinError.code = 'TIN_REQUIRED_FOR_ENCASHMENT';
+  tinError.statusCode = 422;
+
+  const router = loadWalletRouter({
+    assertTinPresentForEncashment: async () => { throw tinError; },
+  });
+  const handlers = getRouteHandlers(router, 'post', '/encash');
+  const req = {
+    body: { amount: 1000 },
+    session: { uid: 44, currentaccttype: 30 },
+  };
+  const res = createResponse();
+
+  await runHandlers(handlers, req, res);
+
+  assert.equal(res.statusCode, 422);
+  assert.deepEqual(res.body, {
+    error: 'TIN is required before encashment. Please complete your account profile first.',
+    code: 'TIN_REQUIRED_FOR_ENCASHMENT',
+  });
 });
 
 test('admin account status route accepts frozen as a first-class account status', async () => {

@@ -46,9 +46,9 @@ test('effective upgrade state preserves traversal fields while refreshing a paid
   assert.equal(result.position, 1);
   assert.equal(result.binarypoints, 10);
   assert.equal(result.codeid, 1);
-  assert.equal(result.cdamount, 0);
-  assert.equal(result.cdtotal, 0);
-  assert.equal(result.cdstatus, 0);
+  assert.equal(result.cdamount, 25000);
+  assert.equal(result.cdtotal, 25000);
+  assert.equal(result.cdstatus, 2);
   assert.equal(result.raw_codeid, 3);
   assert.equal(result.raw_cdamount, 25000);
   assert.equal(result.raw_cdtotal, 5000);
@@ -93,4 +93,39 @@ test('effective upgrade state resets CD progress to the fresh upgrade obligation
   assert.equal(result.raw_cdstatus, 2);
   assert.equal(result.upgrade_codetype, 3);
   assert.equal(result.upgrade_productamount, 25000);
+});
+
+test('fresh referral-link CD registrations stay unpaid when no upgrade row exists', async () => {
+  const runner = {
+    query: async (sql) => {
+      if (sql.includes('FROM upgradetab')) {
+        throw new Error(`Unexpected upgrade lookup for fresh registration: ${sql}`);
+      }
+
+      throw new Error(`Unexpected SQL: ${sql}`);
+    },
+  };
+
+  const result = await getEffectiveAccountState(90210, {
+    uid: 90210,
+    accttype: 40,
+    currentaccttype: 40,
+    codeid: 3,
+    cdamount: 25000,
+    cdtotal: 0,
+    cdstatus: 1,
+    refid: 70001,
+    drefid: 60001,
+    position: 2,
+  }, runner);
+
+  assert.equal(result.codeid, 3);
+  assert.equal(result.cdamount, 25000);
+  assert.equal(result.cdtotal, 0);
+  assert.equal(result.cdstatus, 1);
+  assert.equal(result.refid, 70001);
+  assert.equal(result.drefid, 60001);
+  assert.equal(result.position, 2);
+  assert.equal(result.upgrade_codetype, 0);
+  assert.equal(result.upgrade_productamount, 0);
 });

@@ -1,36 +1,26 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
-
-// Auto-create news table if it doesn't exist
-const INIT_SQL = `
-CREATE TABLE IF NOT EXISTS newstab (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  title VARCHAR(255) NOT NULL,
-  content TEXT NOT NULL,
-  type ENUM('news', 'announcement', 'promo', 'memo') DEFAULT 'news',
-  image_url VARCHAR(500) DEFAULT NULL,
-  is_published TINYINT(1) DEFAULT 1,
-  created_by INT DEFAULT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_published (is_published),
-  INDEX idx_type (type),
-  INDEX idx_created (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-`;
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../services/schemaReadiness');
 
 let tableReady = false;
 async function ensureTable() {
   if (tableReady) return;
-  try {
-    await pool.query(INIT_SQL);
-    await pool.query("ALTER TABLE newstab MODIFY COLUMN type ENUM('news','announcement','promo','memo') DEFAULT 'news'");
-    tableReady = true;
-  } catch (err) {
-    console.error('[News] Failed to create table:', err.message);
-  }
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.NEWS, 'News');
+  tableReady = true;
 }
+
+router.use(async (_req, res, next) => {
+  try {
+    await ensureTable();
+    next();
+  } catch (error) {
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return next(error);
+  }
+});
 
 // GET /api/news - Public: Get published posts by type
 router.get('/', async (req, res) => {

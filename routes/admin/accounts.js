@@ -14,6 +14,7 @@ const { getEffectiveAccountState, getAccountEntryAuditInfo } = require('../../se
 const { writeAuditLog } = require('../../services/audit');
 const { resolveTin, isValidTin } = require('../../utils/tin');
 const { normalizePayoutStorageValue, resolvePayoutOption, listPayoutOptions } = require('../../services/payoutOptions');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 
 const PACKAGE_MAP = {
   10: 'Bronze',
@@ -29,20 +30,17 @@ let memberHasTinNoColumn = false;
 
 async function ensureMemberTinColumns() {
   if (tinColumnsChecked) return;
-  try {
-    const [tinRows] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
-    if (tinRows.length === 0) {
-      await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL AFTER contactnos');
-      console.log('[Admin Accounts] Added memberstab.tin column');
-    }
-
-    const [tinNoRows] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tinno'");
-    memberHasTinNoColumn = tinNoRows.length > 0;
-
-    tinColumnsChecked = true;
-  } catch (err) {
-    console.error('[Admin Accounts] Failed ensuring TIN columns:', err.message);
-  }
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.MEMBER_PROFILE, 'Admin account management');
+  const [tinNoRows] = await pool.query(
+    `SELECT 1 AS ok
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE()
+        AND table_name = 'memberstab'
+        AND column_name = 'tinno'
+      LIMIT 1`
+  );
+  memberHasTinNoColumn = tinNoRows.length > 0;
+  tinColumnsChecked = true;
 }
 
 function buildRegistrationRangeClause(range = 'all') {

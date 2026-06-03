@@ -44,8 +44,8 @@ function getNextPayoutDate(baseDate = new Date()) {
  * Insert income record
  * @param {number} uid - User ID
  * @param {Object} income - Income breakdown object
- *   { dref, paircash, leadership, unilevel, hifive, lpc, beginningbalance, endingbalance }
- *   income6 is reserved for Ranking Bonus fulfillment; calculateAndStoreIncome sends lpc=0.
+ *   { dref, paircash, leadership, unilevel, hifive, beginningbalance, endingbalance }
+ *   income6 is reserved for Ranking Bonus fulfillment and is not written by the shared income calculator.
  */
 async function insertIncome(uid, income) {
   const {
@@ -55,7 +55,6 @@ async function insertIncome(uid, income) {
     unilevel = 0,
     hifive = 0,
     ppctemp = 0,
-    lpc = 0,
     pairproduct = 0,
     beginningbalance = 0,
     endingbalance = 0,
@@ -77,7 +76,7 @@ async function insertIncome(uid, income) {
       0, 0, 0, 0, 0, 0,
       0, ?, 1, 0, NULL)`,
     [uid, beginningbalance, endingbalance,
-     dref, paircash, leadership, unilevel, hifive, lpc, now]
+     dref, paircash, leadership, unilevel, hifive, 0, now]
   );
 
   // Upsert into payouttotaltab (cumulative totals)
@@ -97,7 +96,7 @@ async function insertIncome(uid, income) {
       ttlcashbalance = VALUES(ttlcashbalance),
       ttlpointsbalance = ttlpointsbalance + VALUES(ttlpointsbalance),
       transdate = VALUES(transdate)`,
-    [uid, dref, paircash, leadership, unilevel, hifive, ppctemp, lpc, endingbalance, pairproduct, now]
+    [uid, dref, paircash, leadership, unilevel, hifive, ppctemp, 0, endingbalance, pairproduct, now]
   );
 
   return true;

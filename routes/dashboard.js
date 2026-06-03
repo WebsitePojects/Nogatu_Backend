@@ -4,7 +4,6 @@
  */
 const express = require('express');
 const router = express.Router();
-const XLSX = require('xlsx');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
@@ -18,6 +17,10 @@ const {
   getEffectiveAccountState,
   getAccountEntryAuditInfo,
 } = require('../services/accountState');
+const {
+  buildSectionedCsv,
+  sendCsv,
+} = require('../services/csvExport');
 
 async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
   const safePage = Math.max(1, Number(page) || 1);
@@ -389,10 +392,6 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
         downlineProductPoints: productPointTrace.totalPoints,
         projectedDownlineAmount: productPointTrace.projectedAmount,
       };
-    } else if (metric === 'lpc') {
-      response.formula = 'LPC is disabled for launch; the reserved ranking-bonus ledger remains separate from this feature.';
-      response.rows = [];
-      response.total = 0;
     } else if (metric === 'leadership-bonus') {
       const leadership = await buildLeadershipBreakdown(uid, page, perPage);
       response.formula = leadership.formula;
@@ -452,7 +451,6 @@ router.get('/breakdown/:metric/export', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
     const metric = String(req.params.metric || '').trim().toLowerCase();
-    const format = String(req.query.format || 'xlsx').toLowerCase();
 
     if (metric !== 'leadership-bonus') {
       return res.status(400).json({ error: 'Export is only available for leadership bonus right now.' });
@@ -480,17 +478,13 @@ router.get('/breakdown/:metric/export', memberAuth, async (req, res) => {
       DirectReferrals: '',
     });
 
-    if (format !== 'xlsx') {
-      return res.status(400).json({ error: 'Only xlsx export is supported by this endpoint.' });
-    }
-
-    const workbook = XLSX.utils.book_new();
-    const worksheet = XLSX.utils.json_to_sheet(exportRows);
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Leadership Bonus');
-    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="leadership-bonus-breakdown.xlsx"');
-    res.send(buffer);
+    const csv = buildSectionedCsv([
+      {
+        title: 'Leadership Bonus',
+        rows: exportRows,
+      },
+    ]);
+    sendCsv(res, 'leadership-bonus-breakdown', csv);
   } catch (err) {
     console.error('[Dashboard] Breakdown export error:', err);
     res.status(500).json({ error: 'Unable to export the breakdown right now.' });

@@ -94,9 +94,16 @@ async function getEffectiveAccountState(uid, row, executor) {
 
       if (accountRow.upgrade_codetype === 1) {
         accountRow.codeid = 1;
-        accountRow.cdamount = 0;
-        accountRow.cdtotal = 0;
-        accountRow.cdstatus = 0;
+
+        if (accountRow.raw_codeid === 3) {
+          accountRow.cdamount = accountRow.raw_cdamount;
+          accountRow.cdtotal = Math.max(accountRow.raw_cdtotal, accountRow.raw_cdamount);
+          accountRow.cdstatus = 2;
+        } else {
+          accountRow.cdamount = 0;
+          accountRow.cdtotal = 0;
+          accountRow.cdstatus = 0;
+        }
       } else if (accountRow.upgrade_codetype === 2) {
         accountRow.codeid = 2;
         accountRow.cdamount = 0;
@@ -104,9 +111,19 @@ async function getEffectiveAccountState(uid, row, executor) {
         accountRow.cdstatus = 0;
       } else if (accountRow.upgrade_codetype === 3) {
         accountRow.codeid = 3;
-        accountRow.cdamount = accountRow.upgrade_productamount;
-        accountRow.cdtotal = 0;
-        accountRow.cdstatus = 1;
+
+        if (
+          accountRow.raw_codeid === 3 &&
+          accountRow.raw_cdamount === accountRow.upgrade_productamount
+        ) {
+          accountRow.cdamount = accountRow.raw_cdamount;
+          accountRow.cdtotal = accountRow.raw_cdtotal;
+          accountRow.cdstatus = accountRow.raw_cdstatus;
+        } else {
+          accountRow.cdamount = accountRow.upgrade_productamount;
+          accountRow.cdtotal = 0;
+          accountRow.cdstatus = 1;
+        }
       }
     }
   }

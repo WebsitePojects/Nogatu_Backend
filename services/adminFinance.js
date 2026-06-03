@@ -4,6 +4,7 @@ const {
   getPackagePolicy,
   getPackageDefaultSalesMatchReserveCeiling,
 } = require('./packagePolicy');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 function toNumber(value) {
   const num = Number(value || 0);
@@ -19,19 +20,7 @@ function normalizeFinanceYear(year, now = new Date()) {
 }
 
 async function ensureFinanceTables(conn = pool) {
-  await conn.query(
-    `CREATE TABLE IF NOT EXISTS finance_package_coststab (
-      package_type INT NOT NULL,
-      product_cost DECIMAL(12,2) NOT NULL DEFAULT 0,
-      sales_match_ceiling DECIMAL(12,2) NOT NULL DEFAULT 0,
-      admin_extra_cost DECIMAL(12,2) NOT NULL DEFAULT 0,
-      notes VARCHAR(255) DEFAULT NULL,
-      updated_by VARCHAR(120) DEFAULT NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (package_type)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.FINANCE, 'Admin finance', conn);
 
   for (const policy of listPackagePolicies()) {
     await conn.query(
@@ -39,40 +28,10 @@ async function ensureFinanceTables(conn = pool) {
         (package_type, product_cost, sales_match_ceiling, admin_extra_cost, notes, updated_by)
        VALUES (?, 0, ?, 0, NULL, 'system-seed')
        ON DUPLICATE KEY UPDATE
-         sales_match_ceiling = IF(sales_match_ceiling = 0, VALUES(sales_match_ceiling), sales_match_ceiling)`,
+        sales_match_ceiling = IF(sales_match_ceiling = 0, VALUES(sales_match_ceiling), sales_match_ceiling)`,
       [policy.packageType, Number(getPackageDefaultSalesMatchReserveCeiling(policy.packageType) || 0)]
     );
   }
-
-  await conn.query(
-    `CREATE TABLE IF NOT EXISTS finance_budget_columntab (
-      id INT NOT NULL AUTO_INCREMENT,
-      column_key VARCHAR(80) NOT NULL,
-      label VARCHAR(120) NOT NULL,
-      sort_order INT NOT NULL DEFAULT 0,
-      active TINYINT NOT NULL DEFAULT 1,
-      updated_by VARCHAR(120) DEFAULT NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      UNIQUE KEY uniq_finance_budget_column_key (column_key)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
-  await conn.query(
-    `CREATE TABLE IF NOT EXISTS finance_budget_column_valuestab (
-      column_id INT NOT NULL,
-      package_type INT NOT NULL,
-      amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-      updated_by VARCHAR(120) DEFAULT NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (column_id, package_type),
-      CONSTRAINT fk_finance_budget_value_column
-        FOREIGN KEY (column_id) REFERENCES finance_budget_columntab (id)
-        ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
 }
 
 async function listCustomBudgetColumns(conn = pool) {

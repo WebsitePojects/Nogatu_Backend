@@ -78,16 +78,37 @@ async function updateIncomeTransDate(uid, incomeType) {
   );
 }
 
+function addUnilevelPointsToLevelBucket(totals, level, points) {
+  const numericPoints = Number(points || 0);
+  if (numericPoints <= 0) return;
+
+  if (level === 1) {
+    totals.lev1 += numericPoints;
+    return;
+  }
+  if (level >= 2 && level <= 3) {
+    totals.lev23 += numericPoints;
+    return;
+  }
+  if (level >= 4 && level <= 5) {
+    totals.lev45 += numericPoints;
+    return;
+  }
+  if (level >= 6 && level <= 10) {
+    totals.lev610 += numericPoints;
+  }
+}
+
 /**
  * Recursively calculate unilevel income.
  *
- * This intentionally mirrors production PHP `ctl_level` behavior:
- * qualifying points are added to all level buckets when the ctl gate passes.
- * Even though this is counterintuitive, it must match production output.
+ * Approved new-system behavior is level-by-level:
+ * a downline member's product points count only for that member's actual level,
+ * within the package reach limit.
  *
  * @param {number} parent - Parent UID
  * @param {number} level - Current level (1-10)
- * @param {{ ctlLevel: number, totals: { lev1: number, lev23: number, lev45: number, lev610: number } }} state
+ * @param {{ totals: { lev1: number, lev23: number, lev45: number, lev610: number } }} state
  */
 async function calculateUnilevel(parent, level, state, getPointsForUid) {
   if (level > 10 || level > Number(state.maxReach || 10)) return;
@@ -100,19 +121,7 @@ async function calculateUnilevel(parent, level, state, getPointsForUid) {
   for (const row of rows) {
     if (level >= 1 && level <= 10) {
       const uidPurchases = await getPointsForUid(row.uid);
-
-      if (uidPurchases > 0 && state.ctlLevel <= 10 && state.ctlLevel <= level) {
-        state.ctlLevel += 1;
-
-        state.totals.lev1 += uidPurchases;
-        state.totals.lev23 += uidPurchases;
-        state.totals.lev45 += uidPurchases;
-        state.totals.lev610 += uidPurchases;
-
-        if (state.ctlLevel >= level) {
-          state.ctlLevel = level;
-        }
-      }
+      addUnilevelPointsToLevelBucket(state.totals, level, uidPurchases);
     }
 
     await calculateUnilevel(row.uid, level + 1, state, getPointsForUid);
@@ -146,7 +155,6 @@ async function calculateUnilevelForWindow(uid, options = {}) {
   const packagePolicy = getPackagePolicy(packageRows[0]?.currentaccttype || 0);
 
   const state = {
-    ctlLevel: 0,
     maxReach: Number(packagePolicy.unilevelReach || 0) || 0,
     totals: { lev1: 0, lev23: 0, lev45: 0, lev610: 0 },
   };
@@ -309,4 +317,5 @@ module.exports = {
   getUnilevelProductPointContributors,
   getUnilevelRateForLevel,
   getTotalPointsForRange,
+  addUnilevelPointsToLevelBucket,
 };

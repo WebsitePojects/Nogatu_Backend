@@ -23,7 +23,6 @@ const { applyLifetimeIncomeCeiling } = require('./incomeCapPolicy');
 
 const INCOME_PAYOUT_FLAGS = {
   unilevel: true,
-  lpc: false,
 };
 
 /**
@@ -79,12 +78,6 @@ async function calculateAndStoreIncome(uid, accttype) {
       }
     }
 
-    // income6 is reserved for Ranking Bonus; LPC remains disabled until it has a separate mapping.
-    let activeLpc = 0;
-    if (INCOME_PAYOUT_FLAGS.lpc) {
-      activeLpc = 0;
-    }
-
     // ── Persist if there is new income ───────────────────────────────
     const capResult = applyLifetimeIncomeCeiling({
       packagePolicy: getPackagePolicy(accttype),
@@ -95,7 +88,6 @@ async function calculateAndStoreIncome(uid, accttype) {
         leadership: newLeadership,
         unilevel: activeUnilevel,
         hifive: newHifive,
-        lpc: activeLpc,
       },
     });
 
@@ -111,7 +103,6 @@ async function calculateAndStoreIncome(uid, accttype) {
         unilevel: allowedIncome.unilevel,
         hifive: allowedIncome.hifive,
         ppctemp: 0,
-        lpc: allowedIncome.lpc,
         pairproduct: 0,
         beginningbalance: beginningBalance,
         endingbalance: endingBalance,

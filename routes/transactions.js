@@ -240,7 +240,6 @@ router.get('/', memberAuth, async (req, res) => {
       unilevel: Number(r.income4 || 0),
       hifive: Number(r.income5 || 0),
       rankingBonus: Number(r.income6 || 0),
-      legacyIncome6: Number(r.income6 || 0),
       encashment: Number(r.encashment1 || 0),
       tax: Number(r.tax || 0),
       fee: Number(r.fee || 0),

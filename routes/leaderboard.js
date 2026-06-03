@@ -86,7 +86,7 @@ router.get('/', memberAuth, async (req, res) => {
       userGrossRankablePoints: userGross,
       userRemainingRankablePoints: userRemaining,
       userConsumedPoints: Number(userProgress.consumedPoints || 0),
-      pointsBasis: 'Product Repurchase Points',
+      pointsBasis: 'Repurchase points',
       rankingScope: 'Self + full downline',
       payoutReleaseMode: 'Manual admin release',
       userCurrentRank: Number(userProgress.currentRank || 0),

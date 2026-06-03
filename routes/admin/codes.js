@@ -4,7 +4,6 @@
  */
 const express = require('express');
 const router = express.Router();
-const XLSX = require('xlsx');
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { generateCodes } = require('../../services/codeGeneration');
@@ -14,17 +13,9 @@ const { createProcessKey } = require('../../utils/security');
 const { appendActivationCodeUsage } = require('../../services/registrationAudit');
 const { listAdminActivationHistory } = require('../../services/codeHistory');
 const {
-  renderAdminPdfReport,
-  sendPdfReport,
-} = require('../../services/jsreportExport');
-
-function addSheet(workbook, name, rows, widths = []) {
-  const sheet = XLSX.utils.json_to_sheet(rows);
-  if (widths.length) {
-    sheet['!cols'] = widths.map((wch) => ({ wch }));
-  }
-  XLSX.utils.book_append_sheet(workbook, sheet, name);
-}
+  buildSectionedCsv,
+  sendCsv,
+} = require('../../services/csvExport');
 
 /**
  * POST /api/admin/codes/generate
@@ -123,77 +114,24 @@ router.get('/history', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
 router.get('/history/export', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
-    const rawFormat = String(req.query.format || 'xlsx').toLowerCase();
-    const format = rawFormat === 'pdf' || rawFormat === 'crystal' ? 'pdf' : 'xlsx';
     const history = await listAdminActivationHistory({ page: 1, perPage: 1000, codeQuery: q });
-
-    if (format === 'pdf') {
-      const eventCounts = (history.rows || []).reduce((acc, row) => {
-        const key = row.eventLabel || 'Unknown';
-        acc[key] = (acc[key] || 0) + 1;
-        return acc;
-      }, {});
-      const scale = Math.max(1, ...Object.values(eventCounts));
-      const report = await renderAdminPdfReport({
-        fileName: 'activation-code-history',
-        title: 'Activation Code History Report',
-        subtitle: 'Generated, released, transferred, upgraded, and repurchase activity audit for activation codes.',
-        generatedAt: new Date().toLocaleString('en-PH', { hour12: true }),
-        filterChips: [`Code Search: ${q || 'All codes'}`],
-        summaryCards: [
-          { label: 'Rows Exported', value: String(history.rows?.length || 0), color: '#b45309' },
-          { label: 'Pages Available', value: String(history.totalPages || 1), color: '#1d4ed8' },
-          { label: 'Search Scope', value: q || 'All codes', color: '#047857' },
-        ],
-        charts: [
-          {
-            title: 'History Event Mix',
-            note: 'Event volumes grouped by history event label from the current export scope.',
-            bars: Object.entries(eventCounts).map(([label, value]) => ({
-              label,
-              valueLabel: String(value),
-              percent: Math.max(4, Math.round((value / scale) * 100)),
-              color: '#d4af37',
-            })),
-          },
-        ],
-        tables: [
-          {
-            title: 'Activation Code History',
-            columns: ['Code', 'Event', 'Summary', 'Actor Username', 'Actor Admin', 'From', 'To', 'Created At'],
-            rows: (history.rows || []).map((row) => ([
-              row.code,
-              row.eventLabel,
-              row.summary,
-              row.actorUsername || '',
-              row.actorAdminName || '',
-              row.fromUsername || '',
-              row.toUsername || '',
-              row.createdAt || '',
-            ])),
-          },
-        ],
-      });
-      return sendPdfReport(res, report);
-    }
-
-    const workbook = XLSX.utils.book_new();
-    addSheet(workbook, 'Activation Code History', (history.rows || []).map((row) => ({
-      Code: row.code,
-      Event: row.eventLabel,
-      Summary: row.summary,
-      'Actor Username': row.actorUsername || '',
-      'Actor Admin': row.actorAdminName || '',
-      'From Username': row.fromUsername || '',
-      'To Username': row.toUsername || '',
-      'Created At': row.createdAt || '',
-      'Process Key': row.processKey || '',
-    })), [16, 18, 48, 18, 18, 18, 18, 24, 34]);
-
-    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="activation-code-history.xlsx"');
-    res.send(buffer);
+    const csv = buildSectionedCsv([
+      {
+        title: 'Activation Code History',
+        rows: (history.rows || []).map((row) => ({
+          Code: row.code,
+          Event: row.eventLabel,
+          Summary: row.summary,
+          'Actor Username': row.actorUsername || '',
+          'Actor Admin': row.actorAdminName || '',
+          'From Username': row.fromUsername || '',
+          'To Username': row.toUsername || '',
+          'Created At': row.createdAt || '',
+          'Process Key': row.processKey || '',
+        })),
+      },
+    ]);
+    sendCsv(res, 'activation-code-history', csv);
   } catch (err) {
     console.error('[Admin Codes] History export error:', err);
     res.status(500).json({ error: 'Failed to export activation code history' });

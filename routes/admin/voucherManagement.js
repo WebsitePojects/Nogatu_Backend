@@ -10,45 +10,24 @@ const {
   getVoucherExpiryMode,
   UNUSED_VOUCHER_EXPIRY_MONTHS,
 } = require('../../services/voucher');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 
 async function ensureVoucherTables() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS voucherstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      package_type INT NOT NULL,
-      voucher_amount DECIMAL(12,2) NOT NULL,
-      remaining_balance DECIMAL(12,2) NOT NULL,
-      issued_date DATETIME NOT NULL,
-      expiry_date DATETIME NOT NULL,
-      first_used_at DATETIME DEFAULT NULL,
-      use_expires_at DATETIME DEFAULT NULL,
-      status INT DEFAULT 1,
-      redeemed_date DATETIME DEFAULT NULL,
-      suspend_reason VARCHAR(500) DEFAULT NULL,
-      suspended_by VARCHAR(120) DEFAULT NULL,
-      suspended_at DATETIME DEFAULT NULL,
-      PRIMARY KEY (id),
-      KEY idx_voucher_uid (uid),
-      KEY idx_voucher_status (status)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS voucher_transactionstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      voucher_id INT NOT NULL,
-      cash_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
-      voucher_used DECIMAL(12,2) NOT NULL DEFAULT 0,
-      total_value DECIMAL(12,2) NOT NULL DEFAULT 0,
-      transaction_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_vtx_uid (uid),
-      KEY idx_vtx_voucher (voucher_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
 }
+
+router.use(adminAuth, adminRights([1, 2, 3]));
+router.use(async (_req, res, next) => {
+  try {
+    await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
+    next();
+  } catch (error) {
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return next(error);
+  }
+});
 
 function normalizeVoucherStatus(raw) {
   const value = String(raw || 'all').toLowerCase();

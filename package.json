@@ -7,16 +7,19 @@
     "dev": "cross-env NODE_ENV=development nodemon index.js",
     "start": "cross-env NODE_ENV=production node index.js",
     "test": "node --test \"tests/**/*.test.js\"",
+    "test:staging-smoke": "cross-env RUN_STAGING_SMOKE=1 node --test tests/integration/stagingCriticalFlows.test.js",
     "db:migrate": "node scripts/migrate.js",
     "db:backup-current": "node scripts/backupCurrentDb.js",
     "db:import-reference": "node scripts/importReferenceDb.js",
     "db:replace-from-dump": "node scripts/replaceDbFromDump.js",
-    "smoke": "node scripts/smoke.js"
+    "smoke": "node scripts/smoke.js",
+    "readiness": "node scripts/readiness.js",
+    "readiness:smoke": "node scripts/readiness.js --with-smoke",
+    "monitoring:probe": "node scripts/monitoringProbe.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.9.0",
-    "connect-session-sequelize": "^7.1.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.1",
@@ -24,11 +27,9 @@
     "express-rate-limit": "^7.4.1",
     "express-session": "^1.18.1",
     "helmet": "^8.0.0",
-    "jsreport": "^4.13.0",
     "jszip": "^3.10.1",
     "multer": "^2.1.1",
-    "mysql2": "^3.11.5",
-    "xlsx": "^0.18.5"
+    "mysql2": "^3.11.5"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",

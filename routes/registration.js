@@ -17,56 +17,18 @@ const {
   getPlacementPolicyForSponsor,
   placementPolicyMessage,
 } = require('../services/binaryPlacementPolicy');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../services/schemaReadiness');
 
 async function ensureReferralInvitesTable() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS referral_invitestab (
-      id INT NOT NULL AUTO_INCREMENT,
-      sponsor_uid INT NOT NULL,
-      placement_uid INT NOT NULL,
-      position TINYINT NOT NULL,
-      token VARCHAR(80) NOT NULL,
-      active TINYINT NOT NULL DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      UNIQUE KEY uniq_referral_token (token),
-      KEY idx_sponsor_active (sponsor_uid, active)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.PUBLIC_REGISTRATION, 'Referral registration');
 }
 
 async function ensurePublicIdentityColumns() {
-  const [publicUidCols] = await pool.query("SHOW COLUMNS FROM usertab LIKE 'public_uid'");
-  if (publicUidCols.length === 0) {
-    await pool.query('ALTER TABLE usertab ADD COLUMN public_uid CHAR(36) NULL');
-  }
-  const [slugCols] = await pool.query("SHOW COLUMNS FROM usertab LIKE 'referral_slug'");
-  if (slugCols.length === 0) {
-    await pool.query('ALTER TABLE usertab ADD COLUMN referral_slug VARCHAR(32) NULL');
-  }
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.PUBLIC_REGISTRATION, 'Referral registration');
 }
 
 async function ensurePublicRegistrationAuditColumns() {
-  const [requestedCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'requested_position'").catch(() => [[]]);
-  if (requestedCols.length === 0) {
-    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN requested_position TINYINT NULL').catch(() => {});
-  }
-  const [enforcedCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'enforced_position'").catch(() => [[]]);
-  if (enforcedCols.length === 0) {
-    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN enforced_position TINYINT NULL').catch(() => {});
-  }
-  const [modeCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'placement_policy_mode'").catch(() => [[]]);
-  if (modeCols.length === 0) {
-    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN placement_policy_mode VARCHAR(32) NULL').catch(() => {});
-  }
-  const [reasonCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'placement_policy_reason'").catch(() => [[]]);
-  if (reasonCols.length === 0) {
-    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN placement_policy_reason VARCHAR(120) NULL').catch(() => {});
-  }
-  const [consumedCols] = await pool.query("SHOW COLUMNS FROM public_registration_audittab LIKE 'consumed_at'").catch(() => [[]]);
-  if (consumedCols.length === 0) {
-    await pool.query('ALTER TABLE public_registration_audittab ADD COLUMN consumed_at TIMESTAMP(6) NULL').catch(() => {});
-  }
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.PUBLIC_REGISTRATION, 'Referral registration');
 }
 
 async function ensureReferralSlug(uid) {

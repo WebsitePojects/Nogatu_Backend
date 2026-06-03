@@ -10,78 +10,20 @@
  */
 const { pool } = require('../config/database');
 const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
 
 async function ensureVoucherTable() {
   if (voucherTableReady) return;
-
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS voucherstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      package_type INT NOT NULL,
-      voucher_amount DECIMAL(12,2) NOT NULL,
-      remaining_balance DECIMAL(12,2) NOT NULL,
-      issued_date DATETIME NOT NULL,
-      expiry_date DATETIME NOT NULL,
-      status INT NOT NULL DEFAULT 1,
-      redeemed_date DATETIME DEFAULT NULL,
-      suspend_reason VARCHAR(500) DEFAULT NULL,
-      suspended_by VARCHAR(120) DEFAULT NULL,
-      suspended_at DATETIME DEFAULT NULL,
-      PRIMARY KEY (id),
-      KEY idx_uid (uid),
-      KEY idx_status (status),
-      KEY idx_expiry_date (expiry_date)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
-  // Add suspend columns if table existed before this update
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN suspend_reason VARCHAR(500) DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN suspended_by VARCHAR(120) DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN suspended_at DATETIME DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN first_used_at DATETIME DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN use_expires_at DATETIME DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN revoked_at DATETIME DEFAULT NULL');
-  } catch { /* column exists */ }
-  try {
-    await pool.query('ALTER TABLE voucherstab ADD COLUMN revocation_reason VARCHAR(500) DEFAULT NULL');
-  } catch { /* column exists */ }
-
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Vouchers');
   voucherTableReady = true;
 }
 
 async function ensureVoucherTxTable() {
   if (voucherTxTableReady) return;
-
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS voucher_transactionstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      voucher_id INT NOT NULL,
-      cash_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
-      voucher_used DECIMAL(12,2) NOT NULL DEFAULT 0,
-      total_value DECIMAL(12,2) NOT NULL DEFAULT 0,
-      transaction_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_uid (uid),
-      KEY idx_voucher_id (voucher_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Vouchers');
   voucherTxTableReady = true;
 }
 

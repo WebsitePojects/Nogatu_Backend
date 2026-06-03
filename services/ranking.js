@@ -7,13 +7,14 @@ const { nowMySQL, getAccountTypeName } = require('../utils/helpers');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { writeAuditLog } = require('./audit');
 const { getPackagePolicy, listPackagePolicies } = require('./packagePolicy');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 const {
   listRankableEventsForMember,
   computeRankAwardsFromEvents,
   summarizeAchievementStatus,
 } = require('./rankingRace');
 
-const RANKING_BASIS_LABEL = 'Product Repurchase Points';
+const RANKING_BASIS_LABEL = 'Repurchase points';
 const RACE_BASIS_MODE = 'repurchase-event';
 const RANK_REFRESH_MAX_AGE_MINUTES = 15;
 
@@ -160,74 +161,9 @@ function normalizeRankDefinitions(definitionRows = []) {
   }));
 }
 
-async function ensureIndex(conn, tableName, indexName, alterSql) {
-  const [rows] = await conn.query(`SHOW INDEX FROM ${tableName} WHERE Key_name = ?`, [indexName]);
-  if (rows.length === 0) {
-    await conn.query(alterSql);
-  }
-}
-
 async function ensureRankingTable(conn = pool) {
-  await conn.query(
-    `CREATE TABLE IF NOT EXISTS rankingstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      current_rank INT NOT NULL DEFAULT 0,
-      rank_level INT NOT NULL DEFAULT 0,
-      highest_rank_no INT NOT NULL DEFAULT 0,
-      binary_points_total FLOAT NOT NULL DEFAULT 0,
-      basis_points FLOAT NOT NULL DEFAULT 0,
-      consumed_points DECIMAL(14,2) NOT NULL DEFAULT 0,
-      remaining_rankable_points DECIMAL(14,2) NOT NULL DEFAULT 0,
-      basis_label VARCHAR(120) DEFAULT NULL,
-      race_basis_mode VARCHAR(40) NOT NULL DEFAULT 'repurchase-event',
-      left_qualified_count INT NOT NULL DEFAULT 0,
-      right_qualified_count INT NOT NULL DEFAULT 0,
-      rank_date DATETIME DEFAULT NULL,
-      race_last_awarded_at DATETIME(6) DEFAULT NULL,
-      qualified_date DATETIME DEFAULT NULL,
-      incentive_status INT NOT NULL DEFAULT 0,
-      reward_status INT NOT NULL DEFAULT 0,
-      pending_achievement_count INT NOT NULL DEFAULT 0,
-      reward_claimed_date DATETIME DEFAULT NULL,
-      last_calculated_at DATETIME DEFAULT NULL,
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_uid (uid),
-      KEY idx_current_rank (current_rank),
-      KEY idx_rank_level (rank_level)
-    ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
-  );
-
-  const [cols] = await conn.query('SHOW COLUMNS FROM rankingstab');
-  const columnSet = new Set(cols.map((col) => String(col.Field || '').toLowerCase()));
-
-  if (!columnSet.has('highest_rank_no')) await conn.query('ALTER TABLE rankingstab ADD COLUMN highest_rank_no INT NOT NULL DEFAULT 0 AFTER rank_level');
-  if (!columnSet.has('basis_points')) await conn.query('ALTER TABLE rankingstab ADD COLUMN basis_points FLOAT NOT NULL DEFAULT 0 AFTER binary_points_total');
-  if (!columnSet.has('consumed_points')) await conn.query('ALTER TABLE rankingstab ADD COLUMN consumed_points DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER basis_points');
-  if (!columnSet.has('remaining_rankable_points')) await conn.query('ALTER TABLE rankingstab ADD COLUMN remaining_rankable_points DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER consumed_points');
-  if (!columnSet.has('basis_label')) await conn.query('ALTER TABLE rankingstab ADD COLUMN basis_label VARCHAR(120) DEFAULT NULL AFTER remaining_rankable_points');
-  if (!columnSet.has('race_basis_mode')) await conn.query(`ALTER TABLE rankingstab ADD COLUMN race_basis_mode VARCHAR(40) NOT NULL DEFAULT '${RACE_BASIS_MODE}' AFTER basis_label`);
-  if (!columnSet.has('race_last_awarded_at')) await conn.query('ALTER TABLE rankingstab ADD COLUMN race_last_awarded_at DATETIME(6) DEFAULT NULL AFTER rank_date');
-  if (!columnSet.has('pending_achievement_count')) await conn.query('ALTER TABLE rankingstab ADD COLUMN pending_achievement_count INT NOT NULL DEFAULT 0 AFTER reward_status');
-  if (!columnSet.has('last_calculated_at')) await conn.query('ALTER TABLE rankingstab ADD COLUMN last_calculated_at DATETIME DEFAULT NULL AFTER reward_claimed_date');
-
-  await conn.query(
-    `CREATE TABLE IF NOT EXISTS rank_sequence_countertab (
-      id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
-      next_sequence BIGINT UNSIGNED NOT NULL
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.RANKING, 'Ranking', conn);
   await conn.query('INSERT IGNORE INTO rank_sequence_countertab (id, next_sequence) VALUES (1, 1)');
-
-  await ensureIndex(conn, 'rankingstab', 'idx_basis_points', 'ALTER TABLE rankingstab ADD INDEX idx_basis_points (basis_points)');
-  await ensureIndex(conn, 'rankingstab', 'idx_last_calculated_at', 'ALTER TABLE rankingstab ADD INDEX idx_last_calculated_at (last_calculated_at)');
-  await ensureIndex(conn, 'rankingstab', 'idx_highest_rank_no', 'ALTER TABLE rankingstab ADD INDEX idx_highest_rank_no (highest_rank_no)');
-  await ensureIndex(conn, 'rankingstab', 'idx_race_last_awarded_at', 'ALTER TABLE rankingstab ADD INDEX idx_race_last_awarded_at (race_last_awarded_at)');
-  await ensureIndex(conn, 'repurchasetab', 'idx_uid_incentivepoints1', 'ALTER TABLE repurchasetab ADD INDEX idx_uid_incentivepoints1 (uid, incentivepoints1)');
-  await ensureIndex(conn, 'pairingstab', 'idx_uid_transdate_id', 'ALTER TABLE pairingstab ADD INDEX idx_uid_transdate_id (uid, transdate, id)');
-  await ensureIndex(conn, 'usertab', 'idx_refid_position_uid', 'ALTER TABLE usertab ADD INDEX idx_refid_position_uid (refid, position, uid)');
-  await ensureIndex(conn, 'usertab', 'idx_codeid_mainid_uid', 'ALTER TABLE usertab ADD INDEX idx_codeid_mainid_uid (codeid, mainid, uid)');
-  await ensureIndex(conn, 'binary_tree_closuretab', 'idx_ancestor_leg_depth', 'ALTER TABLE binary_tree_closuretab ADD INDEX idx_ancestor_leg_depth (ancestor_uid, leg, depth)');
 }
 
 async function ensureRankingInfra() {

@@ -3,7 +3,6 @@
  * Lists CD accounts with payment progress, drilldown metrics, and export surfaces.
  */
 const express = require('express');
-const XLSX = require('xlsx');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
@@ -13,9 +12,9 @@ const {
 } = require('../../services/adminReporting');
 const { deriveCdSettlementState } = require('../../services/cdAccountsPolicy');
 const {
-  renderAdminPdfReport,
-  sendPdfReport,
-} = require('../../services/jsreportExport');
+  buildSectionedCsv,
+  sendCsv,
+} = require('../../services/csvExport');
 
 const PACKAGE_MAP = {
   10: 'Bronze',
@@ -137,125 +136,11 @@ async function fetchCdAccounts({ whereClause, params, offset = null, limit = nul
   return rows.map(mapCdAccountRow);
 }
 
-function addSheet(workbook, name, rows, widths = []) {
-  const sheet = XLSX.utils.json_to_sheet(rows);
-  if (widths.length) {
-    sheet['!cols'] = widths.map((wch) => ({ wch }));
-  }
-  XLSX.utils.book_append_sheet(workbook, sheet, name);
-}
-
-function writeWorkbook(res, filename, sheets, format = 'xlsx') {
-  const workbook = XLSX.utils.book_new();
-  for (const [name, rows] of sheets) {
-    addSheet(workbook, name, rows.rows, rows.widths || []);
-  }
-
-  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
-  res.send(buffer);
-}
-
-function money(value) {
-  return `PHP ${Number(value || 0).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
-function buildCdPdfDefinition(accounts, packageBreakdown, stats, filters) {
-  const packageScale = Math.max(1, ...packageBreakdown.map((row) => Number(row.totalCdAmount || 0)));
-  const progressBuckets = [
-    { label: 'Fully Paid', value: Number(stats.fullyPaid || 0), color: '#15803d' },
-    { label: 'Still Paying', value: Number(stats.stillPaying || 0), color: '#d97706' },
-  ];
-  const progressScale = Math.max(1, ...progressBuckets.map((row) => row.value));
-  return {
-    fileName: `cd-accounts-${filters.status}-${filters.packageType}`,
-    title: 'CD Account Management Report',
-    subtitle: 'Recovered-CD tracking, package breakdown, and payment-progress audit for CD accounts.',
-    generatedAt: new Date().toLocaleString('en-PH', { hour12: true }),
-    filterChips: [
-      `Search: ${filters.search || 'All accounts'}`,
-      `Status: ${filters.status || 'all'}`,
-      `Package: ${filters.packageType || 'all'}`,
-    ],
-    summaryCards: [
-      { label: 'Total CD Accounts', value: String(stats.total || 0), color: '#b45309' },
-      { label: 'Fully Paid', value: String(stats.fullyPaid || 0), color: '#15803d' },
-      { label: 'Still Paying', value: String(stats.stillPaying || 0), color: '#d97706' },
-      { label: 'Total CD Amount', value: money(stats.totalCdAmount), color: '#dc2626' },
-      { label: 'Total Paid', value: money(stats.totalPaid), color: '#047857' },
-      { label: 'CD Deductions', value: money(stats.totalCdDeduction), color: '#db2777' },
-      { label: 'Net Encashment', value: money(stats.totalNetEncashment), color: '#1d4ed8' },
-    ],
-    charts: [
-      {
-        title: 'CD Package Exposure',
-        note: 'Total CD amount grouped by package under the current filter.',
-        bars: packageBreakdown.map((row) => ({
-          label: row.package,
-          valueLabel: money(row.totalCdAmount),
-          percent: Math.max(4, Math.round((Number(row.totalCdAmount || 0) / packageScale) * 100)),
-          color: '#d4af37',
-        })),
-      },
-      {
-        title: 'Settlement Status Mix',
-        note: 'Recovered fully-paid versus still-paying CD accounts.',
-        bars: progressBuckets.map((row) => ({
-          label: row.label,
-          valueLabel: String(row.value),
-          percent: Math.max(4, Math.round((row.value / progressScale) * 100)),
-          color: row.color,
-        })),
-      },
-    ],
-    tables: [
-      {
-        title: 'Package Breakdown',
-        note: 'Fully Paid counts only accounts whose CD deduction recovery reached the full CD amount.',
-        columns: ['Package', 'Accounts', 'Fully Paid', 'Still Paying', 'CD Amount', 'Paid', 'Remaining', 'Net Encashment'],
-        rows: packageBreakdown.map((row) => ([
-          row.package,
-          String(row.totalAccounts || 0),
-          String(row.fullyPaid || 0),
-          String(row.stillPaying || 0),
-          money(row.totalCdAmount),
-          money(row.totalPaid),
-          money(row.totalRemaining),
-          money(row.totalNetEncashment),
-        ])),
-      },
-      {
-        title: 'CD Accounts',
-        note: 'Accounts settled outside direct deduction remain visible with their own status instead of inflating recovered fully-paid counts.',
-        columns: ['Username', 'Full Name', 'Package', 'Status', 'CD Amount', 'Paid', 'Remaining', 'Progress', 'CD Logs', 'Net Encashment'],
-        rows: accounts.map((account) => ([
-          account.username,
-          account.fullname,
-          account.package,
-          account.cdstatusLabel,
-          money(account.cdamount),
-          money(account.cdtotal),
-          money(account.remaining),
-          `${account.progress}%`,
-          `${account.deductionCount} deductions / ${account.encashmentCount} encashments`,
-          money(account.netEncashment),
-        ])),
-      },
-    ],
-  };
-}
-
 router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const search = String(req.query.search || '').trim();
     const status = String(req.query.status || 'all').trim();
     const packageType = String(req.query.packageType || 'all').trim();
-    const rawFormat = String(req.query.format || 'xlsx').toLowerCase();
-    const format = rawFormat === 'pdf' || rawFormat === 'crystal' ? rawFormat : 'xlsx';
     const filters = { search, status, packageType };
     const { whereClause, params } = buildCdWhereClause(filters);
     const accounts = await fetchCdAccounts({ whereClause, params });
@@ -279,53 +164,43 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
       totalNetEncashment: 0,
     });
 
-    if (format === 'pdf' || format === 'crystal') {
-      const report = await renderAdminPdfReport(buildCdPdfDefinition(accounts, packageBreakdown, stats, filters));
-      sendPdfReport(res, report);
-      return;
-    }
-
-    writeWorkbook(
-      res,
-      `cd-accounts-${status}-${packageType}`,
-      [
-        ['Summary', {
-          rows: [
-            { Metric: 'Search', Value: search || 'All records' },
-            { Metric: 'Status Filter', Value: status },
-            { Metric: 'Package Filter', Value: packageType },
-            { Metric: 'Total CD Accounts', Value: stats.total },
-            { Metric: 'Fully Paid', Value: stats.fullyPaid },
-            { Metric: 'Still Paying', Value: stats.stillPaying },
-            { Metric: 'Total CD Amount', Value: stats.totalCdAmount },
-            { Metric: 'Total Paid So Far', Value: stats.totalPaid },
-            { Metric: 'CD Deductions', Value: stats.totalCdDeduction },
-            { Metric: 'Net Encashment', Value: stats.totalNetEncashment },
-          ],
-          widths: [26, 20],
-        }],
-        ['CD Accounts', {
-          rows: buildCdExportRows(accounts),
-          widths: [16, 24, 14, 14, 14, 14, 14, 12, 18, 16, 20, 18, 18],
-        }],
-        ['Package Breakdown', {
-          rows: packageBreakdown.map((row) => ({
-            Package: row.package,
-            'Total Accounts': row.totalAccounts,
-            'Fully Paid': row.fullyPaid,
-            'Still Paying': row.stillPaying,
-            'Total CD Amount': row.totalCdAmount,
-            'Total Paid': row.totalPaid,
-            'Total Remaining': row.totalRemaining,
-            'CD Deduction Count': row.totalDeductionCount,
-            'Encashment Count': row.totalEncashmentCount,
-            'Net Encashment Recovered': row.totalNetEncashment,
-          })),
-          widths: [14, 14, 12, 12, 18, 14, 18, 18, 18, 22],
-        }],
-      ],
-      format
-    );
+    const csv = buildSectionedCsv([
+      {
+        title: 'Summary',
+        rows: [
+          { Metric: 'Search', Value: search || 'All records' },
+          { Metric: 'Status Filter', Value: status },
+          { Metric: 'Package Filter', Value: packageType },
+          { Metric: 'Total CD Accounts', Value: stats.total },
+          { Metric: 'Fully Paid', Value: stats.fullyPaid },
+          { Metric: 'Still Paying', Value: stats.stillPaying },
+          { Metric: 'Total CD Amount', Value: stats.totalCdAmount },
+          { Metric: 'Total Paid So Far', Value: stats.totalPaid },
+          { Metric: 'CD Deductions', Value: stats.totalCdDeduction },
+          { Metric: 'Net Encashment', Value: stats.totalNetEncashment },
+        ],
+      },
+      {
+        title: 'CD Accounts',
+        rows: buildCdExportRows(accounts),
+      },
+      {
+        title: 'Package Breakdown',
+        rows: packageBreakdown.map((row) => ({
+          Package: row.package,
+          'Total Accounts': row.totalAccounts,
+          'Fully Paid': row.fullyPaid,
+          'Still Paying': row.stillPaying,
+          'Total CD Amount': row.totalCdAmount,
+          'Total Paid': row.totalPaid,
+          'Total Remaining': row.totalRemaining,
+          'CD Deduction Count': row.totalDeductionCount,
+          'Encashment Count': row.totalEncashmentCount,
+          'Net Encashment Recovered': row.totalNetEncashment,
+        })),
+      },
+    ]);
+    sendCsv(res, `cd-accounts-${status}-${packageType}`, csv);
   } catch (err) {
     console.error('[Admin CD Accounts] Export error:', err);
     res.status(500).json({ success: false, message: 'Failed to export CD accounts' });

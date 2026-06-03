@@ -31,19 +31,100 @@ const MySQLStore = require('express-mysql-session')(session);
 const cors = require('cors');
 const helmet = require('helmet');
 const { testConnection, pool } = require('./config/database');
+const {
+  SCHEMA_REQUIREMENTS,
+  assertSchemaRequirements,
+  getSchemaSnapshot,
+  listMissingSchemaRequirements,
+} = require('./services/schemaReadiness');
 const { requestId } = require('./utils/security');
 
 const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 5000;
+const readinessState = {
+  startedAt: new Date().toISOString(),
+  dbReady: false,
+  schemaReady: false,
+  sessionStoreReady: false,
+  startupComplete: false,
+};
+
+function parseAllowedOrigins(...values) {
+  return [...new Set(
+    values
+      .flatMap((value) => String(value || '').split(','))
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )];
+}
+
+function buildCspDirectives(allowedOrigins) {
+  const directives = {
+    defaultSrc: ["'self'"],
+    baseUri: ["'self'"],
+    objectSrc: ["'none'"],
+    frameAncestors: ["'none'"],
+    imgSrc: ["'self'", 'data:', 'https:'],
+    fontSrc: ["'self'", 'data:', 'https:'],
+    scriptSrc: ["'self'"],
+    styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
+    connectSrc: ["'self'", ...allowedOrigins],
+    formAction: ["'self'", ...allowedOrigins],
+  };
+
+  if (process.env.NODE_ENV === 'production') {
+    directives.upgradeInsecureRequests = [];
+  }
+
+  return directives;
+}
+
+const allowedOrigins = parseAllowedOrigins(
+  process.env.ALLOWED_ORIGINS,
+  process.env.CLIENT_URL,
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5174'
+);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  return allowedOrigins.includes(String(origin).trim());
+}
+
+function getRequestOrigin(req) {
+  const origin = String(req.headers.origin || '').trim();
+  if (origin) return origin;
+
+  const referer = String(req.headers.referer || '').trim();
+  if (!referer) return '';
+
+  try {
+    return new URL(referer).origin;
+  } catch {
+    return '';
+  }
+}
 
 // Trust Nginx reverse proxy — required for secure cookies behind HTTPS proxy
 app.set('trust proxy', 1);
 
 // ─── Middleware ───────────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: buildCspDirectives(allowedOrigins),
+  },
+}));
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin(origin, callback) {
+    if (isAllowedOrigin(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Origin not allowed by CORS'));
+  },
   credentials: true,
 }));
 app.use(express.json());
@@ -123,30 +204,6 @@ async function logAuthTableSnapshot() {
   }
 }
 
-async function ensurePasswordColumns() {
-  const [memberCols] = await pool.query(
-    "SHOW COLUMNS FROM memberstab LIKE 'password'"
-  );
-  if (memberCols.length > 0) {
-    const memberType = String(memberCols[0].Type || '').toLowerCase();
-    if (!memberType.includes('varchar(255)')) {
-      await pool.query('ALTER TABLE memberstab MODIFY COLUMN password VARCHAR(255) NULL');
-      console.log('[Server] Updated memberstab.password to VARCHAR(255)');
-    }
-  }
-
-  const [adminCols] = await pool.query(
-    "SHOW COLUMNS FROM accesstab LIKE 'password'"
-  );
-  if (adminCols.length > 0) {
-    const adminType = String(adminCols[0].Type || '').toLowerCase();
-    if (!adminType.includes('varchar(255)')) {
-      await pool.query('ALTER TABLE accesstab MODIFY COLUMN password VARCHAR(255) NULL');
-      console.log('[Server] Updated accesstab.password to VARCHAR(255)');
-    }
-  }
-}
-
 async function ensureDevelopmentAdminPasswords() {
   if (process.env.NODE_ENV === 'production') return;
 
@@ -179,6 +236,23 @@ app.use(session({
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   },
 }));
+
+app.use((req, res, next) => {
+  const method = String(req.method || 'GET').toUpperCase();
+  const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+  const hasSessionActor = Boolean(req.session?.uid || req.session?.adminid);
+
+  if (!isMutating || !hasSessionActor) {
+    return next();
+  }
+
+  const origin = getRequestOrigin(req);
+  if (!origin || isAllowedOrigin(origin)) {
+    return next();
+  }
+
+  return res.status(403).json({ error: 'Invalid request origin' });
+});
 
 // ─── Rate limiting on login endpoints ────────────────────────
 const loginLimiter = rateLimit({
@@ -234,6 +308,42 @@ app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 app.use('/api/admin/finance', require('./routes/admin/finance'));
 app.use('/api/admin/applications', require('./routes/admin/applications'));
 
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    startedAt: readinessState.startedAt,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+});
+
+app.get('/ready', async (_req, res) => {
+  const checks = {
+    db: false,
+    schema: false,
+    sessions: readinessState.sessionStoreReady,
+    startup: readinessState.startupComplete,
+  };
+  let missing = [];
+
+  try {
+    await pool.query('SELECT 1 AS ok');
+    checks.db = true;
+  } catch {}
+
+  try {
+    const snapshot = await getSchemaSnapshot();
+    missing = listMissingSchemaRequirements(snapshot, SCHEMA_REQUIREMENTS.READINESS);
+    checks.schema = missing.length === 0;
+  } catch {}
+
+  const ready = Object.values(checks).every(Boolean);
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    checks,
+    missing,
+  });
+});
+
 // ─── Serve React build in production ─────────────────────────
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, '../frontend/dist')));
@@ -251,7 +361,9 @@ app.use((err, req, res, next) => {
 // ─── Start ───────────────────────────────────────────────────
 async function start() {
   await testConnection();
-  await ensurePasswordColumns();
+  readinessState.dbReady = true;
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.AUTH_PASSWORDS, 'Authentication');
+  readinessState.schemaReady = true;
   await ensureDevelopmentAdminPasswords();
   await logAuthTableSnapshot();
   await ensureSessionsTable();
@@ -260,8 +372,10 @@ async function start() {
   if (typeof sessionStore.onReady === 'function') {
     await sessionStore.onReady();
   }
+  readinessState.sessionStoreReady = true;
 
   const server = app.listen(PORT, () => {
+    readinessState.startupComplete = true;
     console.log(`[Server] NOGATU Alliance running on http://localhost:${PORT}`);
     console.log(`[Server] API available at http://localhost:${PORT}/api`);
     console.log(`[Server] Mode: ${process.env.NODE_ENV || 'development'}`);
@@ -278,9 +392,15 @@ async function start() {
     console.error('[Server] Failed to start server:', error);
     process.exit(1);
   });
+
+  return server;
 }
 
-start().catch((error) => {
-  console.error('[Server] Startup failed:', error);
-  process.exit(1);
-});
+if (require.main === module) {
+  start().catch((error) => {
+    console.error('[Server] Startup failed:', error);
+    process.exit(1);
+  });
+}
+
+module.exports = { app, start, readinessState };

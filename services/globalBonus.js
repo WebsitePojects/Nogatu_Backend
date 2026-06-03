@@ -3,6 +3,7 @@
  * Pool = 2% of annual net sales, distributed only for fully completed years.
  */
 const { pool } = require('../config/database');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 const STOCKIST_PORTIONS = {
   2: { points: 1, label: 'Mobile Stockist' },
@@ -55,67 +56,7 @@ async function getTableColumns(tableName) {
 }
 
 async function ensureGlobalBonusTables() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS globalbonus_poolstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      period_scope VARCHAR(16) NOT NULL DEFAULT 'annual',
-      period_month INT NOT NULL DEFAULT 0,
-      period_year INT NOT NULL,
-      total_net_sales DECIMAL(14,2) NOT NULL DEFAULT 0,
-      bonus_pool DECIMAL(14,2) NOT NULL DEFAULT 0,
-      total_portions INT NOT NULL DEFAULT 0,
-      per_portion_value DECIMAL(12,2) NOT NULL DEFAULT 0,
-      status INT NOT NULL DEFAULT 0,
-      distributed_date DATETIME DEFAULT NULL,
-      created_date DATETIME DEFAULT NULL,
-      processid VARCHAR(30) DEFAULT NULL,
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_period_scope (period_scope, period_year, period_month)
-    ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
-  );
-
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS globalbonus_membertab (
-      id INT NOT NULL AUTO_INCREMENT,
-      uid INT NOT NULL,
-      period_scope VARCHAR(16) NOT NULL DEFAULT 'annual',
-      period_month INT NOT NULL DEFAULT 0,
-      period_year INT NOT NULL,
-      member_type VARCHAR(60) DEFAULT NULL,
-      portions FLOAT NOT NULL DEFAULT 0,
-      share_amount DECIMAL(14,2) NOT NULL DEFAULT 0,
-      distributed_date DATETIME DEFAULT NULL,
-      processid VARCHAR(30) DEFAULT NULL,
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_uid_scope_period (uid, period_scope, period_year, period_month),
-      KEY idx_period_scope (period_scope, period_year, period_month),
-      KEY idx_uid (uid)
-    ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
-  );
-
-  const poolColumns = await getTableColumns('globalbonus_poolstab');
-  if (!poolColumns.has('period_scope')) {
-    await pool.query(
-      "ALTER TABLE globalbonus_poolstab ADD COLUMN period_scope VARCHAR(16) NOT NULL DEFAULT 'annual' AFTER id"
-    ).catch(() => {});
-  }
-  if (!poolColumns.has('period_month')) {
-    await pool.query(
-      'ALTER TABLE globalbonus_poolstab ADD COLUMN period_month INT NOT NULL DEFAULT 0 AFTER period_scope'
-    ).catch(() => {});
-  }
-
-  const memberColumns = await getTableColumns('globalbonus_membertab');
-  if (!memberColumns.has('period_scope')) {
-    await pool.query(
-      "ALTER TABLE globalbonus_membertab ADD COLUMN period_scope VARCHAR(16) NOT NULL DEFAULT 'annual' AFTER uid"
-    ).catch(() => {});
-  }
-  if (!memberColumns.has('period_month')) {
-    await pool.query(
-      'ALTER TABLE globalbonus_membertab ADD COLUMN period_month INT NOT NULL DEFAULT 0 AFTER period_scope'
-    ).catch(() => {});
-  }
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.GLOBAL_BONUS, 'Global bonus');
 
   await pool.query(
     `UPDATE globalbonus_poolstab

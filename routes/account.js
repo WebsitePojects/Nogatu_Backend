@@ -11,6 +11,7 @@ const { normalizeEmail, isValidEmail } = require('../utils/email');
 const { resolveTin, isValidTin } = require('../utils/tin');
 const { listPackagePolicies } = require('../services/packagePolicy');
 const { normalizePayoutStorageValue, resolvePayoutOption, listPayoutOptions } = require('../services/payoutOptions');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../services/schemaReadiness');
 
 let memberTinColumnsReady = false;
 let memberHasTinNoColumn = false;
@@ -18,21 +19,16 @@ let memberHasTinNoColumn = false;
 async function ensureMemberTinColumns() {
   if (memberTinColumnsReady) return;
 
-  const [columns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tin'");
-  if (columns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN tin VARCHAR(30) DEFAULT NULL');
-  }
-
-  const [tinNoColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tinno'");
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.MEMBER_PROFILE, 'Member account details');
+  const [tinNoColumns] = await pool.query(
+    `SELECT 1 AS ok
+       FROM information_schema.columns
+      WHERE table_schema = DATABASE()
+        AND table_name = 'memberstab'
+        AND column_name = 'tinno'
+      LIMIT 1`
+  );
   memberHasTinNoColumn = tinNoColumns.length > 0;
-
-  const [emailColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'email'");
-  if (emailColumns.length === 0) {
-    await pool.query('ALTER TABLE memberstab ADD COLUMN email VARCHAR(180) DEFAULT NULL');
-  } else if (!String(emailColumns[0].Type || '').toLowerCase().includes('180')) {
-    await pool.query('ALTER TABLE memberstab MODIFY COLUMN email VARCHAR(180) DEFAULT NULL');
-  }
-
   memberTinColumnsReady = true;
 }
 

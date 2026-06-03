@@ -2,6 +2,7 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const { pool } = require('../config/database');
+const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../services/schemaReadiness');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -22,40 +23,20 @@ function normalizeApplicationFields(body = {}) {
 }
 
 async function ensureApplicationsTable() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS distributor_applicationstab (
-      id INT NOT NULL AUTO_INCREMENT,
-      name VARCHAR(150) NOT NULL,
-      age INT DEFAULT NULL,
-      phone VARCHAR(50) NOT NULL,
-      email VARCHAR(200) NOT NULL,
-      letter_of_intent_url VARCHAR(500) DEFAULT NULL,
-      letter_of_intent_public_id VARCHAR(255) DEFAULT NULL,
-      letter_of_intent_filename VARCHAR(255) DEFAULT NULL,
-      letter_of_intent_uploaded_at DATETIME DEFAULT NULL,
-      status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
-      follow_up_status ENUM('new','followed_up','cancelled','done') NOT NULL DEFAULT 'new',
-      admin_note TEXT DEFAULT NULL,
-      reviewed_by VARCHAR(100) DEFAULT NULL,
-      reviewed_at DATETIME DEFAULT NULL,
-      ip_address VARCHAR(45) DEFAULT NULL,
-      submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_status (status),
-      KEY idx_email_phone (email, phone),
-      KEY idx_submitted_at (submitted_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-  );
-
-  await pool.query('ALTER TABLE distributor_applicationstab MODIFY age INT DEFAULT NULL').catch(() => {});
-  await pool.query('ALTER TABLE distributor_applicationstab ADD COLUMN letter_of_intent_url VARCHAR(500) DEFAULT NULL AFTER email').catch(() => {});
-  await pool.query('ALTER TABLE distributor_applicationstab ADD COLUMN letter_of_intent_public_id VARCHAR(255) DEFAULT NULL AFTER letter_of_intent_url').catch(() => {});
-  await pool.query('ALTER TABLE distributor_applicationstab ADD COLUMN letter_of_intent_filename VARCHAR(255) DEFAULT NULL AFTER letter_of_intent_public_id').catch(() => {});
-  await pool.query('ALTER TABLE distributor_applicationstab ADD COLUMN letter_of_intent_uploaded_at DATETIME DEFAULT NULL AFTER letter_of_intent_filename').catch(() => {});
-  await pool.query(
-    "ALTER TABLE distributor_applicationstab ADD COLUMN follow_up_status ENUM('new','followed_up','cancelled','done') NOT NULL DEFAULT 'new' AFTER status"
-  ).catch(() => {});
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.APPLICATIONS, 'Distributor applications');
 }
+
+router.use(async (_req, res, next) => {
+  try {
+    await assertSchemaRequirements(SCHEMA_REQUIREMENTS.APPLICATIONS, 'Distributor applications');
+    next();
+  } catch (error) {
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return next(error);
+  }
+});
 
 router.post('/', applicationLimiter, async (req, res) => {
   try {
