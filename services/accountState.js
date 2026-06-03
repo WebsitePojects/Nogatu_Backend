@@ -4,6 +4,17 @@ function toNumber(value) {
   return Number(value || 0);
 }
 
+function isCdFullyPaid(row) {
+  if (!row) return false;
+  const cdAmount = toNumber(row.cdamount);
+  const cdTotal = toNumber(row.cdtotal);
+  const cdStatus = toNumber(row.cdstatus);
+
+  if (cdStatus !== 2) return false;
+  if (cdAmount <= 0) return true;
+  return cdTotal >= cdAmount;
+}
+
 async function getLatestUpgradeCode(uid, executor) {
   const runner = executor || pool;
   const [rows] = await runner.query(
@@ -125,15 +136,88 @@ function countsForPairingSource(row) {
     return true;
   }
 
-  if (toNumber(row.codeid) === 3 && toNumber(row.cdstatus) === 2) {
+  if (toNumber(row.codeid) === 3 && isCdFullyPaid(row)) {
     return true;
   }
 
   return false;
 }
 
+function getAccountStateLabel(row) {
+  if (!row) return 'Unknown';
+
+  const codeid = toNumber(row.codeid);
+  const cdPaid = isCdFullyPaid(row);
+
+  if (codeid === 1) return 'PD';
+  if (codeid === 2) return 'FS';
+  if (codeid === 3 && cdPaid) return 'CD - Paid';
+  if (codeid === 3) return 'CD';
+  return 'Unknown';
+}
+
+function getAccountEntryAuditInfo(row) {
+  if (!row) {
+    return {
+      entryCode: 'UNKNOWN',
+      entryLabel: 'Unknown',
+      sponsorCreditEligible: false,
+      sourceBinaryEligible: false,
+    };
+  }
+
+  const codeid = toNumber(row.codeid);
+  const cdPaid = isCdFullyPaid(row);
+
+  if (codeid === 1) {
+    return {
+      entryCode: 'PD',
+      entryLabel: 'Paid Direct',
+      sponsorCreditEligible: true,
+      sourceBinaryEligible: true,
+    };
+  }
+
+  if (codeid === 2) {
+    return {
+      entryCode: 'FS',
+      entryLabel: 'Free Slot',
+      sponsorCreditEligible: true,
+      sourceBinaryEligible: false,
+    };
+  }
+
+  if (codeid === 3 && cdPaid) {
+    return {
+      entryCode: 'CD-PAID',
+      entryLabel: 'CD Settled',
+      sponsorCreditEligible: true,
+      sourceBinaryEligible: true,
+    };
+  }
+
+  if (codeid === 3) {
+    return {
+      entryCode: 'CD',
+      entryLabel: 'CD Unpaid',
+      sponsorCreditEligible: true,
+      sourceBinaryEligible: false,
+    };
+  }
+
+  return {
+    entryCode: 'UNKNOWN',
+    entryLabel: 'Unknown',
+    sponsorCreditEligible: false,
+    sourceBinaryEligible: false,
+  };
+}
+
 module.exports = {
   getLatestUpgradeCode,
   getEffectiveAccountState,
+  isCdFullyPaid,
   countsForPairingSource,
+  getAccountStateLabel,
+  getAccountEntryAuditInfo,
 };

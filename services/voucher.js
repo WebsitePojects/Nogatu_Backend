@@ -8,6 +8,7 @@
  * - Expiry: Bronze=30d, Silver=40d, Gold=45d, Platinum=50d, Garnet=55d, Diamond=60d
  */
 const { pool } = require('../config/database');
+const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
@@ -91,6 +92,24 @@ const PACKAGE_AMOUNTS = {
   60: 150000,
 };
 
+const VOUCHER_PRODUCT_BY_CODE = Object.fromEntries(
+  Object.values(VOUCHER_PRODUCT_CATALOG).map((product) => [product.code, product])
+);
+
+function normalizeVoucherProductSelection(options = {}) {
+  const productKey = String(options.productKey || '').trim().toLowerCase();
+  if (productKey && VOUCHER_PRODUCT_CATALOG[productKey]) {
+    return VOUCHER_PRODUCT_CATALOG[productKey];
+  }
+
+  const productCode = Number(options.productCode || 0);
+  if (productCode > 0 && VOUCHER_PRODUCT_BY_CODE[productCode]) {
+    return VOUCHER_PRODUCT_BY_CODE[productCode];
+  }
+
+  return null;
+}
+
 /**
  * Issue a voucher for a new member at registration
  * @param {object} conn - DB connection (for use within transaction)
@@ -113,6 +132,20 @@ async function issueVoucher(conn, uid, packageType) {
   );
 
   return result.insertId;
+}
+
+function buildVoucherExpiryLabel(expiryDate, status) {
+  if (!expiryDate || Number(status || 0) === 2) return 'Expired';
+  if (Number(status || 0) === 3) return 'Fully used';
+  if (Number(status || 0) === 4) return 'Suspended';
+
+  const expiry = new Date(expiryDate);
+  if (Number.isNaN(expiry.getTime())) return 'Active';
+  const diffMs = expiry.getTime() - Date.now();
+  const daysRemaining = Math.max(0, Math.ceil(diffMs / 86400000));
+  if (daysRemaining === 0) return 'Expires today';
+  if (daysRemaining === 1) return '1 day left';
+  return `${daysRemaining} days left`;
 }
 
 /**
@@ -141,7 +174,10 @@ async function getVouchers(uid) {
     [uid]
   );
 
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    expiry_label: buildVoucherExpiryLabel(row.expiry_date, row.status),
+  }));
 }
 
 /**
@@ -167,6 +203,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
 
   const selectedVoucherId = Number(voucherId || 0);
   const cashPaid = Number(cashAmount);
+  const selectedProduct = normalizeVoucherProductSelection(options);
   const lockKey = `nogatu_income_calc_${memberUid}`;
 
   const conn = await pool.getConnection();
@@ -259,6 +296,15 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       [memberUid, resolvedVoucherId, cashPaid, voucherDeduction, cashPaid + voucherDeduction]
     );
 
+    if (selectedProduct) {
+      const voucherReferenceCode = `VCHR-${resolvedVoucherId}-${Date.now()}`;
+      await conn.query(
+        `INSERT INTO repurchasetab (id, uid, producttype, code, transtype, codeid, incentivepoints1, transdate)
+         VALUES (NULL, ?, ?, ?, 1, 1, ?, NOW())`,
+        [memberUid, selectedProduct.code, voucherReferenceCode, selectedProduct.incentivePoints]
+      );
+    }
+
     await conn.commit();
     txStarted = false;
 
@@ -271,6 +317,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       remainingBalance: newBalance,
       walletBalance: newWalletBalance,
       fullyUsed: newStatus === 3,
+      productType: selectedProduct?.code || null,
       ...(safeProductName ? { productName: safeProductName } : {}),
     };
   } catch (err) {
@@ -563,6 +610,8 @@ module.exports = {
   grantVouchersToExistingMembers,
   ensureVoucherTable,
   ensureVoucherTxTable,
+  normalizeVoucherProductSelection,
+  VOUCHER_PRODUCT_CATALOG,
   VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,
 };

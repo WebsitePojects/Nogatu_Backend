@@ -6,6 +6,15 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
+const XLSX = require('xlsx');
+const {
+  buildEncashmentSummary,
+  buildEncashmentExportRows,
+} = require('../../services/adminReporting');
+const {
+  renderAdminPdfReport,
+  sendPdfReport,
+} = require('../../services/jsreportExport');
 
 const PAYOUT_OPTION_LABELS = {
   1: 'Pickup',
@@ -13,6 +22,21 @@ const PAYOUT_OPTION_LABELS = {
   3: 'Remittance Center',
   4: 'Bank Deposit',
   5: 'Others',
+};
+
+const PAYOUT_OPTION_ID_BY_LABEL = Object.entries(PAYOUT_OPTION_LABELS).reduce((acc, [id, label]) => {
+  acc[label.toLowerCase()] = Number(id);
+  return acc;
+}, {});
+
+const PAYOUT_OPTION_ALIASES = {
+  pickup: 'Pickup',
+  gcash: 'GCash',
+  'g cash': 'GCash',
+  'remittance center': 'Remittance Center',
+  'remittance centers': 'Remittance Center',
+  'bank deposit': 'Bank Deposit',
+  others: 'Others',
 };
 
 const PACKAGE_LABELS = {
@@ -23,6 +47,255 @@ const PACKAGE_LABELS = {
   50: 'Garnet',
   60: 'Diamond',
 };
+
+function buildEncashmentWhereClause({ startDate = '', endDate = '', q = '' }) {
+  let whereSql = `WHERE (p.transactiontype = 10 OR p.encashment1 > 0)`;
+  const whereParams = [];
+  const searchLike = `%${q}%`;
+
+  if (startDate) {
+    whereSql += ` AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') >= ?`;
+    whereParams.push(startDate);
+  }
+
+  if (endDate) {
+    whereSql += ` AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') <= ?`;
+    whereParams.push(endDate);
+  }
+
+  if (q) {
+    whereSql += `
+      AND (
+        m.username LIKE ?
+        OR m.firstname LIKE ?
+        OR m.lastname LIKE ?
+        OR CONCAT(m.firstname, ' ', m.lastname) LIKE ?
+      )
+    `;
+    whereParams.push(searchLike, searchLike, searchLike, searchLike);
+  }
+
+  return { whereSql, whereParams };
+}
+
+function normalizePayoutOption(rawValue) {
+  if (rawValue == null) return null;
+
+  const trimmed = String(rawValue).trim();
+  if (!trimmed) return null;
+
+  const numericId = Number(trimmed);
+  if (Number.isFinite(numericId) && PAYOUT_OPTION_LABELS[numericId]) {
+    return {
+      id: numericId,
+      label: PAYOUT_OPTION_LABELS[numericId],
+      raw: trimmed,
+    };
+  }
+
+  const normalizedKey = trimmed.toLowerCase().replace(/\s+/g, ' ');
+  const canonicalLabel = PAYOUT_OPTION_ALIASES[normalizedKey];
+  if (canonicalLabel) {
+    return {
+      id: PAYOUT_OPTION_ID_BY_LABEL[canonicalLabel.toLowerCase()] || null,
+      label: canonicalLabel,
+      raw: trimmed,
+    };
+  }
+
+  return {
+    id: null,
+    label: trimmed,
+    raw: trimmed,
+  };
+}
+
+function resolvePayoutOption(historyOption, profileOption) {
+  return normalizePayoutOption(historyOption) || normalizePayoutOption(profileOption);
+}
+
+function buildPayoutDisplay(optionLabel, rawDetails) {
+  const option = String(optionLabel || '').trim();
+  const details = String(rawDetails || '').trim();
+
+  if (option && details) {
+    if (details.toLowerCase().startsWith(option.toLowerCase())) {
+      return details;
+    }
+    return `${option} / ${details}`;
+  }
+
+  if (option) return option;
+  if (details) return details;
+  return 'N/A';
+}
+
+function mapEncashmentRow(r) {
+  const tax = Number(r.tax_1 || 0);
+  const fee = Number(r.encashmentfee || 0);
+  const cdDeduction = Number(r.cddeduction || 0);
+  const fullName = `${r.firstname || ''} ${r.lastname || ''}`.trim() || `Unknown Account (UID: ${r.uid})`;
+  const payout = resolvePayoutOption(r.paymentoptions, r.payoutid);
+  const payoutOption = payout?.label || 'N/A';
+  const payoutRaw = String(r.paymentdetails || r.payoutdetails || '').trim();
+  const payoutDetails = buildPayoutDisplay(payout?.label, payoutRaw);
+
+  return {
+    pid: Number(r.pid),
+    uid: Number(r.uid),
+    username: r.username || 'N/A',
+    fullname: fullName,
+    encashment: Number(r.encashment1 || 0),
+    tax,
+    fee,
+    cdDeduction,
+    deductions: tax + fee + cdDeduction,
+    cashStatus: Number(r.cashstatus || 0),
+    cashStatusLabel: Number(r.cashstatus || 0) === 1 ? 'Paid' : 'Pending',
+    payoutId: payout?.id || null,
+    payoutOption,
+    payoutDetails,
+    cashtransdate: r.cashtransdate,
+    canViewCdDetails: cdDeduction > 0,
+  };
+}
+
+async function fetchEncashmentRows({ whereSql, whereParams, offset = null, limit = null }) {
+  const paginationSql = Number.isFinite(offset) && Number.isFinite(limit) ? 'LIMIT ?, ?' : '';
+  const params = Number.isFinite(offset) && Number.isFinite(limit)
+    ? [...whereParams, offset, limit]
+    : whereParams;
+
+  const [rows] = await pool.query(
+    `SELECT p.pid, p.uid, DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') as cashtransdate,
+            p.cashstatus, p.cddeduction, p.encashment1, p.tax_1, p.encashmentfee,
+            p.paymentoptions, p.paymentdetails,
+            m.payoutid, m.payoutdetails, m.username, m.firstname, m.lastname
+     FROM payouthistorytab p
+     LEFT JOIN memberstab m ON m.uid = p.uid
+     ${whereSql}
+     ORDER BY p.cashtransdate DESC, p.pid DESC
+     ${paginationSql}`,
+    params
+  );
+
+  return rows.map(mapEncashmentRow);
+}
+
+function addSheet(workbook, name, rows, widths = []) {
+  const sheet = XLSX.utils.json_to_sheet(rows);
+  if (widths.length) {
+    sheet['!cols'] = widths.map((wch) => ({ wch }));
+  }
+  XLSX.utils.book_append_sheet(workbook, sheet, name);
+}
+
+function writeWorkbook(res, filename, sheets, format = 'xlsx') {
+  const workbook = XLSX.utils.book_new();
+  for (const [name, rows] of sheets) {
+    addSheet(workbook, name, rows.rows, rows.widths || []);
+  }
+
+  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
+  res.send(buffer);
+}
+
+function money(value) {
+  return `PHP ${Number(value || 0).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function buildEncashmentPdfDefinition(records, summary, filters) {
+  const dailyRows = summary.daily || [];
+  const dailyScale = Math.max(1, ...dailyRows.map((row) => Number(row.grossEncashment || 0)));
+  const payoutMix = records.reduce((acc, row) => {
+    const key = row.payoutOption || 'N/A';
+    acc[key] = (acc[key] || 0) + Number(row.encashment || 0);
+    return acc;
+  }, {});
+  const payoutScale = Math.max(1, ...Object.values(payoutMix), 1);
+  return {
+    fileName: `encashment-report-${filters.startDate || 'all'}-${filters.endDate || 'latest'}`,
+    title: 'Encashment Management Report',
+    subtitle: 'Finance-facing view of encashment requests, deductions, payout details, and daily totals.',
+    generatedAt: new Date().toLocaleString('en-PH', { hour12: true }),
+    filterChips: [
+      `Search: ${filters.q || 'All accounts'}`,
+      `Start: ${filters.startDate || 'All dates'}`,
+      `End: ${filters.endDate || 'Latest'}`,
+    ],
+    summaryCards: [
+      { label: 'Total Records', value: String(summary.overview.totalRecords || 0), color: '#b45309' },
+      { label: 'Gross Encashment', value: money(summary.overview.grossEncashment), color: '#d97706' },
+      { label: 'Net Receivable', value: money(summary.overview.netReceivable), color: '#047857' },
+      { label: 'Total Deductions', value: money(summary.overview.totalDeductions), color: '#dc2626' },
+      { label: 'CD Deductions', value: money(summary.overview.totalCdDeduction), color: '#db2777' },
+      { label: 'Paid Requests', value: String(summary.overview.paidCount || 0), color: '#15803d' },
+      { label: 'Pending Requests', value: String(summary.overview.pendingCount || 0), color: '#b45309' },
+      { label: 'Members Covered', value: String(summary.overview.uniqueMembers || 0), color: '#1d4ed8' },
+    ],
+    charts: [
+      {
+        title: 'Daily Gross Encashment',
+        note: 'Gross request volume by day for the current filter scope.',
+        bars: dailyRows.slice(0, 10).map((row) => ({
+          label: row.date,
+          valueLabel: money(row.grossEncashment),
+          percent: Math.max(4, Math.round((Number(row.grossEncashment || 0) / dailyScale) * 100)),
+          color: '#d97706',
+        })),
+      },
+      {
+        title: 'Payout Option Mix',
+        note: 'Requested encashment amount grouped by payout option.',
+        bars: Object.entries(payoutMix).map(([label, value]) => ({
+          label,
+          valueLabel: money(value),
+          percent: Math.max(4, Math.round((Number(value || 0) / payoutScale) * 100)),
+          color: '#1d4ed8',
+        })),
+      },
+    ],
+    tables: [
+      {
+        title: 'Daily Totals',
+        columns: ['Date', 'Requests', 'Members', 'Gross', 'Net', 'Deductions', 'CD', 'Paid', 'Pending'],
+        rows: (summary.daily || []).map((row) => ([
+          row.date,
+          String(row.totalRecords || 0),
+          String(row.uniqueMembers || 0),
+          money(row.grossEncashment),
+          money(row.netReceivable),
+          money(row.totalDeductions),
+          money(row.totalCdDeduction),
+          String(row.paidCount || 0),
+          String(row.pendingCount || 0),
+        ])),
+      },
+      {
+        title: 'Encashment Records',
+        note: 'Payout option and payout details are flattened for finance audit use.',
+        columns: ['Name', 'Username', 'Date', 'Net', 'Tax', 'Fee', 'CD', 'Deductions', 'Payout', 'Status'],
+        rows: records.map((row) => ([
+          row.fullname,
+          row.username,
+          row.cashtransdate || '',
+          money(row.encashment),
+          money(row.tax),
+          money(row.fee),
+          money(row.cdDeduction),
+          money(row.deductions),
+          row.payoutDetails,
+          row.cashStatusLabel,
+        ])),
+      },
+    ],
+  };
+}
 
 /**
  * GET /api/admin/encashment?page=1&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&q=keyword
@@ -37,32 +310,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const startDate = (req.query.startDate || '').trim();
     const endDate = (req.query.endDate || '').trim();
     const q = (req.query.q || '').trim();
-    const searchLike = `%${q}%`;
-
-    let whereSql = `WHERE (p.transactiontype = 10 OR p.encashment1 > 0)`;
-    const whereParams = [];
-
-    if (startDate) {
-      whereSql += ` AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') >= ?`;
-      whereParams.push(startDate);
-    }
-
-    if (endDate) {
-      whereSql += ` AND DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') <= ?`;
-      whereParams.push(endDate);
-    }
-
-    if (q) {
-      whereSql += `
-        AND (
-          m.username LIKE ?
-          OR m.firstname LIKE ?
-          OR m.lastname LIKE ?
-          OR CONCAT(m.firstname, ' ', m.lastname) LIKE ?
-        )
-      `;
-      whereParams.push(searchLike, searchLike, searchLike, searchLike);
-    }
+    const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q });
 
     const [countRows] = await pool.query(
       `SELECT COUNT(*) as total FROM payouthistorytab p
@@ -71,53 +319,84 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
       whereParams
     );
     const total = Number(countRows[0].total);
+    const [records, summaryRecords] = await Promise.all([
+      fetchEncashmentRows({ whereSql, whereParams, offset, limit: perPage }),
+      fetchEncashmentRows({ whereSql, whereParams }),
+    ]);
 
-    const [rows] = await pool.query(
-      `SELECT p.pid, p.uid, DATE_FORMAT(p.cashtransdate, '%Y-%m-%d') as cashtransdate,
-              p.cashstatus, p.cddeduction, p.encashment1, p.tax_1, p.encashmentfee,
-              m.payoutid, m.payoutdetails, m.username, m.firstname, m.lastname
-       FROM payouthistorytab p
-       LEFT JOIN memberstab m ON m.uid = p.uid
-       ${whereSql}
-       ORDER BY p.cashtransdate DESC, p.pid DESC LIMIT ?, ?`,
-      [...whereParams, offset, perPage]
-    );
-
-    const records = rows.map(r => {
-      const tax = Number(r.tax_1 || 0);
-      const fee = Number(r.encashmentfee || 0);
-      const cdDeduction = Number(r.cddeduction || 0);
-      const fullName = `${r.firstname || ''} ${r.lastname || ''}`.trim() || `Unknown Account (UID: ${r.uid})`;
-      const payoutId = Number(r.payoutid || 0);
-      const payoutOption = PAYOUT_OPTION_LABELS[payoutId] || 'N/A';
-      const payoutDetails = r.payoutdetails
-        ? `${payoutOption} / ${r.payoutdetails}`
-        : payoutOption;
-
-      return {
-        pid: r.pid,
-        uid: r.uid,
-        username: r.username || 'N/A',
-        fullname: fullName,
-        encashment: Number(r.encashment1 || 0),
-        tax,
-        fee,
-        cdDeduction,
-        deductions: tax + fee + cdDeduction,
-        cashStatus: r.cashstatus,
-        cashStatusLabel: Number(r.cashstatus) === 1 ? 'Paid' : 'Pending',
-        payoutId: r.payoutid,
-        payoutOption,
-        payoutDetails,
-        cashtransdate: r.cashtransdate,
-        canViewCdDetails: cdDeduction > 0,
-      };
+    res.json({
+      records,
+      total,
+      page,
+      totalPages: Math.ceil(total / perPage),
+      summary: buildEncashmentSummary(summaryRecords),
     });
-
-    res.json({ records, total, page, totalPages: Math.ceil(total / perPage) });
   } catch (err) {
     console.error('[Admin Encashment] List error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const startDate = (req.query.startDate || '').trim();
+    const endDate = (req.query.endDate || '').trim();
+    const q = (req.query.q || '').trim();
+    const rawFormat = String(req.query.format || 'xlsx').toLowerCase();
+    const format = rawFormat === 'pdf' || rawFormat === 'crystal' ? rawFormat : 'xlsx';
+    const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q });
+    const records = await fetchEncashmentRows({ whereSql, whereParams });
+    const summary = buildEncashmentSummary(records);
+
+    if (format === 'pdf' || format === 'crystal') {
+      const report = await renderAdminPdfReport(buildEncashmentPdfDefinition(records, summary, { startDate, endDate, q }));
+      sendPdfReport(res, report);
+      return;
+    }
+
+    writeWorkbook(
+      res,
+      `encashment-report-${startDate || 'all'}-${endDate || 'latest'}`,
+      [
+        ['Summary', {
+          rows: [
+            { Metric: 'Search', Value: q || 'All records' },
+            { Metric: 'Start Date', Value: startDate || 'All dates' },
+            { Metric: 'End Date', Value: endDate || 'Latest' },
+            { Metric: 'Total Records', Value: summary.overview.totalRecords },
+            { Metric: 'Gross Encashment', Value: summary.overview.grossEncashment },
+            { Metric: 'Net Receivable', Value: summary.overview.netReceivable },
+            { Metric: 'Total Deductions', Value: summary.overview.totalDeductions },
+            { Metric: 'CD Deduction', Value: summary.overview.totalCdDeduction },
+          ],
+          widths: [24, 22],
+        }],
+        ['Encashments', {
+          rows: buildEncashmentExportRows(records),
+          widths: [12, 24, 16, 18, 16, 12, 12, 14, 16, 20, 28, 14],
+        }],
+        ['Daily Summary', {
+          rows: summary.daily.map((row) => ({
+            Date: row.date,
+            'Total Records': row.totalRecords,
+            'Unique Members': row.uniqueMembers,
+            'Gross Encashment': row.grossEncashment,
+            'Net Receivable': row.netReceivable,
+            Tax: row.totalTax,
+            Fee: row.totalFee,
+            'CD Deduction': row.totalCdDeduction,
+            'Total Deductions': row.totalDeductions,
+            Paid: row.paidCount,
+            Pending: row.pendingCount,
+          })),
+          widths: [12, 14, 14, 18, 16, 12, 12, 16, 18, 10, 10],
+        }],
+      ],
+      format
+    );
+  } catch (err) {
+    console.error('[Admin Encashment] Export error:', err);
+    res.status(500).json({ error: 'Failed to export encashment report' });
   }
 });
 
@@ -176,12 +455,13 @@ router.get('/:pid/details', adminAuth, adminRights([1, 3]), async (req, res) => 
       leadership: Number(row.income3 || 0),
       unilevel: Number(row.income4 || 0),
       hifive: Number(row.income5 || 0),
-      lpc: Number(row.income6 || 0),
+      rankingBonus: Number(row.income6 || 0),
+      legacyIncome6: Number(row.income6 || 0),
     };
 
-    const payoutId = Number(row.paymentoptions || row.payoutid || 0);
-    const paymentOption = PAYOUT_OPTION_LABELS[payoutId] || 'N/A';
-    const paymentDetails = row.paymentdetails || row.payoutdetails || null;
+    const payout = resolvePayoutOption(row.paymentoptions, row.payoutid);
+    const paymentOption = payout?.label || 'N/A';
+    const paymentDetails = String(row.paymentdetails || row.payoutdetails || '').trim() || null;
 
     res.json({
       pid: Number(row.pid),
@@ -212,7 +492,7 @@ router.get('/:pid/details', adminAuth, adminRights([1, 3]), async (req, res) => 
         total: deductions,
       },
       paymentOption,
-      paymentOptionId: payoutId || null,
+      paymentOptionId: payout?.id || null,
       paymentDetails,
       canViewCdDetails: cdDeduction > 0,
     });
@@ -252,3 +532,8 @@ router.put('/:pid/process', adminAuth, adminRights([1, 3]), async (req, res) => 
 });
 
 module.exports = router;
+module.exports.__private = {
+  normalizePayoutOption,
+  buildPayoutDisplay,
+  mapEncashmentRow,
+};

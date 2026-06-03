@@ -7,6 +7,9 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
+const { normalizeEmail, isValidEmail } = require('../utils/email');
+const { resolveTin, isValidTin } = require('../utils/tin');
+const { listPackagePolicies } = require('../services/packagePolicy');
 
 let memberTinColumnsReady = false;
 let memberHasTinNoColumn = false;
@@ -22,8 +25,26 @@ async function ensureMemberTinColumns() {
   const [tinNoColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'tinno'");
   memberHasTinNoColumn = tinNoColumns.length > 0;
 
+  const [emailColumns] = await pool.query("SHOW COLUMNS FROM memberstab LIKE 'email'");
+  if (emailColumns.length === 0) {
+    await pool.query('ALTER TABLE memberstab ADD COLUMN email VARCHAR(180) DEFAULT NULL');
+  } else if (!String(emailColumns[0].Type || '').toLowerCase().includes('180')) {
+    await pool.query('ALTER TABLE memberstab MODIFY COLUMN email VARCHAR(180) DEFAULT NULL');
+  }
+
   memberTinColumnsReady = true;
 }
+
+router.get('/package-policies', memberAuth, async (_req, res) => {
+  try {
+    res.json({
+      packages: listPackagePolicies(),
+    });
+  } catch (err) {
+    console.error('[Account] Package policies error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 /**
  * GET /api/account
@@ -64,6 +85,7 @@ router.get('/', memberAuth, async (req, res) => {
       address: user.address,
       contactnos: user.contactnos,
       email: user.email,
+      emailRequired: !normalizeEmail(user.email),
       tin: resolvedTin,
       tinno: resolvedTin,
       payoutid: user.payoutid,
@@ -88,16 +110,30 @@ router.put('/', memberAuth, async (req, res) => {
     await ensureMemberTinColumns();
 
     const uid = req.session.uid;
-    const { address, password, payoutdetails, payoutoptions, contactnos, tin, tinno } = req.body;
+    const { address, password, payoutdetails, payoutoptions, contactnos, tin, tinno, email } = req.body;
 
     const hasTinField = Object.prototype.hasOwnProperty.call(req.body, 'tin')
       || Object.prototype.hasOwnProperty.call(req.body, 'tinno');
 
     let normalizedTin = null;
+    const normalizedEmail = normalizeEmail(email);
+
+    if (!isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'A valid email address is required for password reset.' });
+    }
+
+    const [emailRows] = await pool.query(
+      'SELECT uid FROM memberstab WHERE email = ? AND uid <> ? LIMIT 1',
+      [normalizedEmail, uid]
+    );
+    if (emailRows.length > 0) {
+      return res.status(400).json({ error: 'That email address is already being used by another account.' });
+    }
+
     if (hasTinField) {
-      normalizedTin = String(tin || tinno || '').trim();
-      if (normalizedTin && (normalizedTin.length < 9 || normalizedTin.length > 30 || !/^[0-9-]+$/.test(normalizedTin))) {
-        return res.status(400).json({ error: 'TIN must be 9-30 characters using digits and dashes only' });
+      normalizedTin = resolveTin({ tin, tinno });
+      if (normalizedTin && !isValidTin(normalizedTin)) {
+        return res.status(400).json({ error: 'TIN must contain 9-15 digits and will be saved in grouped format.' });
       }
     }
 
@@ -106,8 +142,9 @@ router.put('/', memberAuth, async (req, res) => {
       'payoutdetails = ?',
       'payoutid = ?',
       'contactnos = ?',
+      'email = ?',
     ];
-    const values = [address, payoutdetails, payoutoptions, contactnos];
+    const values = [address, payoutdetails, payoutoptions, contactnos, normalizedEmail];
 
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);

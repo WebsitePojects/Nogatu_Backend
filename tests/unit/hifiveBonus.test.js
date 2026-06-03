@@ -2,14 +2,67 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  summarizeProductReferralRows,
   buildProductSummary,
   buildPackageSummary,
   formatPackageClaimRow,
 } = require('../../services/income/hifiveBonus');
 
+test('product Hi-Five counts five distinct direct referrals as one qualified set', () => {
+  const { qualifyingReferralsByKey, rawPurchasesByKey, contributorsByKey } = summarizeProductReferralRows([
+    { producttype: 100, referralUid: 11, cnt: 1, username: 'dr1', firstname: 'Direct', lastname: 'One', lastTransdate: '2026-05-01 10:00:00' },
+    { producttype: 100, referralUid: 12, cnt: 1, username: 'dr2', firstname: 'Direct', lastname: 'Two', lastTransdate: '2026-05-01 11:00:00' },
+    { producttype: 100, referralUid: 13, cnt: 1, username: 'dr3', firstname: 'Direct', lastname: 'Three', lastTransdate: '2026-05-01 12:00:00' },
+    { producttype: 100, referralUid: 14, cnt: 1, username: 'dr4', firstname: 'Direct', lastname: 'Four', lastTransdate: '2026-05-01 13:00:00' },
+    { producttype: 100, referralUid: 15, cnt: 1, username: 'dr5', firstname: 'Direct', lastname: 'Five', lastTransdate: '2026-05-01 14:00:00' },
+  ]);
+
+  assert.equal(qualifyingReferralsByKey.bl, 5);
+  assert.equal(rawPurchasesByKey.bl, 5);
+  assert.equal(contributorsByKey.bl.length, 5);
+
+  const result = buildProductSummary({
+    qualifyingReferralsByKey,
+    rawPurchasesByKey,
+    claimedByKey: { bl: 0 },
+    maintenancePoints: 220,
+    contributorsByKey,
+  });
+
+  const barley = result.products.find((item) => item.key === 'bl');
+  assert.equal(barley.qualifyingDirectReferrals, 5);
+  assert.equal(barley.directReferralPurchases, 5);
+  assert.equal(barley.qualifiedSets, 1);
+  assert.equal(barley.availableClaims, 1);
+});
+
+test('product Hi-Five does not let one direct referral qualify multiple same-product slots alone', () => {
+  const { qualifyingReferralsByKey, rawPurchasesByKey, contributorsByKey } = summarizeProductReferralRows([
+    { producttype: 100, referralUid: 11, cnt: 5, username: 'dr1', firstname: 'Direct', lastname: 'One', lastTransdate: '2026-05-01 10:00:00' },
+  ]);
+
+  assert.equal(qualifyingReferralsByKey.bl, 1);
+  assert.equal(rawPurchasesByKey.bl, 5);
+
+  const result = buildProductSummary({
+    qualifyingReferralsByKey,
+    rawPurchasesByKey,
+    claimedByKey: { bl: 0 },
+    maintenancePoints: 220,
+    contributorsByKey,
+  });
+
+  const barley = result.products.find((item) => item.key === 'bl');
+  assert.equal(barley.qualifyingDirectReferrals, 1);
+  assert.equal(barley.directReferralPurchases, 5);
+  assert.equal(barley.qualifiedSets, 0);
+  assert.equal(barley.remainingToNextSet, 4);
+});
+
 test('product Hi-Five summary blocks claims until 200 maintenance points are met', () => {
   const result = buildProductSummary({
-    purchasesByKey: { bl: 10, gl: 4 },
+    qualifyingReferralsByKey: { bl: 10, gl: 4 },
+    rawPurchasesByKey: { bl: 10, gl: 4 },
     claimedByKey: { bl: 1, gl: 0 },
     maintenancePoints: 150,
   });
@@ -28,7 +81,8 @@ test('product Hi-Five summary blocks claims until 200 maintenance points are met
 
 test('product Hi-Five summary exposes available claims when maintenance is satisfied', () => {
   const result = buildProductSummary({
-    purchasesByKey: { bl: 11, cmm: 5 },
+    qualifyingReferralsByKey: { bl: 11, cmm: 5 },
+    rawPurchasesByKey: { bl: 11, cmm: 5 },
     claimedByKey: { bl: 1, cmm: 0 },
     maintenancePoints: 220,
   });

@@ -3,11 +3,26 @@
  * 1:1 port of PHP income-dref-fnc.php :: get_DREF($id)
  *
  * Income Type 1 (income1)
- * - Sums directreferral values from all paid direct referrals
+ * - Sums directreferral values from all package-entry direct referrals
  * - Adds Hi-Five bonus per 5 referrals of same account type
  * - Adds upgrade incentive points from direct referrals
  */
 const { pool } = require('../../config/database');
+const { getEffectiveAccountState } = require('../accountState');
+
+function toNumber(value) {
+  return Number(value || 0);
+}
+
+function countsForDirectReferralSource(row) {
+  if (!row) return false;
+
+  if ([1, 2, 3].includes(toNumber(row.codeid))) {
+    return true;
+  }
+
+  return false;
+}
 
 /**
  * Calculate Direct Referral income for a user
@@ -26,9 +41,12 @@ async function getDREF(uid) {
     hifive: 0,
   };
 
-  // Query all paid direct referrals (codeid = 1)
+  // Query all direct referrals, then apply latest production effective-state rules.
   const [rows] = await pool.query(
-    'SELECT uid, accttype, currentaccttype, directreferral FROM usertab WHERE drefid = ? AND codeid = 1',
+    `SELECT uid, accttype, currentaccttype, directreferral,
+            codeid, cdamount, cdtotal, cdstatus
+       FROM usertab
+      WHERE drefid = ?`,
     [uid]
   );
 
@@ -36,9 +54,14 @@ async function getDREF(uid) {
   let countByType = { 10: 0, 20: 0, 30: 0, 40: 0, 50: 0, 60: 0 };
 
   for (const row of rows) {
-    totalDref += Number(row.directreferral || 0);
-    const acctType = Number(row.currentaccttype || row.accttype || 0);
-    if (countByType.hasOwnProperty(acctType)) {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    if (!countsForDirectReferralSource(effectiveRow)) {
+      continue;
+    }
+
+    totalDref += Number(effectiveRow.directreferral || 0);
+    const acctType = Number(effectiveRow.currentaccttype || effectiveRow.accttype || 0);
+    if (Object.prototype.hasOwnProperty.call(countByType, acctType)) {
       countByType[acctType]++;
     }
   }
@@ -69,4 +92,4 @@ async function getDREF(uid) {
   return result;
 }
 
-module.exports = { getDREF };
+module.exports = { getDREF, countsForDirectReferralSource };

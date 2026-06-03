@@ -27,7 +27,8 @@ router.get('/', memberAuth, async (req, res) => {
       leadership:     Number(updated.ttlincome3 || 0),
       unilevel:       Number(updated.ttlincome4 || 0),
       hifive:         Number(updated.ttlincome5 || 0),
-      lpc:            Number(updated.ttlincome6 || 0),
+      rankingBonus:   Number(updated.ttlincome6 || 0),
+      legacyIncome6:  Number(updated.ttlincome6 || 0),
       cashBalance:    Number(updated.ttlcashbalance || 0),
       totalIncome:    Number(updated.ttlincome1 || 0) + Number(updated.ttlincome2 || 0) +
                       Number(updated.ttlincome3 || 0) + Number(updated.ttlincome4 || 0) +

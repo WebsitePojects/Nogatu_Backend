@@ -9,20 +9,22 @@
  *   - dref / pairing / leadership / hifive: Math.max(0, calc - stored)
  *     → returns 0 if already up-to-date, never double-credits
  *   - unilevel: monthly guard via incometransdatetab incometype=4
- *   - LPC:      monthly guard via incometransdatetab incometype=6
+ *   - ranking:  income6 is reserved for Ranking Bonus fulfillment
  */
 const { pool } = require('../../config/database');
 const { getDREF } = require('./directReferral');
 const { getPairing, savePairingReport } = require('./pairing');
 const { getLeadershipBonus } = require('./leadership');
 const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('./unilevel');
-const { getLPC, checkLpcTransDate } = require('./lpc');
 const { insertIncome } = require('./insertIncome');
-const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
+const { getEffectiveAccountState } = require('../accountState');
+const { getPackagePolicy } = require('../packagePolicy');
+const { applyLifetimeIncomeCeiling } = require('./incomeCapPolicy');
 
-// Match current production behavior: Unilevel and LPC are feature-flagged off.
-const ENABLE_UNILEVEL_PAYOUT = false;
-const ENABLE_LPC_PAYOUT = false;
+const INCOME_PAYOUT_FLAGS = {
+  unilevel: true,
+  lpc: false,
+};
 
 /**
  * Run income calculation for a member and persist any new income.
@@ -49,9 +51,10 @@ async function calculateAndStoreIncome(uid, accttype) {
     const stored = totals[0] || {};
     const beginningBalance = Number(stored.ttlcashbalance || 0);
 
-    // Pairing income eligibility mirrors production ewallet.php rules.
-    const member = await getEffectiveAccountState(uid);
-    const canEarnPairing = countsForPairingSource(member);
+    // Production ewallet.php allows all accounts to receive pairing income
+    // when eligible source nodes exist on both legs; only source-node
+    // contribution is restricted by effective account state.
+    await getEffectiveAccountState(uid);
 
     // ── Continuous income (deduplication via Math.max) ───────────────
     const drefResult = await getDREF(uid);
@@ -59,15 +62,16 @@ async function calculateAndStoreIncome(uid, accttype) {
     const leadershipAmount = await getLeadershipBonus(uid);
 
     const newDref = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
-    const newPairing = canEarnPairing
-      ? Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0))
-      : 0;
+    const newPairing = Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0));
     const newLeadership = Math.max(0, leadershipAmount - Number(stored.ttlincome3 || 0));
-    const newHifive = Math.max(0, drefResult.hifive - Number(stored.ttlincome5 || 0));
+    // Package Hi-Five cash is release-controlled through the claim-review flow.
+    // Keep wallet/dashboard calculation from auto-crediting income5, or the same
+    // entitlement can be credited again when admin approves the claim.
+    const newHifive = 0;
 
     // ── Monthly income — unilevel (incometype=4) ─────────────────────
     let activeUnilevel = 0;
-    if (ENABLE_UNILEVEL_PAYOUT) {
+    if (INCOME_PAYOUT_FLAGS.unilevel) {
       const hasMaintenance = await checkLastMaintenance(uid);
       const alreadyCalcUnilevel = await checkUnilevelTransDate(uid);
       if (hasMaintenance && !alreadyCalcUnilevel) {
@@ -75,29 +79,39 @@ async function calculateAndStoreIncome(uid, accttype) {
       }
     }
 
-    // ── Monthly income — LPC (incometype=6) ──────────────────────────
+    // income6 is reserved for Ranking Bonus; LPC remains disabled until it has a separate mapping.
     let activeLpc = 0;
-    if (ENABLE_LPC_PAYOUT) {
-      const alreadyCalcLpc = await checkLpcTransDate(uid);
-      if (!alreadyCalcLpc) {
-        activeLpc = await getLPC(uid);
-      }
+    if (INCOME_PAYOUT_FLAGS.lpc) {
+      activeLpc = 0;
     }
 
     // ── Persist if there is new income ───────────────────────────────
-    const totalNewIncome = newDref + newPairing + newLeadership +
-      activeUnilevel + newHifive + activeLpc;
-    const endingBalance = beginningBalance + totalNewIncome;
-
-    if (totalNewIncome >= 1) {
-      await insertIncome(uid, {
+    const capResult = applyLifetimeIncomeCeiling({
+      packagePolicy: getPackagePolicy(accttype),
+      storedTotals: stored,
+      proposedIncome: {
         dref: newDref,
         paircash: newPairing,
         leadership: newLeadership,
         unilevel: activeUnilevel,
         hifive: newHifive,
-        ppctemp: 0,
         lpc: activeLpc,
+      },
+    });
+
+    const allowedIncome = capResult.allowedIncome;
+    const totalNewIncome = capResult.allowedTotal;
+    const endingBalance = beginningBalance + totalNewIncome;
+
+    if (totalNewIncome >= 1) {
+      await insertIncome(uid, {
+        dref: allowedIncome.dref,
+        paircash: allowedIncome.paircash,
+        leadership: allowedIncome.leadership,
+        unilevel: allowedIncome.unilevel,
+        hifive: allowedIncome.hifive,
+        ppctemp: 0,
+        lpc: allowedIncome.lpc,
         pairproduct: 0,
         beginningbalance: beginningBalance,
         endingbalance: endingBalance,
@@ -125,4 +139,4 @@ async function calculateAndStoreIncome(uid, accttype) {
   }
 }
 
-module.exports = { calculateAndStoreIncome };
+module.exports = { calculateAndStoreIncome, INCOME_PAYOUT_FLAGS };

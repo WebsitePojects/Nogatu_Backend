@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
 const { writeAuditLog } = require('../services/audit');
+const { normalizeEmail, isValidEmail } = require('../utils/email');
 
 function normalizeLegacyUsername(value) {
   return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
@@ -34,6 +35,7 @@ router.post('/login', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT u.uid, u.public_uid, u.mainid, u.accttype, u.currentaccttype, u.cdstatus,
               u.codeid, DATE_FORMAT(u.datereg, '%Y-%m-%d') as datereg, u.position,
+              u.account_status, u.account_status_reason,
               m.uid as mUid, m.username, m.password, m.firstname, m.lastname
        FROM memberstab m, usertab u
        WHERE m.uid = u.uid AND m.username = ?`,
@@ -87,6 +89,24 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    const accountStatus = String(user.account_status || 'active').trim().toLowerCase();
+    if (accountStatus && accountStatus !== 'active') {
+      return res.status(423).json({
+        error: accountStatus === 'frozen'
+          ? 'This account is frozen. Please contact support or your administrator.'
+          : 'This account is suspended. Please contact support or your administrator.',
+        accountStatus,
+        reason: user.account_status_reason || null,
+      });
+    }
+
+    await new Promise((resolve, reject) => {
+      req.session.regenerate((sessionErr) => {
+        if (sessionErr) reject(sessionErr);
+        else resolve();
+      });
+    });
+
     // Set session variables (mirrors PHP session exactly)
     req.session.uid = user.uid;
     req.session.publicUid = user.public_uid || null;
@@ -99,6 +119,11 @@ router.post('/login', async (req, res) => {
     req.session.codeid = user.codeid;
     req.session.cdstatus = user.cdstatus;
     req.session.position = user.position;
+    req.session.accountStatus = accountStatus || 'active';
+    req.session.accountStatusReason = user.account_status_reason || null;
+    delete req.session.adminid;
+    delete req.session.adminname;
+    delete req.session.adminrights;
 
     await new Promise((resolve, reject) => {
       req.session.save((saveErr) => {
@@ -121,6 +146,8 @@ router.post('/login', async (req, res) => {
         codeid: user.codeid,
         cdstatus: user.cdstatus,
         position: user.position,
+        accountStatus: accountStatus || 'active',
+        accountStatusReason: user.account_status_reason || null,
         datereg: user.datereg,
       },
     });
@@ -146,17 +173,17 @@ router.post('/logout', (req, res) => {
  */
 router.post('/forgot-password', async (req, res) => {
   try {
-    const identifier = String(req.body.email || req.body.username || '').trim();
-    if (!identifier) {
-      return res.json({ success: true, message: 'If the account exists, reset instructions will be sent.' });
+    const email = normalizeEmail(req.body.email);
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: 'Enter the email address saved on your account.' });
     }
 
     const [rows] = await pool.query(
       `SELECT uid, username, email, firstname, lastname
        FROM memberstab
-       WHERE email = ? OR username = ?
+       WHERE email = ?
        LIMIT 1`,
-      [identifier, normalizeLegacyUsername(identifier)]
+      [email]
     );
 
     if (rows.length > 0) {
@@ -284,6 +311,8 @@ router.get('/session', (req, res) => {
         codeid: req.session.codeid,
         cdstatus: req.session.cdstatus,
         position: req.session.position,
+        accountStatus: req.session.accountStatus || 'active',
+        accountStatusReason: req.session.accountStatusReason || null,
       },
     });
   } else {

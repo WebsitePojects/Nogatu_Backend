@@ -4,10 +4,53 @@
  */
 const express = require('express');
 const router = express.Router();
+const XLSX = require('xlsx');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
+const { getProjectedCurrentMonthUnilevel } = require('../services/income/unilevel');
+const { getLeadershipTraceability } = require('../services/income/leadership');
+const { getEffectiveAccountState, getAccountEntryAuditInfo } = require('../services/accountState');
+
+async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
+  const safePage = Math.max(1, Number(page) || 1);
+  const safePerPage = Math.min(200, Math.max(1, Number(perPage) || 50));
+  const trace = await getLeadershipTraceability(uid);
+  const [directCountRows] = await pool.query(
+    'SELECT COUNT(*) AS total FROM usertab WHERE drefid = ?',
+    [uid]
+  );
+
+  const allRows = trace.rows.map((row) => ({
+    uid: row.uid,
+    username: row.username,
+    fullname: row.fullName,
+    level: row.level,
+    ratePercent: row.ratePercent,
+    pairingIncome: row.pairingIncome,
+    amount: row.leadershipBonus,
+    directReferralCount: row.directReferralCount,
+  }));
+  const total = allRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const totalPages = Math.max(1, Math.ceil(allRows.length / safePerPage));
+  const offset = (safePage - 1) * safePerPage;
+  const rows = allRows.slice(offset, offset + safePerPage);
+
+  return {
+    formula: 'Leadership bonus is 5% of level 1 pairing income, 2% of level 2, and 1% of levels 3 to 5.',
+    rows,
+    total,
+    page: safePage,
+    perPage: safePerPage,
+    totalRows: allRows.length,
+    totalPages,
+    summary: {
+      totalSources: trace.totalSources,
+      directReferralCount: Number(directCountRows[0]?.total || 0),
+    },
+  };
+}
 
 /**
  * GET /api/dashboard
@@ -45,6 +88,7 @@ router.get('/', memberAuth, async (req, res) => {
       [uid, start, end]
     );
     const maintenancePoints = Number(maintRows[0]?.ttlpoints || 0);
+    const projectedUnilevelReceivable = await getProjectedCurrentMonthUnilevel(uid);
     let maintenanceStatus;
     if (maintenancePoints >= 200) maintenanceStatus = 'Active';
     else if (maintenancePoints === 0) maintenanceStatus = 'Not Active';
@@ -123,8 +167,8 @@ router.get('/', memberAuth, async (req, res) => {
         currentPoints: maintenancePoints,
         neededPoints: Math.max(0, 200 - maintenancePoints),
         eligible: maintenancePoints >= 200,
-        receivableAmount: maintenancePoints >= 200 ? ttlincome4 : 0,
-        blockedAmount: maintenancePoints >= 200 ? 0 : ttlincome4,
+        receivableAmount: maintenancePoints >= 200 ? Number(projectedUnilevelReceivable || 0) : 0,
+        blockedAmount: maintenancePoints >= 200 ? 0 : Number(projectedUnilevelReceivable || 0),
       },
       directReferrals: drefByType,
       leftAccounts,
@@ -145,6 +189,8 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
     const uid = req.session.uid;
     const metric = String(req.params.metric || '').trim().toLowerCase();
     const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 50));
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = Math.min(200, Math.max(1, Number(req.query.perPage) || 50));
 
     const response = {
       metric,
@@ -188,20 +234,73 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
       response.total = Number(row.ttlcashbalance || 0);
       response.rows = [row];
     } else if (['direct-referral', 'directreferral'].includes(metric)) {
-      const [rows] = await pool.query(
-        `SELECT ph.pid, ph.income1 AS amount, ph.transdate, u.uid AS referred_uid,
-                m.username, m.firstname, m.lastname
-         FROM payouthistorytab ph
-         LEFT JOIN usertab u ON u.drefid = ph.uid
-         LEFT JOIN memberstab m ON m.uid = u.uid
-         WHERE ph.uid = ? AND ph.income1 > 0
-         ORDER BY ph.transdate DESC, ph.pid DESC
-         LIMIT ?`,
-        [uid, limit]
-      );
-      response.formula = 'Direct referral income rows from payouthistorytab where income1 > 0.';
-      response.rows = rows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
-      response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
+      const [rows, upgradeRows] = await Promise.all([
+        pool.query(
+          `SELECT u.uid AS referred_uid, u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+                  u.directreferral, u.datereg, m.username, m.firstname, m.lastname
+           FROM usertab u
+           LEFT JOIN memberstab m ON m.uid = u.uid
+           WHERE u.drefid = ?
+           ORDER BY u.datereg DESC, u.uid DESC
+           LIMIT ?`,
+          [uid, limit]
+        ).then(([result]) => result),
+        pool.query(
+          `SELECT u.uid AS referred_uid, u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+                  m.username, m.firstname, m.lastname,
+                  COALESCE(SUM(up.incentivepoints), 0) AS upgradeReferral,
+                  MAX(up.transdate) AS transdate
+           FROM upgradetab up
+           INNER JOIN usertab u ON u.uid = up.uid
+           LEFT JOIN memberstab m ON m.uid = u.uid
+           WHERE u.drefid = ? AND up.transtype = 1
+           GROUP BY u.uid, u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+                    m.username, m.firstname, m.lastname
+           ORDER BY MAX(up.transdate) DESC, u.uid DESC
+           LIMIT ?`,
+          [uid, limit]
+        ).then(([result]) => result),
+      ]);
+      response.formula = 'Direct referral contributor rows based on the referred account entry type plus any credited upgrade incentive from the sponsor tree.';
+      const contributorRows = await Promise.all(rows.map(async (row) => {
+        const effectiveRow = await getEffectiveAccountState(row.referred_uid, row);
+        const auditInfo = getAccountEntryAuditInfo(effectiveRow || row);
+        return {
+          referred_uid: Number(row.referred_uid || 0),
+          username: row.username || null,
+          fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || 'Not available',
+          accountType: getAccountTypeName(effectiveRow?.currentaccttype || row.currentaccttype),
+          entryType: auditInfo.entryLabel,
+          entryCode: auditInfo.entryCode,
+          sponsorCreditEligible: Boolean(auditInfo.sponsorCreditEligible),
+          sourceBinaryEligible: Boolean(auditInfo.sourceBinaryEligible),
+          amount: Number(effectiveRow?.directreferral || row.directreferral || 0),
+          transdate: row.datereg,
+          rowType: 'referral_signup',
+        };
+      }));
+      const upgradeContributorRows = await Promise.all(upgradeRows.map(async (row) => {
+        const effectiveRow = await getEffectiveAccountState(row.referred_uid, row);
+        const auditInfo = getAccountEntryAuditInfo(effectiveRow || row);
+        return {
+          referred_uid: Number(row.referred_uid || 0),
+          username: row.username || null,
+          fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || 'Not available',
+          accountType: getAccountTypeName(effectiveRow?.currentaccttype || row.currentaccttype),
+          entryType: auditInfo.entryLabel,
+          entryCode: auditInfo.entryCode,
+          sponsorCreditEligible: Boolean(auditInfo.sponsorCreditEligible),
+          sourceBinaryEligible: Boolean(auditInfo.sourceBinaryEligible),
+          amount: Number(row.upgradeReferral || 0),
+          transdate: row.transdate,
+          rowType: 'upgrade_incentive',
+        };
+      }));
+      response.rows = [...contributorRows, ...upgradeContributorRows]
+        .filter((row) => Number(row.amount || 0) > 0)
+        .sort((left, right) => new Date(right.transdate || 0) - new Date(left.transdate || 0))
+        .slice(0, limit);
+      response.total = response.rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
     } else if (['sales-volume', 'pairing', 'pairing-balance', 'salesvolume'].includes(metric)) {
       const [rows] = await pool.query(
         `SELECT id, totalleft, totalright, totalpointsleft, totalpointsright,
@@ -253,10 +352,24 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
       };
       response.rows = incomeRows.map((row) => ({ ...row, amount: Number(row.amount || 0) }));
       response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
-    } else if (['leadership-bonus', 'hifive-bonus', 'hi-five-bonus', 'ranking-bonus', 'lpc'].includes(metric)) {
-      const incomeColumn = metric.includes('leadership') ? 'income3'
-        : metric.includes('ranking') || metric.includes('lpc') ? 'income6'
-          : 'income5';
+    } else if (metric === 'lpc') {
+      response.formula = 'LPC is disabled for launch; legacy income6 is reserved for Ranking Bonus.';
+      response.rows = [];
+      response.total = 0;
+    } else if (metric === 'leadership-bonus') {
+      const leadership = await buildLeadershipBreakdown(uid, page, perPage);
+      response.formula = leadership.formula;
+      response.rows = leadership.rows;
+      response.total = leadership.total;
+      response.summary = leadership.summary;
+      response.pagination = {
+        page: leadership.page,
+        perPage: leadership.perPage,
+        totalRows: leadership.totalRows,
+        totalPages: leadership.totalPages,
+      };
+    } else if (['hifive-bonus', 'hi-five-bonus', 'ranking-bonus'].includes(metric)) {
+      const incomeColumn = metric.includes('ranking') ? 'income6' : 'income5';
       const [rows] = await pool.query(
         `SELECT pid, ${incomeColumn} AS amount, transdate, processid
          FROM payouthistorytab
@@ -292,6 +405,55 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
   } catch (err) {
     console.error('[Dashboard] Breakdown error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/breakdown/:metric/export', memberAuth, async (req, res) => {
+  try {
+    const uid = req.session.uid;
+    const metric = String(req.params.metric || '').trim().toLowerCase();
+    const format = String(req.query.format || 'xlsx').toLowerCase();
+
+    if (metric !== 'leadership-bonus') {
+      return res.status(400).json({ error: 'Export is only available for leadership bonus right now.' });
+    }
+
+    const leadership = await buildLeadershipBreakdown(uid, 1, 5000);
+    const exportRows = leadership.rows.map((row, index) => ({
+      '#': index + 1,
+      Username: row.username || '',
+      Fullname: row.fullname || '',
+      Level: Number(row.level || 0),
+      RatePercent: Number(row.ratePercent || 0),
+      PairingIncome: Number(row.pairingIncome || 0),
+      LeadershipBonus: Number(row.amount || 0),
+      DirectReferrals: Number(row.directReferralCount || 0),
+    }));
+    exportRows.push({
+      '#': '',
+      Username: '',
+      Fullname: 'OVERALL TOTAL',
+      Level: '',
+      RatePercent: '',
+      PairingIncome: '',
+      LeadershipBonus: Number(leadership.total || 0),
+      DirectReferrals: '',
+    });
+
+    if (format !== 'xlsx') {
+      return res.status(400).json({ error: 'Only xlsx export is supported by this endpoint.' });
+    }
+
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(exportRows);
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Leadership Bonus');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="leadership-bonus-breakdown.xlsx"');
+    res.send(buffer);
+  } catch (err) {
+    console.error('[Dashboard] Breakdown export error:', err);
+    res.status(500).json({ error: 'Unable to export the breakdown right now.' });
   }
 });
 

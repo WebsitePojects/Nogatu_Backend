@@ -6,7 +6,10 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
-const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES } = require('../utils/helpers');
+const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES, CODE_PREFIXES } = require('../utils/helpers');
+const { createProcessKey, createPublicId } = require('../utils/security');
+const { appendActivationCodeUsage } = require('../services/registrationAudit');
+const { listMemberActivationHistory } = require('../services/codeHistory');
 
 /**
  * GET /api/codes?page=1
@@ -26,7 +29,7 @@ router.get('/', memberAuth, async (req, res) => {
     const total = Number(countRows[0].total);
 
     const [codes] = await pool.query(
-      `SELECT id, code, producttype, uid, codestatus, releasedate, dategen
+      `SELECT id, code, producttype, codetype, productamount, uid, codestatus, releasedate, dategen
        FROM codestab WHERE codestatus <= 2 AND uid = ?
        ORDER BY id DESC LIMIT ?, ?`,
       [uid, offset, perPage]
@@ -36,7 +39,11 @@ router.get('/', memberAuth, async (req, res) => {
       id: c.id,
       code: c.code,
       producttype: c.producttype,
+      codetype: Number(c.codetype || 0),
+      codeTypeLabel: CODE_PREFIXES[Number(c.codetype || 0)] || 'Unknown',
       producttypeName: PRODUCT_TYPES[c.producttype] || `Type ${c.producttype}`,
+      accountLabel: `${ACCOUNT_TYPES[c.producttype] || PRODUCT_TYPES[c.producttype] || `Type ${c.producttype}`} - ${CODE_PREFIXES[Number(c.codetype || 0)] || 'Unknown'}`,
+      productamount: Number(c.productamount || 0),
       codestatus: c.codestatus,
       statusLabel: c.codestatus === 0 ? 'For Release' : c.codestatus === 1 ? 'Available' : 'Used',
       dategen: c.dategen,
@@ -50,6 +57,17 @@ router.get('/', memberAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('[Codes] List error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/history', memberAuth, async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const result = await listMemberActivationHistory(req.session.uid, page, 20);
+    res.json(result);
+  } catch (err) {
+    console.error('[Codes] History error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -103,6 +121,19 @@ router.post('/transfer', memberAuth, async (req, res) => {
          ON DUPLICATE KEY UPDATE history = CONCAT(history, ' -> ', ?), datetransfer = NOW()`,
         [codeRows[0].id, code, codeRows[0].dategen, history, history]
       );
+
+      await appendActivationCodeUsage(pool, {
+        code,
+        codeRowId: codeRows[0].id,
+        eventType: 'transfer',
+        fromUid: uid,
+        toUid: targetUid,
+        actorUid: uid,
+        notes: {
+          targetUsername: targetSanitized,
+        },
+        processKey: createProcessKey(['member-code-transfer', code, uid, targetUid, Date.now()]),
+      });
 
       transferred++;
     }
@@ -228,6 +259,45 @@ router.post('/upgrade', memberAuth, async (req, res) => {
        codeData.directreferral, String(uid), now]
     );
 
+    await conn.query(
+      `INSERT INTO binary_point_eventstab
+       (event_uid, source_member_uid, owner_uid, parent_uid, leg, event_type,
+        package_type, point_value, reference_key, event_ts)
+       SELECT ?, u.uid, u.drefid, u.refid,
+              CASE WHEN u.position = 1 THEN 'left' ELSE 'right' END,
+              'package_upgrade', ?, ?, ?, ?
+         FROM usertab u
+        WHERE u.uid = ?
+        LIMIT 1
+       ON DUPLICATE KEY UPDATE event_uid = event_uid`,
+      [
+        createPublicId(),
+        String(codeData.producttype || ''),
+        Number(codeData.binarypoints || 0),
+        createProcessKey(['binary-point-event', 'upgrade-code', code, uid, now]),
+        now,
+        uid,
+      ]
+    ).catch((error) => {
+      if (error.code === 'ER_NO_SUCH_TABLE') return;
+      throw error;
+    });
+
+    await appendActivationCodeUsage(conn, {
+      code,
+      codeRowId: codeData.id,
+      eventType: 'upgrade_use',
+      fromUid: uid,
+      toUid: uid,
+      actorUid: uid,
+      upgradeUid: uid,
+      notes: {
+        newProductType: Number(codeData.producttype),
+        codeType: Number(codeData.codetype),
+      },
+      processKey: createProcessKey(['code-upgrade-use', code, uid, codeData.producttype, now]),
+    });
+
     await conn.commit();
 
     // Update session
@@ -307,6 +377,20 @@ router.post('/maintenance', memberAuth, async (req, res) => {
        VALUES (NULL, ?, ?, ?, ?, ?, ?, NOW())`,
       [uid, codeData.producttype, code, transType, codeData.codetype, codeData.unilevelpoints]
     );
+
+    await appendActivationCodeUsage(conn, {
+      code,
+      codeRowId: codeData.id,
+      eventType: 'maintenance_use',
+      fromUid: uid,
+      toUid: uid,
+      actorUid: uid,
+      notes: {
+        transType,
+        productType: Number(codeData.producttype),
+      },
+      processKey: createProcessKey(['code-maintenance-use', code, uid, transType, nowMySQL()]),
+    });
 
     await conn.commit();
 

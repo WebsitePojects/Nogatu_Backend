@@ -1,3 +1,5 @@
+const { MAINTENANCE_PRODUCT_TYPES } = require('../constants/maintenanceProductCatalog');
+
 /**
  * Shared helper functions used across the application
  */
@@ -12,6 +14,24 @@ const ACCOUNT_TYPES = {
   60: 'Diamond',
 };
 
+const PACKAGE_BINARY_POINTS = {
+  10: 1,
+  20: 2,
+  30: 4,
+  40: 10,
+  50: 20,
+  60: 60,
+};
+
+const PACKAGE_BINARY_VALUES = {
+  10: 250,
+  20: 500,
+  30: 1000,
+  40: 2500,
+  50: 5000,
+  60: 15000,
+};
+
 // Product type to name mapping
 const PRODUCT_TYPES = {
   10: 'Bronze Entry Package',
@@ -20,15 +40,7 @@ const PRODUCT_TYPES = {
   40: 'Platinum Entry Package',
   50: 'Garnet Entry Package',
   60: 'Diamond Entry Package',
-  100: 'Barley',
-  101: 'Glutathione',
-  102: 'Gluta w/ Collagen',
-  103: 'Coffee Mix',
-  104: 'Chocolate Drink',
-  105: 'Mangosteen',
-  106: 'Vitamin Zinc',
-  107: 'Max Coffee',
-  108: 'Black Coffee',
+  ...MAINTENANCE_PRODUCT_TYPES,
 };
 
 // Code type prefix mapping
@@ -120,6 +132,8 @@ function getISOWeek(dateStr) {
 
 module.exports = {
   ACCOUNT_TYPES,
+  PACKAGE_BINARY_POINTS,
+  PACKAGE_BINARY_VALUES,
   PRODUCT_TYPES,
   CODE_PREFIXES,
   PAYOUT_OPTIONS,

@@ -171,7 +171,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
  * POST /api/admin/voucher-management/grant-existing
  * Grant one-time vouchers to existing members that have no voucher yet.
  */
-router.post('/grant-existing', adminAuth, adminRights([1, 3]), async (req, res) => {
+router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
     const inserted = await grantVouchersToExistingMembers();
     res.json({
@@ -238,7 +238,7 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
  * Suspend an active voucher
  * Body: { reason }
  */
-router.put('/:id/suspend', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.put('/:id/suspend', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     await ensureVoucherTable();
 
@@ -285,7 +285,7 @@ router.put('/:id/suspend', adminAuth, adminRights([1, 2, 3]), async (req, res) =
  * PUT /api/admin/voucher-management/:id/unsuspend
  * Reactivate a suspended voucher (only if not expired)
  */
-router.put('/:id/unsuspend', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.put('/:id/unsuspend', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     await ensureVoucherTable();
 

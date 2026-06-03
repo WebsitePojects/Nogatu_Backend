@@ -6,6 +6,14 @@
  */
 const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
+const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo } = require('./accountState');
+const { getPackageBinaryValue } = require('./packagePolicy');
+
+function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
+  const numericStored = Number(storedBinaryPoints || 0);
+  if (numericStored > 0) return numericStored;
+  return getPackageBinaryValue(currentaccttype);
+}
 
 /**
  * Get all downline UIDs recursively via refid (binary tree)
@@ -31,18 +39,22 @@ async function getNetworkMembersDetailed(rootUid, maxDepth = 10) {
       [rootUid, maxDepth]
     );
 
-    return rows.map((row) => ({
-      uid: Number(row.uid),
-      publicUid: row.public_uid || null,
-      username: row.username,
-      fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
-      accttype: Number(row.currentaccttype || 0),
-      accttypeName: getAccountTypeName(row.currentaccttype),
-      depth: Number(row.depth || 0),
-      leg: row.leg || null,
-      position: Number(row.position || 0),
-      binaryPoints: Number(row.binarypoints || 0),
-      datereg: row.datereg,
+    return Promise.all(rows.map(async (row) => {
+      const effectiveRow = await getEffectiveAccountState(row.uid, row);
+      return {
+        uid: Number(row.uid),
+        publicUid: row.public_uid || null,
+        username: row.username,
+        fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+        accttype: Number(row.currentaccttype || 0),
+        accttypeName: getAccountTypeName(row.currentaccttype),
+        depth: Number(row.depth || 0),
+        leg: row.leg || null,
+        position: Number(row.position || 0),
+        binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+        datereg: row.datereg,
+        accountStateLabel: getAccountStateLabel(effectiveRow || row),
+      };
     }));
   } catch (error) {
     if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
@@ -90,8 +102,9 @@ async function _traverseNetworkDetailed(parent, list, depth, maxDepth, leg) {
       depth,
       leg: rowLeg,
       position: Number(row.position || 0),
-      binaryPoints: Number(row.binarypoints || 0),
+      binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
       datereg: row.datereg,
+      accountStateLabel: getAccountStateLabel(await getEffectiveAccountState(row.uid, row)),
     });
     await _traverseNetworkDetailed(row.uid, list, depth + 1, maxDepth, rowLeg);
   }
@@ -110,7 +123,7 @@ async function _buildTreeNode(uid, depth, maxDepth) {
   const [rows] = await pool.query(
     `SELECT m.uid, m.firstname, m.lastname, m.middlename, m.username,
             u.uid as uUid, u.refid, u.drefid, u.accttype, u.currentaccttype,
-            u.position, u.codeid, u.datereg, u.public_uid
+            u.position, u.codeid, u.datereg, u.public_uid, u.binarypoints
      FROM memberstab m, usertab u
      WHERE m.uid = u.uid AND u.uid = ?`,
     [uid]
@@ -131,6 +144,8 @@ async function _buildTreeNode(uid, depth, maxDepth) {
     codeid: row.codeid,
     datereg: row.datereg,
     position: row.position,
+    binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+    accountStateLabel: getAccountStateLabel(await getEffectiveAccountState(uid, row)),
     left: null,
     right: null,
     hasLeftSlot: true,
@@ -197,15 +212,24 @@ async function getDirectReferrals(uid) {
     [uid]
   );
 
-  return rows.map(row => ({
-    uid: row.uid,
-    username: row.username,
-    fullname: `${row.firstname} ${row.lastname}`,
-    accttype: row.currentaccttype,
-    accttypeName: getAccountTypeName(row.currentaccttype),
-    codeid: row.codeid,
-    entryType: row.codeid === 1 ? 'Paid Account' : row.codeid === 2 ? 'Free Slot' : 'CD Slot',
-    datereg: row.datereg,
+  return Promise.all(rows.map(async (row) => {
+    const effectiveRow = await getEffectiveAccountState(row.uid, row);
+    const auditInfo = getAccountEntryAuditInfo(effectiveRow || row);
+
+    return {
+      uid: row.uid,
+      username: row.username,
+      fullname: `${row.firstname} ${row.lastname}`,
+      accttype: Number(effectiveRow?.currentaccttype || row.currentaccttype || 0),
+      accttypeName: getAccountTypeName(effectiveRow?.currentaccttype || row.currentaccttype),
+      codeid: Number(effectiveRow?.codeid || row.codeid || 0),
+      entryType: auditInfo.entryLabel,
+      entryCode: auditInfo.entryCode,
+      accountStateLabel: getAccountStateLabel(effectiveRow || row),
+      sponsorCreditEligible: Boolean(auditInfo.sponsorCreditEligible),
+      sourceBinaryEligible: Boolean(auditInfo.sourceBinaryEligible),
+      datereg: row.datereg,
+    };
   }));
 }
 
@@ -245,4 +269,5 @@ module.exports = {
   isInNetwork,
   getDirectReferrals,
   getPairingCounts,
+  resolveGenealogyPoints,
 };

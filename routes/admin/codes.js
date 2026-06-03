@@ -4,11 +4,27 @@
  */
 const express = require('express');
 const router = express.Router();
+const XLSX = require('xlsx');
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { generateCodes } = require('../../services/codeGeneration');
 const { PRODUCT_TYPES } = require('../../utils/helpers');
 const { sanitizeAlphaNum } = require('../../utils/helpers');
+const { createProcessKey } = require('../../utils/security');
+const { appendActivationCodeUsage } = require('../../services/registrationAudit');
+const { listAdminActivationHistory } = require('../../services/codeHistory');
+const {
+  renderAdminPdfReport,
+  sendPdfReport,
+} = require('../../services/jsreportExport');
+
+function addSheet(workbook, name, rows, widths = []) {
+  const sheet = XLSX.utils.json_to_sheet(rows);
+  if (widths.length) {
+    sheet['!cols'] = widths.map((wch) => ({ wch }));
+  }
+  XLSX.utils.book_append_sheet(workbook, sheet, name);
+}
 
 /**
  * POST /api/admin/codes/generate
@@ -46,7 +62,7 @@ router.get('/', adminAuth, async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = 100;
+    const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 40));
     const offset = (page - 1) * perPage;
     const q = (req.query.q || '').trim();
 
@@ -88,6 +104,99 @@ router.get('/', adminAuth, async (req, res) => {
   } catch (err) {
     console.error('[Admin Codes] List error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/history', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const q = (req.query.q || '').trim();
+    const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 30));
+    const result = await listAdminActivationHistory({ page, perPage, codeQuery: q });
+    res.json(result);
+  } catch (err) {
+    console.error('[Admin Codes] History error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/history/export', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    const rawFormat = String(req.query.format || 'xlsx').toLowerCase();
+    const format = rawFormat === 'pdf' || rawFormat === 'crystal' ? 'pdf' : 'xlsx';
+    const history = await listAdminActivationHistory({ page: 1, perPage: 1000, codeQuery: q });
+
+    if (format === 'pdf') {
+      const eventCounts = (history.rows || []).reduce((acc, row) => {
+        const key = row.eventLabel || 'Unknown';
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      const scale = Math.max(1, ...Object.values(eventCounts));
+      const report = await renderAdminPdfReport({
+        fileName: 'activation-code-history',
+        title: 'Activation Code History Report',
+        subtitle: 'Generated, released, transferred, upgraded, and maintenance activity audit for activation codes.',
+        generatedAt: new Date().toLocaleString('en-PH', { hour12: true }),
+        filterChips: [`Code Search: ${q || 'All codes'}`],
+        summaryCards: [
+          { label: 'Rows Exported', value: String(history.rows?.length || 0), color: '#b45309' },
+          { label: 'Pages Available', value: String(history.totalPages || 1), color: '#1d4ed8' },
+          { label: 'Search Scope', value: q || 'All codes', color: '#047857' },
+        ],
+        charts: [
+          {
+            title: 'History Event Mix',
+            note: 'Event volumes grouped by history event label from the current export scope.',
+            bars: Object.entries(eventCounts).map(([label, value]) => ({
+              label,
+              valueLabel: String(value),
+              percent: Math.max(4, Math.round((value / scale) * 100)),
+              color: '#d4af37',
+            })),
+          },
+        ],
+        tables: [
+          {
+            title: 'Activation Code History',
+            columns: ['Code', 'Event', 'Summary', 'Actor Username', 'Actor Admin', 'From', 'To', 'Created At'],
+            rows: (history.rows || []).map((row) => ([
+              row.code,
+              row.eventLabel,
+              row.summary,
+              row.actorUsername || '',
+              row.actorAdminName || '',
+              row.fromUsername || '',
+              row.toUsername || '',
+              row.createdAt || '',
+            ])),
+          },
+        ],
+      });
+      return sendPdfReport(res, report);
+    }
+
+    const workbook = XLSX.utils.book_new();
+    addSheet(workbook, 'Activation Code History', (history.rows || []).map((row) => ({
+      Code: row.code,
+      Event: row.eventLabel,
+      Summary: row.summary,
+      'Actor Username': row.actorUsername || '',
+      'Actor Admin': row.actorAdminName || '',
+      'From Username': row.fromUsername || '',
+      'To Username': row.toUsername || '',
+      'Created At': row.createdAt || '',
+      'Process Key': row.processKey || '',
+    })), [16, 18, 48, 18, 18, 18, 18, 24, 34]);
+
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="activation-code-history.xlsx"');
+    res.send(buffer);
+  } catch (err) {
+    console.error('[Admin Codes] History export error:', err);
+    res.status(500).json({ error: 'Failed to export activation code history' });
   }
 });
 
@@ -135,11 +244,27 @@ router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
     let released = 0;
 
     for (const code of selectedCodes) {
+      const [codeRows] = await pool.query(
+        'SELECT id, uid FROM codestab WHERE code = ? AND codestatus = 0 LIMIT 1',
+        [code]
+      );
+      if (codeRows.length === 0) continue;
+
       const [result] = await pool.query(
         "UPDATE codestab SET releasedate = 1, codestatus = 1 WHERE code = ? AND codestatus = 0 LIMIT 1",
         [code]
       );
-      if (result.affectedRows === 1) released++;
+      if (result.affectedRows === 1) {
+        released++;
+        await appendActivationCodeUsage(pool, {
+          code,
+          codeRowId: codeRows[0].id,
+          eventType: 'release',
+          toUid: codeRows[0].uid || null,
+          actorAdminId: Number(req.session.adminid) || null,
+          processKey: createProcessKey(['code-release', code, req.session.adminid, Date.now()]),
+        });
+      }
     }
 
     res.json({ success: true, released });
@@ -191,6 +316,19 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
          ON DUPLICATE KEY UPDATE history = CONCAT(history, ' -> ', ?), datetransfer = NOW()`,
         [codeRows[0].id, code, codeRows[0].dategen, history, history]
       );
+
+      await appendActivationCodeUsage(pool, {
+        code,
+        codeRowId: codeRows[0].id,
+        eventType: 'admin_transfer',
+        fromUid: codeRows[0].uid || null,
+        toUid: targetUid,
+        actorAdminId: Number(req.session.adminid) || null,
+        notes: {
+          targetUsername: targetSanitized,
+        },
+        processKey: createProcessKey(['admin-code-transfer', code, req.session.adminid, targetUid, Date.now()]),
+      });
 
       transferred++;
     }

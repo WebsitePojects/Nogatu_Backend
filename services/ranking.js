@@ -1,59 +1,194 @@
 /**
- * Ranking Bonus System (DOC2 §4.2)
- *
- * Three supervisor ranks based on accumulated binary/pairing points:
- * - Supervisor 1: 10,000 pts + 1 qualified S1 in left + 1 S1 in right
- * - Supervisor 2: 20,000 pts (requirements TBD)
- * - Supervisor 3: 40,000 pts + 1 qualified S2 in left + 1 S2 in right
+ * Ranking Bonus race engine orchestration.
+ * Ranking uses repurchase events from self + full binary downline.
  */
 const { pool } = require('../config/database');
+const { nowMySQL, getAccountTypeName } = require('../utils/helpers');
+const { createProcessKey, createPublicId } = require('../utils/security');
+const { writeAuditLog } = require('./audit');
+const { getPackagePolicy, listPackagePolicies } = require('./packagePolicy');
+const {
+  listRankableEventsForMember,
+  computeRankAwardsFromEvents,
+  summarizeAchievementStatus,
+} = require('./rankingRace');
 
-const RANK_REQUIREMENTS = {
-  1: { minPoints: 10000, label: 'Supervisor 1', color: '#CD7F32' },
-  2: { minPoints: 20000, label: 'Supervisor 2', color: '#C0C0C0' },
-  3: { minPoints: 40000, label: 'Supervisor 3', color: '#FFD700' },
-};
-
-const RANK_INCENTIVES = {
-  1: 'DP Motorcycle, ₱5,000, White T-shirt',
-  2: 'Laptop, ₱10,000, White Polo',
-  3: 'International Asian Travel, ₱20,000, Silver Pin',
-};
-
-const PACKAGE_LABELS = {
-  10: 'Bronze',
-  20: 'Silver',
-  30: 'Gold',
-  40: 'Platinum',
-  50: 'Garnet',
-  60: 'Diamond',
-};
-
+const RANKING_BASIS_LABEL = 'Repurchase points';
+const RACE_BASIS_MODE = 'repurchase-event';
 const RANK_REFRESH_MAX_AGE_MINUTES = 15;
 
-async function ensureIndex(tableName, indexName, alterSql) {
-  const [rows] = await pool.query(`SHOW INDEX FROM ${tableName} WHERE Key_name = ?`, [indexName]);
+const RANK_COLORS = {
+  0: '#6B7280',
+  1: '#CD7F32',
+  2: '#C0C0C0',
+  3: '#FFD700',
+  4: '#EF4444',
+  5: '#DC2626',
+  6: '#B91C1C',
+  7: '#111827',
+  8: '#1F2937',
+  9: '#000000',
+  10: '#EAB308',
+};
+
+const FULL_RANK_DEFINITIONS = [
+  { rank: 1, rank_code: 'supervisor_1', rank_name: 'Supervisor 1', points_required: 10000, left_rank_required: 0, right_rank_required: 0, incentive_summary: 'D.P Motorcycle, 5,000 Cash, White T-shirt', cash_incentive: 5000, sort_order: 10 },
+  { rank: 2, rank_code: 'supervisor_2', rank_name: 'Supervisor 2', points_required: 20000, left_rank_required: 1, right_rank_required: 1, incentive_summary: 'Laptop, 10,000 Cash, White Polo Shirt', cash_incentive: 10000, sort_order: 20 },
+  { rank: 3, rank_code: 'supervisor_3', rank_name: 'Supervisor 3', points_required: 40000, left_rank_required: 2, right_rank_required: 2, incentive_summary: 'International Asian Travel, 20,000 cash, White polo shirt with red collar, Silver Pin', cash_incentive: 20000, sort_order: 30 },
+  { rank: 4, rank_code: 'manager_1', rank_name: 'Manager 1', points_required: 60000, left_rank_required: 3, right_rank_required: 3, incentive_summary: 'D.P Car Sedan, 30,000 Cash, Red T-Shirt', cash_incentive: 30000, sort_order: 40 },
+  { rank: 5, rank_code: 'manager_2', rank_name: 'Manager 2', points_required: 100000, left_rank_required: 4, right_rank_required: 4, incentive_summary: 'D.P Car SUV, 50,000 Cash, Red Polo Shirt', cash_incentive: 50000, sort_order: 50 },
+  { rank: 6, rank_code: 'manager_3', rank_name: 'Manager 3', points_required: 200000, left_rank_required: 5, right_rank_required: 5, incentive_summary: 'D.P Condo Unit, 100,000 Cash, Red Polo Shirt with Black Collar, Gold Pin', cash_incentive: 100000, sort_order: 60 },
+  { rank: 7, rank_code: 'director_1', rank_name: 'Director 1', points_required: 600000, left_rank_required: 6, right_rank_required: 6, incentive_summary: 'Sedan Full Payment, 200,000 Cash, Black Shirt', cash_incentive: 200000, sort_order: 70 },
+  { rank: 8, rank_code: 'director_2', rank_name: 'Director 2', points_required: 1000000, left_rank_required: 7, right_rank_required: 7, incentive_summary: 'SUV Full Payment, 300,000 Cash, Black Polo Shirt', cash_incentive: 300000, sort_order: 80 },
+  { rank: 9, rank_code: 'director_3', rank_name: 'Director 3', points_required: 1600000, left_rank_required: 8, right_rank_required: 8, incentive_summary: 'Condo Fully Paid, 500,000 Cash, Black Polo Shirt, Black Jacket, Ring', cash_incentive: 500000, sort_order: 90 },
+  { rank: 10, rank_code: 'ambassador', rank_name: 'AMBASSADOR', points_required: 2000000, left_rank_required: 9, right_rank_required: 9, incentive_summary: '1,000,000 Cash, Yellow Polo Shirt, White Jacket, 1 Pin and a ring, US travel for 2, One point for global bonus', cash_incentive: 1000000, sort_order: 100 },
+];
+
+const PACKAGE_LABELS = Object.fromEntries(
+  listPackagePolicies().map((policy) => [Number(policy.packageType), policy.packageLabel])
+);
+
+const RANK_REQUIREMENTS = FULL_RANK_DEFINITIONS.reduce((map, row) => {
+  map[row.rank] = {
+    minPoints: Number(row.points_required),
+    label: row.rank_name,
+    color: RANK_COLORS[row.rank] || RANK_COLORS[0],
+  };
+  return map;
+}, {});
+
+const RANK_INCENTIVES = FULL_RANK_DEFINITIONS.reduce((map, row) => {
+  map[row.rank] = row.incentive_summary;
+  return map;
+}, {});
+
+const RANK_CASH_INCENTIVES = FULL_RANK_DEFINITIONS.reduce((map, row) => {
+  map[row.rank] = Number(row.cash_incentive || 0);
+  return map;
+}, {});
+
+let rankingInfraReadyPromise = null;
+const memberRefreshPromises = new Map();
+
+function toNumber(value) {
+  return Number(value || 0);
+}
+
+function getPackageRankingPolicy(packageType) {
+  const numericPackageType = toNumber(packageType);
+  const policy = getPackagePolicy(numericPackageType);
+  const packageLabel = policy.packageLabel || PACKAGE_LABELS[numericPackageType] || getAccountTypeName(numericPackageType) || `Type ${numericPackageType}`;
+  const rankingEligibilityReason = !policy.rankingEligible
+    ? 'Upgrade to Gold package to begin ranking.'
+    : policy.nextUpgradePackageLabel
+    ? `Upgrade to ${policy.nextUpgradePackageLabel} package to progress beyond ${policy.rankingMaxLabel || 'the current package ceiling'}.`
+    : null;
+
+  return {
+    packageType: numericPackageType,
+    packageLabel,
+    rankingEligible: Boolean(policy.rankingEligible),
+    maxRank: toNumber(policy.rankingMax),
+    maxRankLabel: policy.rankingMaxLabel || null,
+    nextUpgradePackageType: policy.nextUpgradePackageType == null ? null : toNumber(policy.nextUpgradePackageType),
+    nextUpgradePackageLabel: policy.nextUpgradePackageLabel || null,
+    reason: rankingEligibilityReason,
+  };
+}
+
+function filterRankDefinitionsForPackage(definitions = [], packageType) {
+  const policy = getPackageRankingPolicy(packageType);
+  if (!policy.rankingEligible || policy.maxRank <= 0) return [];
+  return definitions.filter((definition) => toNumber(definition.rank) > 0 && toNumber(definition.rank) <= policy.maxRank);
+}
+
+function canReleaseRankAchievementForPackage(packageType, rankNo) {
+  const policy = getPackageRankingPolicy(packageType);
+  const numericRank = toNumber(rankNo);
+  return Boolean(policy.rankingEligible) && numericRank > 0 && numericRank <= policy.maxRank;
+}
+
+function clampRankToPackage(packageType, rankNo) {
+  const policy = getPackageRankingPolicy(packageType);
+  if (!policy.rankingEligible || policy.maxRank <= 0) return 0;
+  return Math.min(policy.maxRank, Math.max(0, toNumber(rankNo)));
+}
+
+function toMysqlDateTime(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value.replace('T', ' ').replace('Z', '');
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function rankColor(rank) {
+  return RANK_COLORS[toNumber(rank)] || RANK_COLORS[0];
+}
+
+function sumRepurchasePoints(rows) {
+  return (rows || []).reduce((sum, row) => sum + toNumber(row.incentivepoints1 ?? row.ttlpoints), 0);
+}
+
+function normalizeRankDefinitions(definitionRows = []) {
+  const orderedRows = [...definitionRows].sort((a, b) => toNumber(a.sort_order) - toNumber(b.sort_order));
+  const rankByCode = new Map();
+
+  orderedRows.forEach((row, index) => {
+    rankByCode.set(String(row.rank_code || '').toLowerCase(), index + 1);
+  });
+
+  const normalizeRequirement = (value) => {
+    if (value == null || value === '') return 0;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && String(value).trim() !== '') return numeric;
+    return rankByCode.get(String(value).toLowerCase()) || 0;
+  };
+
+  return orderedRows.map((rank, index) => ({
+    rank: index + 1,
+    definition_uid: rank.definition_uid || null,
+    rank_code: rank.rank_code,
+    rank_name: rank.rank_name,
+    points_required: toNumber(rank.points_required),
+    left_rank_required: normalizeRequirement(rank.left_rank_required),
+    right_rank_required: normalizeRequirement(rank.right_rank_required),
+    incentive_summary: rank.incentive_summary || '',
+    cash_incentive: toNumber(rank.cash_incentive),
+    sort_order: toNumber(rank.sort_order || (index + 1) * 10),
+    color: rankColor(index + 1),
+  }));
+}
+
+async function ensureIndex(conn, tableName, indexName, alterSql) {
+  const [rows] = await conn.query(`SHOW INDEX FROM ${tableName} WHERE Key_name = ?`, [indexName]);
   if (rows.length === 0) {
-    await pool.query(alterSql);
+    await conn.query(alterSql);
   }
 }
 
-async function ensureRankingTable() {
-  await pool.query(
+async function ensureRankingTable(conn = pool) {
+  await conn.query(
     `CREATE TABLE IF NOT EXISTS rankingstab (
       id INT NOT NULL AUTO_INCREMENT,
       uid INT NOT NULL,
       current_rank INT NOT NULL DEFAULT 0,
       rank_level INT NOT NULL DEFAULT 0,
+      highest_rank_no INT NOT NULL DEFAULT 0,
       binary_points_total FLOAT NOT NULL DEFAULT 0,
       basis_points FLOAT NOT NULL DEFAULT 0,
+      consumed_points DECIMAL(14,2) NOT NULL DEFAULT 0,
+      remaining_rankable_points DECIMAL(14,2) NOT NULL DEFAULT 0,
       basis_label VARCHAR(120) DEFAULT NULL,
+      race_basis_mode VARCHAR(40) NOT NULL DEFAULT 'repurchase-event',
       left_qualified_count INT NOT NULL DEFAULT 0,
       right_qualified_count INT NOT NULL DEFAULT 0,
       rank_date DATETIME DEFAULT NULL,
+      race_last_awarded_at DATETIME(6) DEFAULT NULL,
       qualified_date DATETIME DEFAULT NULL,
       incentive_status INT NOT NULL DEFAULT 0,
       reward_status INT NOT NULL DEFAULT 0,
+      pending_achievement_count INT NOT NULL DEFAULT 0,
       reward_claimed_date DATETIME DEFAULT NULL,
       last_calculated_at DATETIME DEFAULT NULL,
       PRIMARY KEY (id),
@@ -63,102 +198,68 @@ async function ensureRankingTable() {
     ) ENGINE=InnoDB DEFAULT CHARSET=latin1`
   );
 
-  const [cols] = await pool.query('SHOW COLUMNS FROM rankingstab');
+  const [cols] = await conn.query('SHOW COLUMNS FROM rankingstab');
   const columnSet = new Set(cols.map((col) => String(col.Field || '').toLowerCase()));
 
-  if (!columnSet.has('basis_points')) {
-    await pool.query('ALTER TABLE rankingstab ADD COLUMN basis_points FLOAT NOT NULL DEFAULT 0 AFTER binary_points_total');
-  }
-  if (!columnSet.has('basis_label')) {
-    await pool.query('ALTER TABLE rankingstab ADD COLUMN basis_label VARCHAR(120) DEFAULT NULL AFTER basis_points');
-  }
-  if (!columnSet.has('last_calculated_at')) {
-    await pool.query('ALTER TABLE rankingstab ADD COLUMN last_calculated_at DATETIME DEFAULT NULL AFTER reward_claimed_date');
-  }
+  if (!columnSet.has('highest_rank_no')) await conn.query('ALTER TABLE rankingstab ADD COLUMN highest_rank_no INT NOT NULL DEFAULT 0 AFTER rank_level');
+  if (!columnSet.has('basis_points')) await conn.query('ALTER TABLE rankingstab ADD COLUMN basis_points FLOAT NOT NULL DEFAULT 0 AFTER binary_points_total');
+  if (!columnSet.has('consumed_points')) await conn.query('ALTER TABLE rankingstab ADD COLUMN consumed_points DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER basis_points');
+  if (!columnSet.has('remaining_rankable_points')) await conn.query('ALTER TABLE rankingstab ADD COLUMN remaining_rankable_points DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER consumed_points');
+  if (!columnSet.has('basis_label')) await conn.query('ALTER TABLE rankingstab ADD COLUMN basis_label VARCHAR(120) DEFAULT NULL AFTER remaining_rankable_points');
+  if (!columnSet.has('race_basis_mode')) await conn.query(`ALTER TABLE rankingstab ADD COLUMN race_basis_mode VARCHAR(40) NOT NULL DEFAULT '${RACE_BASIS_MODE}' AFTER basis_label`);
+  if (!columnSet.has('race_last_awarded_at')) await conn.query('ALTER TABLE rankingstab ADD COLUMN race_last_awarded_at DATETIME(6) DEFAULT NULL AFTER rank_date');
+  if (!columnSet.has('pending_achievement_count')) await conn.query('ALTER TABLE rankingstab ADD COLUMN pending_achievement_count INT NOT NULL DEFAULT 0 AFTER reward_status');
+  if (!columnSet.has('last_calculated_at')) await conn.query('ALTER TABLE rankingstab ADD COLUMN last_calculated_at DATETIME DEFAULT NULL AFTER reward_claimed_date');
 
-  await ensureIndex('rankingstab', 'idx_basis_points', 'ALTER TABLE rankingstab ADD INDEX idx_basis_points (basis_points)');
-  await ensureIndex('rankingstab', 'idx_last_calculated_at', 'ALTER TABLE rankingstab ADD INDEX idx_last_calculated_at (last_calculated_at)');
-  await ensureIndex('pairingstab', 'idx_uid_transdate_id', 'ALTER TABLE pairingstab ADD INDEX idx_uid_transdate_id (uid, transdate, id)');
-  await ensureIndex('pairingstab', 'idx_uid_totalbpay', 'ALTER TABLE pairingstab ADD INDEX idx_uid_totalbpay (uid, totalbpay)');
-  await ensureIndex('usertab', 'idx_refid_position_uid', 'ALTER TABLE usertab ADD INDEX idx_refid_position_uid (refid, position, uid)');
-  await ensureIndex('usertab', 'idx_codeid_uid_mainid', 'ALTER TABLE usertab ADD INDEX idx_codeid_uid_mainid (codeid, uid, mainid)');
-}
-
-function toNumber(value) {
-  return Number(value || 0);
-}
-
-function shouldRefreshRankState(row) {
-  if (!row) return true;
-
-  const dbBasisPoints = toNumber(row.db_basis_points);
-  const liveBasisPoints = toNumber(row.live_basis_points);
-  if (Math.abs(dbBasisPoints - liveBasisPoints) > 0.001) return true;
-
-  if (!row.last_calculated_at) return true;
-
-  const lastCalculatedAt = new Date(row.last_calculated_at);
-  if (Number.isNaN(lastCalculatedAt.getTime())) return true;
-
-  const ageMs = Date.now() - lastCalculatedAt.getTime();
-  if (ageMs > RANK_REFRESH_MAX_AGE_MINUTES * 60 * 1000) return true;
-
-  if (toNumber(row.current_rank) > 0 && !(row.rank_date || row.qualified_date)) return true;
-
-  return false;
-}
-
-function parseRankRow(row) {
-  if (!row) {
-    return {
-      rank: 0,
-      incentiveStatus: 0,
-      rewardStatus: 0,
-      rankDate: null,
-    };
-  }
-
-  return {
-    rank: Math.max(Number(row.current_rank || 0), Number(row.rank_level || 0)),
-    incentiveStatus: Number(row.incentive_status || 0),
-    rewardStatus: Number(row.reward_status || 0),
-    rankDate: row.rank_date || row.qualified_date || null,
-  };
-}
-
-/**
- * Get total accumulated pairing points for a user
- */
-async function getTotalPairingPoints(uid) {
-  const [rows] = await pool.query(
-    'SELECT SUM(totalpoints) as ttlpoints FROM pairingstab WHERE uid = ?',
-    [uid]
+  await conn.query(
+    `CREATE TABLE IF NOT EXISTS rank_sequence_countertab (
+      id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+      next_sequence BIGINT UNSIGNED NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
   );
-  return Number(rows[0]?.ttlpoints || 0);
+  await conn.query('INSERT IGNORE INTO rank_sequence_countertab (id, next_sequence) VALUES (1, 1)');
+
+  await ensureIndex(conn, 'rankingstab', 'idx_basis_points', 'ALTER TABLE rankingstab ADD INDEX idx_basis_points (basis_points)');
+  await ensureIndex(conn, 'rankingstab', 'idx_last_calculated_at', 'ALTER TABLE rankingstab ADD INDEX idx_last_calculated_at (last_calculated_at)');
+  await ensureIndex(conn, 'rankingstab', 'idx_highest_rank_no', 'ALTER TABLE rankingstab ADD INDEX idx_highest_rank_no (highest_rank_no)');
+  await ensureIndex(conn, 'rankingstab', 'idx_race_last_awarded_at', 'ALTER TABLE rankingstab ADD INDEX idx_race_last_awarded_at (race_last_awarded_at)');
+  await ensureIndex(conn, 'repurchasetab', 'idx_uid_incentivepoints1', 'ALTER TABLE repurchasetab ADD INDEX idx_uid_incentivepoints1 (uid, incentivepoints1)');
+  await ensureIndex(conn, 'pairingstab', 'idx_uid_transdate_id', 'ALTER TABLE pairingstab ADD INDEX idx_uid_transdate_id (uid, transdate, id)');
+  await ensureIndex(conn, 'usertab', 'idx_refid_position_uid', 'ALTER TABLE usertab ADD INDEX idx_refid_position_uid (refid, position, uid)');
+  await ensureIndex(conn, 'usertab', 'idx_codeid_mainid_uid', 'ALTER TABLE usertab ADD INDEX idx_codeid_mainid_uid (codeid, mainid, uid)');
+  await ensureIndex(conn, 'binary_tree_closuretab', 'idx_ancestor_leg_depth', 'ALTER TABLE binary_tree_closuretab ADD INDEX idx_ancestor_leg_depth (ancestor_uid, leg, depth)');
 }
 
-async function getRankingBasis(uid) {
-  const [rows] = await pool.query(
-    `SELECT COALESCE(MAX(totalpointsleft), 0) AS max_left_points,
-            COALESCE(MAX(totalpointsright), 0) AS max_right_points
-       FROM pairingstab
-      WHERE uid = ?`,
-    [uid]
-  );
-
-  const row = rows[0] || {};
-  const leftPoints = toNumber(row.max_left_points);
-  const rightPoints = toNumber(row.max_right_points);
-  const basisPoints = leftPoints + rightPoints;
-
-  return {
-    basisPoints,
-    basisLabel: 'Combined binary leg points',
-  };
+async function ensureRankingInfra() {
+  if (!rankingInfraReadyPromise) {
+    rankingInfraReadyPromise = ensureRankingTable().catch((error) => {
+      rankingInfraReadyPromise = null;
+      throw error;
+    });
+  }
+  return rankingInfraReadyPromise;
 }
 
-async function getLatestPairingSnapshot(uid) {
-  const [rows] = await pool.query(
+async function getRankDefinitions(conn = pool) {
+  try {
+    const [definitionRows] = await conn.query(
+      `SELECT definition_uid, rank_code, rank_name, points_required, left_rank_required, right_rank_required,
+              incentive_summary, cash_incentive, sort_order
+       FROM rank_definitionstab
+       WHERE is_active = 1
+       ORDER BY sort_order ASC`
+    );
+
+    if (definitionRows.length > 0) return normalizeRankDefinitions(definitionRows);
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
+  }
+
+  return normalizeRankDefinitions(FULL_RANK_DEFINITIONS);
+}
+
+async function getLatestPairingSnapshot(uid, conn = pool) {
+  const [rows] = await conn.query(
     `SELECT totalbpay, totalleft, totalright, totalpointsleft, totalpointsright
      FROM pairingstab
      WHERE uid = ?
@@ -177,387 +278,905 @@ async function getLatestPairingSnapshot(uid) {
   };
 }
 
-/**
- * Check binary leg qualifications for rank requirements
- * S1 requires: 1 S1 in left leg + 1 S1 in right leg
- * S3 requires: 1 S2 in left leg + 1 S2 in right leg
- */
-async function checkLegQualification(uid, requiredRank) {
-  // Get direct binary children
-  const [children] = await pool.query(
-    'SELECT uid, position FROM usertab WHERE refid = ?',
+async function getDirectChildren(uid, conn = pool) {
+  const [rows] = await conn.query(
+    'SELECT uid FROM usertab WHERE refid = ? ORDER BY position ASC, id ASC',
+    [uid]
+  );
+  return rows.map((row) => toNumber(row.uid)).filter((value) => value > 0);
+}
+
+async function getAchievementRowsForMember(uid, conn = pool) {
+  try {
+    const [rows] = await conn.query(
+      `SELECT
+          ra.achievement_uid,
+          ra.member_uid,
+          ra.rank_definition_uid,
+          ra.achieved_at,
+          ra.last_consumed_event_ts,
+          ra.sequence_id,
+          ra.gross_points_at_achievement,
+          ra.remaining_rankable_points,
+          ra.status,
+          ra.fulfilled_at,
+          ra.admin_fulfilled_by,
+          ra.fulfillment_notes,
+          rd.rank_code,
+          rd.rank_name,
+          rd.points_required,
+          rd.left_rank_required,
+          rd.right_rank_required,
+          rd.incentive_summary,
+          rd.cash_incentive,
+          rd.sort_order
+       FROM rank_achievementstab ra
+       INNER JOIN rank_definitionstab rd ON rd.definition_uid = ra.rank_definition_uid
+       WHERE ra.member_uid = ?
+       ORDER BY rd.sort_order ASC, ra.sequence_id ASC`,
+      [uid]
+    );
+
+    const normalizedRows = normalizeRankDefinitions(rows);
+
+    return rows.map((row, index) => {
+      const definition = normalizedRows[index] || {};
+      return {
+        achievementUid: row.achievement_uid,
+        memberUid: toNumber(row.member_uid),
+        rankDefinitionUid: row.rank_definition_uid,
+        rank: toNumber(definition.rank),
+        rankCode: row.rank_code,
+        rankName: row.rank_name,
+        pointsRequired: toNumber(row.points_required),
+        leftRankRequired: toNumber(definition.left_rank_required ?? row.left_rank_required),
+        rightRankRequired: toNumber(definition.right_rank_required ?? row.right_rank_required),
+        incentiveSummary: row.incentive_summary || '',
+        cashIncentive: toNumber(row.cash_incentive),
+        achievedAt: row.achieved_at,
+        lastConsumedEventTs: row.last_consumed_event_ts || row.achieved_at,
+        sequenceId: toNumber(row.sequence_id),
+        grossPointsAtAchievement: toNumber(row.gross_points_at_achievement),
+        remainingRankablePoints: toNumber(row.remaining_rankable_points),
+        achievementStatus: row.status,
+        fulfilledAt: row.fulfilled_at,
+        adminFulfilledBy: row.admin_fulfilled_by,
+        fulfillmentNotes: row.fulfillment_notes,
+        sortOrder: toNumber(row.sort_order),
+      };
+    });
+  } catch (error) {
+    if (error.code === 'ER_NO_SUCH_TABLE') return [];
+    throw error;
+  }
+}
+
+async function getConsumedEventMapForMember(uid, conn = pool) {
+  try {
+    const [rows] = await conn.query(
+      `SELECT consumed_member_uid, source_event_id, COALESCE(SUM(points_consumed), 0) AS total_consumed
+       FROM rank_point_consumptiontab
+       WHERE consuming_member_uid = ?
+       GROUP BY consumed_member_uid, source_event_id`,
+      [uid]
+    );
+
+    const consumedByEvent = new Map();
+    let consumedPoints = 0;
+
+    for (const row of rows) {
+      const key = `${toNumber(row.consumed_member_uid)}:${String(row.source_event_id || '')}`;
+      const total = toNumber(row.total_consumed);
+      consumedByEvent.set(key, total);
+      consumedPoints += total;
+    }
+
+    return { consumedByEvent, consumedPoints };
+  } catch (error) {
+    if (error.code === 'ER_NO_SUCH_TABLE') {
+      return { consumedByEvent: new Map(), consumedPoints: 0 };
+    }
+    throw error;
+  }
+}
+
+function buildRemainingEventPool(rankableEvents, consumedState) {
+  const { consumedByEvent, consumedPoints } = consumedState;
+  const grossRankablePoints = rankableEvents.reduce((sum, event) => sum + toNumber(event.points), 0);
+
+  const remainingEvents = rankableEvents
+    .map((event) => {
+      const key = `${toNumber(event.sourceMemberUid)}:${String(event.sourceEventId || '')}`;
+      const alreadyConsumed = toNumber(consumedByEvent.get(key));
+      const remainingPoints = Math.max(0, toNumber(event.points) - alreadyConsumed);
+      return {
+        ...event,
+        remainingPoints,
+      };
+    })
+    .filter((event) => toNumber(event.remainingPoints) > 0);
+
+  return {
+    grossRankablePoints,
+    existingConsumedPoints: consumedPoints,
+    remainingEvents,
+  };
+}
+
+async function getSubtreeQualifiedRankCounts(uid, rankDefinitions, conn = pool) {
+  const [rows] = await conn.query(
+    `SELECT c.leg,
+            u.currentaccttype,
+            GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) AS awarded_rank
+     FROM binary_tree_closuretab c
+     INNER JOIN usertab u ON u.uid = c.descendant_uid
+     LEFT JOIN rankingstab r ON r.uid = c.descendant_uid
+     WHERE c.ancestor_uid = ?
+       AND c.depth > 0`,
     [uid]
   );
 
-  let leftQualified = false;
-  let rightQualified = false;
-
-  for (const child of children) {
-    const childRank = await getCurrentRank(child.uid);
-    if (childRank >= requiredRank) {
-      if (Number(child.position) === 1) leftQualified = true;
-      if (Number(child.position) === 2) rightQualified = true;
-    }
-
-    // Also check deeper in the same leg
-    if (!leftQualified && Number(child.position) === 1) {
-      leftQualified = await hasQualifiedDownline(child.uid, requiredRank);
-    }
-    if (!rightQualified && Number(child.position) === 2) {
-      rightQualified = await hasQualifiedDownline(child.uid, requiredRank);
+  const thresholdCounts = new Map();
+  for (const definition of rankDefinitions) {
+    const threshold = Math.max(toNumber(definition.left_rank_required), toNumber(definition.right_rank_required));
+    if (threshold > 0 && !thresholdCounts.has(threshold)) {
+      thresholdCounts.set(threshold, { left: 0, right: 0 });
     }
   }
 
-  return { leftQualified, rightQualified };
+  for (const row of rows) {
+    const leg = row.leg === 'left' ? 'left' : row.leg === 'right' ? 'right' : null;
+    const awardedRank = clampRankToPackage(row.currentaccttype, row.awarded_rank);
+    if (!leg || awardedRank <= 0) continue;
+
+    for (const [threshold, counts] of thresholdCounts.entries()) {
+      if (awardedRank >= threshold) counts[leg] += 1;
+    }
+  }
+
+  const result = {};
+  for (const definition of rankDefinitions) {
+    const rankNo = toNumber(definition.rank);
+    const leftReq = toNumber(definition.left_rank_required);
+    const rightReq = toNumber(definition.right_rank_required);
+    result[rankNo] = {
+      leftQualifiedCount: leftReq > 0 ? toNumber(thresholdCounts.get(leftReq)?.left) : 0,
+      rightQualifiedCount: rightReq > 0 ? toNumber(thresholdCounts.get(rightReq)?.right) : 0,
+    };
+  }
+
+  return result;
 }
 
-/**
- * Recursively check if any downline member has the required rank
- */
-async function hasQualifiedDownline(parentUid, requiredRank) {
-  const [children] = await pool.query(
-    'SELECT uid FROM usertab WHERE refid = ?',
-    [parentUid]
+async function nextSequenceId(conn) {
+  const [rows] = await conn.query(
+    'SELECT next_sequence FROM rank_sequence_countertab WHERE id = 1 LIMIT 1 FOR UPDATE'
+  );
+  const next = toNumber(rows[0]?.next_sequence) || 1;
+  await conn.query('UPDATE rank_sequence_countertab SET next_sequence = ? WHERE id = 1', [next + 1]);
+  return next;
+}
+
+async function insertAchievementAward(memberUid, award, definitionByRank, grossRankablePoints, conn) {
+  const definition = definitionByRank.get(toNumber(award.rank));
+  const achievementUid = createPublicId();
+  const sequenceId = await nextSequenceId(conn);
+  const achievedAt = toMysqlDateTime(award.achievedAt) || nowMySQL();
+  const lastConsumption = award.consumptionRows[award.consumptionRows.length - 1] || null;
+  const remainingAfterAward = Math.max(0, toNumber(award.remainingRankablePointsAfterAward));
+
+  await conn.query(
+    `INSERT INTO rank_achievementstab
+      (achievement_uid, member_uid, rank_definition_uid, achieved_at, last_consumed_event_ts,
+       tie_break_member_uid, source_basis, sequence_id,
+       gross_points_at_achievement, consumed_by_upline_points, remaining_rankable_points, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'pending_fulfillment')`,
+    [
+      achievementUid,
+      memberUid,
+      definition.definition_uid || null,
+      achievedAt,
+      achievedAt,
+      toNumber(lastConsumption?.sourceMemberUid) || null,
+      RACE_BASIS_MODE,
+      sequenceId,
+      toNumber(grossRankablePoints),
+      remainingAfterAward,
+    ]
   );
 
-  for (const child of children) {
-    const rank = await getCurrentRank(child.uid);
-    if (rank >= requiredRank) return true;
-    const found = await hasQualifiedDownline(child.uid, requiredRank);
-    if (found) return true;
+  for (const row of award.consumptionRows) {
+    await conn.query(
+      `INSERT INTO rank_point_consumptiontab
+        (consumption_uid, consumed_member_uid, consuming_rank_uid, consuming_member_uid,
+         points_consumed, source_event_id, source_event_ts, source_leg, source_process_id,
+         consumed_at, explanation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        createPublicId(),
+        toNumber(row.sourceMemberUid),
+        achievementUid,
+        memberUid,
+        toNumber(row.pointsConsumed),
+        toNumber(row.sourceEventId) || null,
+        toMysqlDateTime(row.sourceEventTs),
+        row.sourceLeg || 'unknown',
+        row.sourceProcessId || null,
+        achievedAt,
+        `${award.rankName} consumed ${toNumber(row.pointsConsumed)} repurchase points from ${row.sourceLeg || 'unknown'} leg.`,
+      ]
+    );
   }
 
+  return {
+    achievementUid,
+    rank: toNumber(award.rank),
+    rankCode: award.rankCode,
+    rankName: award.rankName,
+    cashIncentive: toNumber(award.cashIncentive),
+    achievedAt,
+    achievementStatus: 'pending_fulfillment',
+    remainingRankablePoints: remainingAfterAward,
+  };
+}
+
+function parseSnapshotRow(row) {
+  const currentRank = Math.max(
+    toNumber(row?.highest_rank_no),
+    toNumber(row?.current_rank),
+    toNumber(row?.rank_level)
+  );
+
+  return {
+    currentRank,
+    currentRankLabel: currentRank > 0 ? (RANK_REQUIREMENTS[currentRank]?.label || `Rank ${currentRank}`) : 'Unranked',
+    currentRankColor: rankColor(currentRank),
+    grossRankablePoints: toNumber(row?.basis_points),
+    consumedPoints: toNumber(row?.consumed_points),
+    remainingRankablePoints: toNumber(row?.remaining_rankable_points),
+    basisLabel: row?.basis_label || RANKING_BASIS_LABEL,
+    raceBasisMode: row?.race_basis_mode || RACE_BASIS_MODE,
+    rankDate: row?.rank_date || row?.qualified_date || null,
+    raceLastAwardedAt: row?.race_last_awarded_at || null,
+    leftQualifiedCount: toNumber(row?.left_qualified_count),
+    rightQualifiedCount: toNumber(row?.right_qualified_count),
+    incentiveStatus: toNumber(row?.incentive_status),
+    rewardStatus: toNumber(row?.reward_status),
+    pendingAchievementCount: toNumber(row?.pending_achievement_count),
+    lastCalculatedAt: row?.last_calculated_at || null,
+  };
+}
+
+function buildPendingAchievementSummary(achievements = []) {
+  const pending = achievements.filter((achievement) => String(achievement.achievementStatus || achievement.status || '') === 'pending_fulfillment');
+  const fulfilled = achievements.filter((achievement) => String(achievement.achievementStatus || achievement.status || '') === 'fulfilled');
+
+  return {
+    pendingCount: pending.length,
+    fulfilledCount: fulfilled.length,
+    nextPendingRank: pending[0] || null,
+  };
+}
+
+function normalizeNextRankRequirement(definition) {
+  if (!definition) return null;
+  return {
+    ...definition,
+    rank: toNumber(definition.rank),
+    rankName: definition.rankName || definition.rank_name || definition.rank_name || `Rank ${toNumber(definition.rank)}`,
+    pointsRequired: toNumber(definition.pointsRequired ?? definition.points_required),
+    leftRankRequired: toNumber(definition.leftRankRequired ?? definition.left_rank_required),
+    rightRankRequired: toNumber(definition.rightRankRequired ?? definition.right_rank_required),
+  };
+}
+
+function applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, achievements = []) {
+  const policy = getPackageRankingPolicy(packageType);
+  const effectiveDefinitions = filterRankDefinitionsForPackage(definitions, packageType);
+  const filteredAchievements = (achievements || []).filter((achievement) =>
+    canReleaseRankAchievementForPackage(packageType, achievement.rank)
+  );
+  const effectiveAchievementSummary = buildPendingAchievementSummary(filteredAchievements);
+  const effectiveCurrentRankFromAchievements = filteredAchievements.length > 0
+    ? Math.max(...filteredAchievements.map((achievement) => toNumber(achievement.rank)))
+    : 0;
+
+  const rawCurrentRank = toNumber(snapshot.currentRank);
+  const effectiveCurrentRank = Math.max(
+    clampRankToPackage(packageType, rawCurrentRank),
+    effectiveCurrentRankFromAchievements
+  );
+  const nextRankRequirement = normalizeNextRankRequirement(
+    effectiveDefinitions.find((definition) => toNumber(definition.rank) > effectiveCurrentRank) || null
+  );
+  const maxPublishedRank = definitions.reduce((max, definition) => Math.max(max, toNumber(definition.rank)), 0);
+  const blockedByPackageGate = !policy.rankingEligible
+    || (policy.maxRank > 0 && policy.maxRank < maxPublishedRank && effectiveCurrentRank >= policy.maxRank && !nextRankRequirement);
+
+  return {
+    ...snapshot,
+    rawCurrentRank,
+    currentRank: effectiveCurrentRank,
+    currentRankLabel: effectiveCurrentRank > 0 ? (RANK_REQUIREMENTS[effectiveCurrentRank]?.label || `Rank ${effectiveCurrentRank}`) : 'Unranked',
+    currentRankColor: rankColor(effectiveCurrentRank),
+    nextRank: nextRankRequirement ? toNumber(nextRankRequirement.rank) : null,
+    nextRankRequirement,
+    leftRequirementMet: !nextRankRequirement || toNumber(snapshot.leftQualifiedCount) >= toNumber(nextRankRequirement.leftRankRequired),
+    rightRequirementMet: !nextRankRequirement || toNumber(snapshot.rightQualifiedCount) >= toNumber(nextRankRequirement.rightRankRequired),
+    rankingEligible: policy.rankingEligible,
+    rankingEligibilityReason: blockedByPackageGate ? policy.reason : null,
+    blockedByPackageGate,
+    packageType: toNumber(packageType),
+    packageLabel: policy.packageLabel,
+    packageRankMax: policy.maxRank,
+    packageRankMaxLabel: policy.maxRankLabel,
+    upgradeRequiredPackageType: blockedByPackageGate ? policy.nextUpgradePackageType : null,
+    upgradeRequiredPackageLabel: blockedByPackageGate ? policy.nextUpgradePackageLabel : null,
+    achievements: filteredAchievements,
+    pendingAchievementCount: effectiveAchievementSummary.pendingCount,
+    nextPendingRank: effectiveAchievementSummary.nextPendingRank,
+    rankDefinitions: effectiveDefinitions,
+  };
+}
+
+async function getSnapshotRow(uid, conn = pool) {
+  const [rows] = await conn.query(
+    `SELECT r.current_rank, r.rank_level, r.highest_rank_no, r.basis_points, r.consumed_points,
+            remaining_rankable_points, basis_label, race_basis_mode,
+            rank_date, race_last_awarded_at, qualified_date,
+            left_qualified_count, right_qualified_count,
+            incentive_status, reward_status, pending_achievement_count,
+            last_calculated_at, u.currentaccttype
+     FROM rankingstab r
+     INNER JOIN usertab u ON u.uid = r.uid
+     WHERE r.uid = ?
+     LIMIT 1`,
+    [uid]
+  );
+
+  return parseSnapshotRow(rows[0]);
+}
+
+async function upsertRankingSnapshot(uid, payload, conn) {
+  await conn.query(
+    `INSERT INTO rankingstab (
+       uid, current_rank, rank_level, highest_rank_no, binary_points_total,
+       basis_points, consumed_points, remaining_rankable_points,
+       basis_label, race_basis_mode,
+       left_qualified_count, right_qualified_count,
+       rank_date, race_last_awarded_at, qualified_date,
+       incentive_status, reward_status, pending_achievement_count,
+       reward_claimed_date, last_calculated_at
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+     ON DUPLICATE KEY UPDATE
+       current_rank = VALUES(current_rank),
+       rank_level = VALUES(rank_level),
+       highest_rank_no = VALUES(highest_rank_no),
+       binary_points_total = VALUES(binary_points_total),
+       basis_points = VALUES(basis_points),
+       consumed_points = VALUES(consumed_points),
+       remaining_rankable_points = VALUES(remaining_rankable_points),
+       basis_label = VALUES(basis_label),
+       race_basis_mode = VALUES(race_basis_mode),
+       left_qualified_count = VALUES(left_qualified_count),
+       right_qualified_count = VALUES(right_qualified_count),
+       rank_date = VALUES(rank_date),
+       race_last_awarded_at = VALUES(race_last_awarded_at),
+       qualified_date = VALUES(qualified_date),
+       incentive_status = VALUES(incentive_status),
+       reward_status = VALUES(reward_status),
+       pending_achievement_count = VALUES(pending_achievement_count),
+       reward_claimed_date = VALUES(reward_claimed_date),
+       last_calculated_at = NOW()`,
+    [
+      uid,
+      payload.currentRank,
+      payload.currentRank,
+      payload.currentRank,
+      payload.binaryPoints,
+      payload.grossRankablePoints,
+      payload.consumedPoints,
+      payload.remainingRankablePoints,
+      payload.basisLabel,
+      payload.raceBasisMode,
+      payload.leftQualifiedCount,
+      payload.rightQualifiedCount,
+      payload.rankDate,
+      payload.raceLastAwardedAt,
+      payload.rankDate,
+      payload.incentiveStatus,
+      payload.rewardStatus,
+      payload.pendingAchievementCount,
+      payload.rewardClaimedDate,
+    ]
+  );
+}
+
+async function rebuildRankSnapshot(uid, conn = pool, context = null) {
+  await ensureRankingTable(conn);
+
+  const memberUid = toNumber(uid);
+  const ctx = context || {
+    memo: new Map(),
+    stack: new Set(),
+    definitions: null,
+  };
+
+  if (ctx.memo.has(memberUid)) return ctx.memo.get(memberUid);
+  if (ctx.stack.has(memberUid)) return ctx.memo.get(memberUid) || null;
+  ctx.stack.add(memberUid);
+
+  try {
+    const definitions = ctx.definitions || await getRankDefinitions(conn);
+    ctx.definitions = definitions;
+    const [memberRows] = await conn.query(
+      'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
+      [memberUid]
+    );
+    const packageType = toNumber(memberRows[0]?.currentaccttype);
+    const effectiveDefinitions = filterRankDefinitionsForPackage(definitions, packageType);
+    const definitionByRank = new Map(definitions.map((definition) => [toNumber(definition.rank), definition]));
+
+    const children = await getDirectChildren(memberUid, conn);
+    for (const childUid of children) {
+      await rebuildRankSnapshot(childUid, conn, ctx);
+    }
+
+    const rankableEvents = await listRankableEventsForMember(memberUid, conn);
+    const achievementsBefore = await getAchievementRowsForMember(memberUid, conn);
+    const consumedState = await getConsumedEventMapForMember(memberUid, conn);
+    const eventPool = buildRemainingEventPool(rankableEvents, consumedState);
+    const subtreeQualifiedRankCounts = await getSubtreeQualifiedRankCounts(memberUid, effectiveDefinitions, conn);
+
+    const raceState = computeRankAwardsFromEvents({
+      memberUid,
+      rankDefinitions: effectiveDefinitions,
+      rankableEvents: eventPool.remainingEvents,
+      subtreeQualifiedRankCounts,
+      existingAchievements: achievementsBefore,
+      grossRankablePoints: eventPool.grossRankablePoints,
+      consumedPoints: eventPool.existingConsumedPoints,
+    });
+
+    if (raceState.awards.length > 0) {
+      let rollingConsumedPoints = eventPool.existingConsumedPoints;
+      for (const award of raceState.awards) {
+        rollingConsumedPoints += toNumber(award.pointsConsumed);
+        award.remainingRankablePointsAfterAward = Math.max(0, raceState.grossRankablePoints - rollingConsumedPoints);
+        await insertAchievementAward(memberUid, award, definitionByRank, raceState.grossRankablePoints, conn);
+      }
+    }
+
+    const achievementsAfter = await getAchievementRowsForMember(memberUid, conn);
+    const filteredAchievements = achievementsAfter.filter((achievement) =>
+      canReleaseRankAchievementForPackage(packageType, achievement.rank)
+    );
+    const achievementSummary = summarizeAchievementStatus(filteredAchievements);
+    const pairing = await getLatestPairingSnapshot(memberUid, conn);
+    const latestAward = [...filteredAchievements].sort((a, b) => toNumber(a.rank) - toNumber(b.rank)).at(-1) || null;
+    const nextRankDefinition = raceState.nextRankRequirement;
+    const nextCounts = nextRankDefinition ? (subtreeQualifiedRankCounts[toNumber(nextRankDefinition.rank)] || {}) : {};
+    const currentRank = filteredAchievements.length > 0
+      ? Math.max(...filteredAchievements.map((achievement) => toNumber(achievement.rank)))
+      : 0;
+
+    const snapshotPayload = {
+      currentRank,
+      grossRankablePoints: raceState.grossRankablePoints,
+      consumedPoints: raceState.consumedPoints,
+      remainingRankablePoints: raceState.remainingRankablePoints,
+      basisLabel: RANKING_BASIS_LABEL,
+      raceBasisMode: RACE_BASIS_MODE,
+      binaryPoints: pairing.binaryPoints,
+      leftQualifiedCount: toNumber(nextCounts.leftQualifiedCount),
+      rightQualifiedCount: toNumber(nextCounts.rightQualifiedCount),
+      rankDate: latestAward?.achievedAt ? toMysqlDateTime(latestAward.achievedAt) : null,
+      raceLastAwardedAt: latestAward?.achievedAt ? toMysqlDateTime(latestAward.achievedAt) : null,
+      incentiveStatus: achievementSummary.pendingCount > 0 ? 0 : (currentRank > 0 ? 1 : 0),
+      rewardStatus: achievementSummary.pendingCount > 0 ? 0 : (currentRank > 0 ? 1 : 0),
+      pendingAchievementCount: achievementSummary.pendingCount,
+      rewardClaimedDate: achievementSummary.pendingCount > 0 ? null : (latestAward?.fulfilledAt ? toMysqlDateTime(latestAward.fulfilledAt) : null),
+    };
+
+    await upsertRankingSnapshot(memberUid, snapshotPayload, conn);
+
+    const snapshot = {
+      uid: memberUid,
+      currentRank,
+      currentRankLabel: currentRank > 0 ? (RANK_REQUIREMENTS[currentRank]?.label || `Rank ${currentRank}`) : 'Unranked',
+      currentRankColor: rankColor(currentRank),
+      grossRankablePoints: raceState.grossRankablePoints,
+      consumedPoints: raceState.consumedPoints,
+      remainingRankablePoints: raceState.remainingRankablePoints,
+      basisPoints: raceState.grossRankablePoints,
+      basisLabel: RANKING_BASIS_LABEL,
+      raceBasisMode: RACE_BASIS_MODE,
+      rankDate: snapshotPayload.rankDate,
+      raceLastAwardedAt: snapshotPayload.raceLastAwardedAt,
+      leftQualifiedCount: toNumber(nextCounts.leftQualifiedCount),
+      rightQualifiedCount: toNumber(nextCounts.rightQualifiedCount),
+      leftRequirementMet: raceState.leftRequirementMet,
+      rightRequirementMet: raceState.rightRequirementMet,
+      nextRank: raceState.nextRank,
+      nextRankRequirement: raceState.nextRankRequirement,
+      achievements: filteredAchievements,
+      pendingAchievementCount: achievementSummary.pendingCount,
+      nextPendingRank: achievementSummary.nextPendingRank,
+      incentiveStatus: snapshotPayload.incentiveStatus,
+      rewardStatus: snapshotPayload.rewardStatus,
+      pairing,
+    };
+    const gatedSnapshot = applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, filteredAchievements);
+    ctx.memo.set(memberUid, gatedSnapshot);
+    return gatedSnapshot;
+  } finally {
+    ctx.stack.delete(memberUid);
+  }
+}
+
+function shouldRefreshRankState(row) {
+  if (!row || !row.last_calculated_at) return true;
+  const lastCalculatedAt = new Date(row.last_calculated_at);
+  if (Number.isNaN(lastCalculatedAt.getTime())) return true;
+  const ageMs = Date.now() - lastCalculatedAt.getTime();
+  if (ageMs > RANK_REFRESH_MAX_AGE_MINUTES * 60 * 1000) return true;
+  if (toNumber(row.highest_rank_no || row.current_rank || row.rank_level) > 0 && !(row.rank_date || row.qualified_date || row.race_last_awarded_at)) return true;
   return false;
 }
 
-/**
- * Get current rank from rankingstab
- */
-async function getCurrentRank(uid) {
-  const [rows] = await pool.query(
-    `SELECT current_rank, rank_level, incentive_status, reward_status,
-            rank_date, qualified_date
-     FROM rankingstab WHERE uid = ?`,
+async function getStoredRankingRow(uid, conn = pool) {
+  const [rows] = await conn.query(
+    `SELECT r.uid, r.current_rank, r.rank_level, r.highest_rank_no, r.basis_points, r.consumed_points,
+            remaining_rankable_points, basis_label, race_basis_mode, left_qualified_count,
+            right_qualified_count, rank_date, qualified_date, race_last_awarded_at,
+            incentive_status, reward_status, pending_achievement_count, reward_claimed_date,
+            last_calculated_at, u.currentaccttype
+     FROM rankingstab r
+     INNER JOIN usertab u ON u.uid = r.uid
+     WHERE r.uid = ?
+     LIMIT 1`,
     [uid]
   );
 
-  return parseRankRow(rows[0]).rank;
+  return rows[0] || null;
 }
 
-async function getCurrentRankMap(uidList) {
+function buildSnapshotFromStoredRow(row, definitions, pairing, achievements = []) {
+  const currentRank = Math.max(
+    toNumber(row?.highest_rank_no),
+    toNumber(row?.current_rank),
+    toNumber(row?.rank_level)
+  );
+  const nextRankRequirement = definitions.find((definition) => toNumber(definition.rank) > currentRank) || null;
+  const leftQualifiedCount = toNumber(row?.left_qualified_count);
+  const rightQualifiedCount = toNumber(row?.right_qualified_count);
+  const snapshot = {
+    uid: toNumber(row?.uid),
+    currentRank,
+    currentRankLabel: currentRank > 0 ? (RANK_REQUIREMENTS[currentRank]?.label || `Rank ${currentRank}`) : 'Unranked',
+    currentRankColor: rankColor(currentRank),
+    grossRankablePoints: toNumber(row?.basis_points),
+    consumedPoints: toNumber(row?.consumed_points),
+    remainingRankablePoints: toNumber(row?.remaining_rankable_points),
+    basisPoints: toNumber(row?.basis_points),
+    basisLabel: row?.basis_label || RANKING_BASIS_LABEL,
+    raceBasisMode: row?.race_basis_mode || RACE_BASIS_MODE,
+    rankDate: row?.race_last_awarded_at || row?.rank_date || row?.qualified_date || null,
+    raceLastAwardedAt: row?.race_last_awarded_at || row?.rank_date || row?.qualified_date || null,
+    leftQualifiedCount,
+    rightQualifiedCount,
+    leftRequirementMet: !nextRankRequirement || leftQualifiedCount >= toNumber(nextRankRequirement.left_rank_required),
+    rightRequirementMet: !nextRankRequirement || rightQualifiedCount >= toNumber(nextRankRequirement.right_rank_required),
+    nextRank: nextRankRequirement ? toNumber(nextRankRequirement.rank) : null,
+    nextRankRequirement,
+    achievements,
+    pendingAchievementCount: toNumber(row?.pending_achievement_count),
+    nextPendingRank: achievements.find((achievement) => achievement.achievementStatus !== 'paid') || null,
+    incentiveStatus: toNumber(row?.incentive_status),
+    rewardStatus: toNumber(row?.reward_status),
+    pairing,
+  };
+
+  return applyPackageRankingGateToSnapshot(snapshot, row?.currentaccttype, definitions, achievements);
+}
+
+async function refreshMemberRankSnapshot(uid) {
+  const memberUid = toNumber(uid);
+  if (memberRefreshPromises.has(memberUid)) {
+    return memberRefreshPromises.get(memberUid);
+  }
+
+  const refreshPromise = (async () => {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const snapshot = await rebuildRankSnapshot(memberUid, conn);
+      await conn.commit();
+      return snapshot;
+    } catch (error) {
+      try {
+        await conn.rollback();
+      } catch {}
+      throw error;
+    } finally {
+      conn.release();
+    }
+  })();
+
+  memberRefreshPromises.set(memberUid, refreshPromise);
+  try {
+    return await refreshPromise;
+  } finally {
+    memberRefreshPromises.delete(memberUid);
+  }
+}
+
+async function getCurrentRank(uid) {
+  await ensureRankingInfra();
+  const snapshot = await refreshMemberRankSnapshot(uid);
+  return toNumber(snapshot?.currentRank);
+}
+
+async function getRankProgress(uid) {
+  await ensureRankingInfra();
+  const memberUid = toNumber(uid);
+  const definitions = await getRankDefinitions();
+  const storedRow = await getStoredRankingRow(memberUid);
+
+  let snapshot;
+  if (!shouldRefreshRankState(storedRow)) {
+    const [pairing, achievements] = await Promise.all([
+      getLatestPairingSnapshot(memberUid),
+      getAchievementRowsForMember(memberUid),
+    ]);
+    snapshot = buildSnapshotFromStoredRow(storedRow, definitions, pairing, achievements);
+  } else {
+    snapshot = await refreshMemberRankSnapshot(memberUid);
+  }
+
+  const progress = !snapshot.rankingEligible
+    ? 0
+    : snapshot.nextRankRequirement
+    ? Math.min(100, (toNumber(snapshot.remainingRankablePoints) / toNumber(snapshot.nextRankRequirement.pointsRequired || 0)) * 100)
+    : 100;
+
+  const achievementsByRank = new Map(snapshot.achievements.map((achievement) => [toNumber(achievement.rank), achievement]));
+  const effectiveDefinitions = snapshot.rankDefinitions || filterRankDefinitionsForPackage(definitions, snapshot.packageType);
+
+  return {
+    uid: memberUid,
+    packageType: snapshot.packageType,
+    packageLabel: snapshot.packageLabel,
+    rankingEligible: snapshot.rankingEligible,
+    rankingEligibilityReason: snapshot.rankingEligibilityReason,
+    blockedByPackageGate: snapshot.blockedByPackageGate,
+    packageRankMax: snapshot.packageRankMax,
+    packageRankMaxLabel: snapshot.packageRankMaxLabel,
+    upgradeRequiredPackageType: snapshot.upgradeRequiredPackageType,
+    upgradeRequiredPackageLabel: snapshot.upgradeRequiredPackageLabel,
+    currentRank: snapshot.currentRank,
+    currentRankLabel: snapshot.currentRankLabel,
+    currentRankColor: snapshot.currentRankColor,
+    basisLabel: snapshot.basisLabel,
+    basisPoints: snapshot.basisPoints,
+    grossRankablePoints: snapshot.grossRankablePoints,
+    consumedPoints: snapshot.consumedPoints,
+    remainingRankablePoints: snapshot.remainingRankablePoints,
+    repurchasePoints: snapshot.grossRankablePoints,
+    binaryPoints: snapshot.pairing.binaryPoints,
+    qualifiedDate: snapshot.rankDate,
+    nextRank: snapshot.nextRank,
+    nextRankLabel: snapshot.nextRankRequirement?.rankName || 'Max Rank Achieved',
+    nextRankMinPoints: snapshot.nextRankRequirement?.pointsRequired || null,
+    nextRankRequirement: snapshot.nextRankRequirement,
+    leftRequirementMet: snapshot.leftRequirementMet,
+    rightRequirementMet: snapshot.rightRequirementMet,
+    progress: Number.isFinite(progress) ? Math.round(progress * 100) / 100 : 0,
+    left: {
+      count: snapshot.pairing.leftCount,
+      points: snapshot.pairing.leftPoints,
+      qualifiedCount: snapshot.leftQualifiedCount,
+    },
+    right: {
+      count: snapshot.pairing.rightCount,
+      points: snapshot.pairing.rightPoints,
+      qualifiedCount: snapshot.rightQualifiedCount,
+    },
+    achievements: snapshot.achievements.map((achievement) => ({
+      rank: toNumber(achievement.rank),
+      rankCode: achievement.rankCode,
+      rankName: achievement.rankName,
+      achievedAt: achievement.achievedAt,
+      status: achievement.achievementStatus,
+      cashIncentive: achievement.cashIncentive,
+      incentiveSummary: achievement.incentiveSummary,
+      fulfilledAt: achievement.fulfilledAt,
+    })),
+    pendingAchievementCount: snapshot.pendingAchievementCount,
+    nextPendingRank: snapshot.nextPendingRank,
+    incentiveStatus: snapshot.incentiveStatus,
+    rewardStatus: snapshot.rewardStatus,
+    incentives: snapshot.nextPendingRank?.incentiveSummary || snapshot.achievements.at(-1)?.incentiveSummary || 'N/A',
+    rankDefinitions: effectiveDefinitions,
+    ranks: effectiveDefinitions.map((definition) => {
+      const achievement = achievementsByRank.get(toNumber(definition.rank));
+      return {
+        rank: toNumber(definition.rank),
+        label: definition.rank_name,
+        minPoints: toNumber(definition.points_required),
+        qualified: Boolean(achievement),
+        qualifiedDate: achievement?.achievedAt || null,
+        status: achievement?.achievementStatus || 'locked',
+      };
+    }),
+  };
+}
+
+async function getCurrentRankMap(uidList, conn = pool) {
   if (!uidList || uidList.length === 0) return new Map();
 
-  const uniqueIds = [...new Set(uidList.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+  const uniqueIds = [...new Set(uidList.map((id) => toNumber(id)).filter((id) => id > 0))];
   if (uniqueIds.length === 0) return new Map();
 
   const placeholders = uniqueIds.map(() => '?').join(',');
-  const [rows] = await pool.query(
-    `SELECT uid, current_rank, rank_level
+  const [rows] = await conn.query(
+    `SELECT uid, GREATEST(COALESCE(highest_rank_no, 0), COALESCE(current_rank, 0), COALESCE(rank_level, 0)) AS rank_no
      FROM rankingstab
      WHERE uid IN (${placeholders})`,
     uniqueIds
   );
 
   const rankMap = new Map();
-  for (const row of rows) {
-    rankMap.set(Number(row.uid), Math.max(toNumber(row.current_rank), toNumber(row.rank_level)));
-  }
+  for (const row of rows) rankMap.set(toNumber(row.uid), toNumber(row.rank_no));
   return rankMap;
 }
 
-async function collectLegDownlineUids(uid) {
-  const [directRows] = await pool.query(
-    'SELECT uid, position FROM usertab WHERE refid = ?',
-    [uid]
+async function refreshRankingForest() {
+  await ensureRankingInfra();
+
+  const [rootRows] = await pool.query(
+    `SELECT u.uid
+     FROM usertab u
+     WHERE u.codeid = 1
+       AND u.uid = u.mainid
+       AND NOT EXISTS (
+         SELECT 1
+         FROM binary_tree_closuretab c
+         WHERE c.descendant_uid = u.uid
+           AND c.depth > 0
+       )
+     ORDER BY u.uid ASC`
   );
 
-  const queue = [];
-  const visited = new Set();
+  const roots = rootRows.map((row) => toNumber(row.uid)).filter((value) => value > 0);
+  if (roots.length === 0) return;
 
-  for (const row of directRows) {
-    const childUid = Number(row.uid);
-    if (!childUid || visited.has(childUid)) continue;
-    const side = Number(row.position) === 1 ? 'left' : 'right';
-    queue.push({ uid: childUid, side });
-    visited.add(childUid);
+  for (const rootUid of roots) {
+    await refreshMemberRankSnapshot(rootUid);
   }
-
-  const leftUids = [];
-  const rightUids = [];
-
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (current.side === 'left') leftUids.push(current.uid);
-    else rightUids.push(current.uid);
-
-    const [children] = await pool.query('SELECT uid FROM usertab WHERE refid = ?', [current.uid]);
-    for (const child of children) {
-      const childUid = Number(child.uid);
-      if (!childUid || visited.has(childUid)) continue;
-      queue.push({ uid: childUid, side: current.side });
-      visited.add(childUid);
-    }
-  }
-
-  return { leftUids, rightUids };
 }
 
-async function getLegQualification(uid, requiredRank) {
-  const { leftUids, rightUids } = await collectLegDownlineUids(uid);
-  const rankMap = await getCurrentRankMap([...leftUids, ...rightUids]);
-
-  let leftQualifiedCount = 0;
-  let rightQualifiedCount = 0;
-
-  for (const leftUid of leftUids) {
-    if (toNumber(rankMap.get(leftUid)) >= requiredRank) leftQualifiedCount += 1;
-  }
-  for (const rightUid of rightUids) {
-    if (toNumber(rankMap.get(rightUid)) >= requiredRank) rightQualifiedCount += 1;
-  }
-
-  return {
-    leftQualified: leftQualifiedCount > 0,
-    rightQualified: rightQualifiedCount > 0,
-    leftQualifiedCount,
-    rightQualifiedCount,
-  };
-}
-
-async function upsertRankState(uid, payload) {
-  await pool.query(
-    `INSERT INTO rankingstab (
-       uid, current_rank, rank_level, binary_points_total,
-       basis_points, basis_label,
-       left_qualified_count, right_qualified_count,
-       rank_date, qualified_date, incentive_status, reward_status
-     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-             CASE WHEN ? > 0 THEN NOW() ELSE NULL END,
-             CASE WHEN ? > 0 THEN NOW() ELSE NULL END,
-             0, 0)
-     ON DUPLICATE KEY UPDATE
-       current_rank = VALUES(current_rank),
-       rank_level = VALUES(rank_level),
-       binary_points_total = VALUES(binary_points_total),
-       basis_points = VALUES(basis_points),
-       basis_label = VALUES(basis_label),
-       left_qualified_count = VALUES(left_qualified_count),
-       right_qualified_count = VALUES(right_qualified_count),
-       rank_date = IF(VALUES(current_rank) > current_rank, NOW(), rank_date),
-       qualified_date = CASE
-         WHEN VALUES(current_rank) <= 0 AND current_rank <= 0 THEN NULL
-         WHEN VALUES(current_rank) > current_rank THEN NOW()
-         ELSE qualified_date
-       END,
-       last_calculated_at = NOW()`,
-    [
-      uid,
-      payload.currentRank,
-      payload.currentRank,
-      payload.binaryPoints,
-      payload.basisPoints,
-      payload.basisLabel,
-      payload.leftQualifiedCount,
-      payload.rightQualifiedCount,
-      payload.currentRank,
-      payload.currentRank,
-    ]
-  );
-}
-
-async function getRankState(uid) {
-  await ensureRankingTable();
-
-  const [rows] = await pool.query(
-    `SELECT current_rank, rank_level, incentive_status, reward_status,
-            rank_date, qualified_date
-     FROM rankingstab WHERE uid = ?`,
-    [uid]
-  );
-
-  return parseRankRow(rows[0]);
-}
-
-/**
- * Calculate rank progress for a member
- */
-async function getRankProgress(uid) {
-  await ensureRankingTable();
-
-  const pairing = await getLatestPairingSnapshot(uid);
-  const basis = await getRankingBasis(uid);
-  const totalPoints = basis.basisPoints;
-  const currentState = await getRankState(uid);
-  const currentRank = currentState.rank;
-
-  const legForS1 = await getLegQualification(uid, 1);
-  const legForS2 = await getLegQualification(uid, 2);
-
-  const isS1Qualified = totalPoints >= RANK_REQUIREMENTS[1].minPoints && legForS1.leftQualified && legForS1.rightQualified;
-  const isS2Qualified = totalPoints >= RANK_REQUIREMENTS[2].minPoints;
-  const isS3Qualified = totalPoints >= RANK_REQUIREMENTS[3].minPoints && legForS2.leftQualified && legForS2.rightQualified;
-
-  let newRank = 0;
-  if (isS1Qualified) newRank = 1;
-  if (isS1Qualified && isS2Qualified) newRank = 2;
-  if (isS1Qualified && isS2Qualified && isS3Qualified) newRank = 3;
-
-  const effectiveRank = Math.max(currentRank, newRank);
-  await upsertRankState(uid, {
-    currentRank: effectiveRank,
-    binaryPoints: totalPoints,
-    basisPoints: basis.basisPoints,
-    basisLabel: basis.basisLabel,
-    leftQualifiedCount: legForS1.leftQualifiedCount,
-    rightQualifiedCount: legForS1.rightQualifiedCount,
-  });
-
-  const finalState = await getRankState(uid);
-
-  // Determine next rank target
-  let nextRank = effectiveRank + 1;
-  if (nextRank > 3) nextRank = 3;
-
-  const nextReq = RANK_REQUIREMENTS[nextRank];
-  const progress = nextReq ? Math.min(100, (totalPoints / nextReq.minPoints) * 100) : 100;
-
-  // Next-rank leg check (only rank1 and rank3 have structure requirements).
-  let legStatus = { leftQualified: false, rightQualified: false };
-  if (nextRank === 1) {
-    legStatus = { leftQualified: legForS1.leftQualified, rightQualified: legForS1.rightQualified };
-  } else if (nextRank === 3) {
-    legStatus = { leftQualified: legForS2.leftQualified, rightQualified: legForS2.rightQualified };
-  }
-
-  const ranks = [1, 2, 3].map((rankNo) => ({
-    rank: rankNo,
-    label: RANK_REQUIREMENTS[rankNo].label,
-    minPoints: RANK_REQUIREMENTS[rankNo].minPoints,
-    qualified:
-      rankNo === 1 ? isS1Qualified :
-      rankNo === 2 ? (isS1Qualified && isS2Qualified) :
-      (isS1Qualified && isS2Qualified && isS3Qualified),
-    qualifiedDate: finalState.rankDate,
-  }));
-
-  return {
-    uid,
-    currentRank: effectiveRank,
-    currentRankLabel: RANK_REQUIREMENTS[effectiveRank]?.label || 'Unranked',
-    currentRankColor: RANK_REQUIREMENTS[effectiveRank]?.color || '#6B7280',
-    binaryPoints: totalPoints,
-    basisPoints: basis.basisPoints,
-    basisLabel: basis.basisLabel,
-    qualifiedDate: finalState.rankDate,
-    totalPoints,
-    left: {
-      count: pairing.leftCount,
-      points: pairing.leftPoints,
-      qualifiedS1: legForS1.leftQualified ? 1 : 0,
-      qualifiedS2: legForS2.leftQualified ? 1 : 0,
-    },
-    right: {
-      count: pairing.rightCount,
-      points: pairing.rightPoints,
-      qualifiedS1: legForS1.rightQualified ? 1 : 0,
-      qualifiedS2: legForS2.rightQualified ? 1 : 0,
-    },
-    ranks,
-    nextRank: effectiveRank < 3 ? effectiveRank + 1 : null,
-    nextRankLabel: effectiveRank < 3 ? RANK_REQUIREMENTS[effectiveRank + 1].label : 'Max Rank Achieved',
-    nextRankMinPoints: effectiveRank < 3 ? RANK_REQUIREMENTS[effectiveRank + 1].minPoints : null,
-    progress: Math.round(progress * 100) / 100,
-    legStatus,
-    incentives: RANK_INCENTIVES[effectiveRank] || 'N/A',
-    incentiveStatus: finalState.incentiveStatus,
-    rewardStatus: finalState.rewardStatus,
-  };
-}
-
-/**
- * Get all rankings for admin view
- */
 async function getAllRankings(page = 1, perPage = 30) {
-  await ensureRankingTable();
+  await ensureRankingInfra();
+  const definitions = await getRankDefinitions();
 
   const currentPage = Math.max(1, Number(page) || 1);
   const size = Math.min(100, Math.max(1, Number(perPage) || 30));
   const offset = (currentPage - 1) * size;
 
   const [countRows] = await pool.query(
-    `SELECT COUNT(*) as total
+    `SELECT COUNT(*) AS total
      FROM usertab u
-     WHERE u.codeid = 1 AND u.uid = u.mainid`
+     WHERE u.uid = u.mainid`
   );
-  const total = Number(countRows[0]?.total || 0);
+  const total = toNumber(countRows[0]?.total);
 
   const [rows] = await pool.query(
-    `SELECT u.uid, u.currentaccttype,
-            m.firstname, m.lastname, m.username,
-            COALESCE(r.current_rank, 0) AS current_rank,
-            COALESCE(r.rank_level, 0) AS rank_level,
-            COALESCE(r.basis_points, 0) AS db_basis_points,
-            r.basis_label,
-            r.rank_date, r.qualified_date,
-            COALESCE(r.incentive_status, 0) AS incentive_status,
-            COALESCE(r.reward_status, 0) AS reward_status,
-            r.last_calculated_at,
-            COALESCE(stats.max_left_points, 0) AS max_left_points,
-            COALESCE(stats.max_right_points, 0) AS max_right_points,
-            (COALESCE(stats.max_left_points, 0) + COALESCE(stats.max_right_points, 0)) AS live_basis_points
+    `SELECT
+        u.uid,
+        u.currentaccttype,
+        m.firstname,
+        m.lastname,
+        m.username,
+        COALESCE(r.current_rank, 0) AS current_rank,
+        COALESCE(r.rank_level, 0) AS rank_level,
+        COALESCE(r.highest_rank_no, 0) AS highest_rank_no,
+        COALESCE(r.basis_points, 0) AS basis_points,
+        COALESCE(r.consumed_points, 0) AS consumed_points,
+        COALESCE(r.remaining_rankable_points, 0) AS remaining_rankable_points,
+        COALESCE(r.pending_achievement_count, 0) AS pending_achievement_count,
+        r.basis_label,
+        r.rank_date,
+        r.qualified_date,
+        r.race_last_awarded_at,
+        r.last_calculated_at,
+        COALESCE(r.incentive_status, 0) AS incentive_status,
+        COALESCE(r.reward_status, 0) AS reward_status
      FROM usertab u
      INNER JOIN memberstab m ON m.uid = u.uid
      LEFT JOIN rankingstab r ON r.uid = u.uid
-     LEFT JOIN (
-       SELECT uid,
-              COALESCE(MAX(totalpointsleft), 0) AS max_left_points,
-              COALESCE(MAX(totalpointsright), 0) AS max_right_points
-         FROM pairingstab
-        GROUP BY uid
-     ) stats ON stats.uid = u.uid
-     WHERE u.codeid = 1 AND u.uid = u.mainid
-     ORDER BY live_basis_points DESC, u.uid ASC
+     WHERE u.uid = u.mainid
+     ORDER BY
+       GREATEST(COALESCE(r.highest_rank_no, 0), COALESCE(r.current_rank, 0), COALESCE(r.rank_level, 0)) DESC,
+       COALESCE(r.remaining_rankable_points, 0) DESC,
+       COALESCE(r.basis_points, 0) DESC,
+       COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') ASC,
+       u.uid ASC
      LIMIT ?, ?`,
     [offset, size]
   );
 
-  const hydratedRows = await Promise.all(rows.map(async (r, idx) => {
-    const needsRefresh = shouldRefreshRankState(r);
-    const progress = needsRefresh ? await getRankProgress(r.uid) : null;
-    const storedRank = Math.max(toNumber(r.current_rank), toNumber(r.rank_level));
-    const basisPoints = progress ? toNumber(progress.basisPoints) : toNumber(r.live_basis_points);
-    const effectiveRank = progress ? toNumber(progress.currentRank) : storedRank;
-    const qualifiedDate = effectiveRank > 0
-      ? (progress?.qualifiedDate || r.qualified_date || r.rank_date || null)
-      : null;
+  const hydrated = [];
+  for (const row of rows) {
+    const snapshot = applyPackageRankingGateToSnapshot({
+      currentRank: Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level)),
+      currentRankLabel: RANK_REQUIREMENTS[Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level))]?.label || 'Unranked',
+      currentRankColor: rankColor(Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level))),
+      grossRankablePoints: toNumber(row.basis_points),
+      consumedPoints: toNumber(row.consumed_points),
+      remainingRankablePoints: toNumber(row.remaining_rankable_points),
+      basisLabel: row.basis_label || RANKING_BASIS_LABEL,
+      rankDate: row.race_last_awarded_at || row.rank_date || row.qualified_date || null,
+      pendingAchievementCount: toNumber(row.pending_achievement_count),
+      incentiveStatus: toNumber(row.incentive_status),
+      rewardStatus: toNumber(row.reward_status),
+      nextPendingRank: null,
+      leftQualifiedCount: 0,
+      rightQualifiedCount: 0,
+      achievements: [],
+      pairing: { binaryPoints: 0, leftCount: 0, rightCount: 0, leftPoints: 0, rightPoints: 0 },
+    }, row.currentaccttype, definitions, []);
 
-    return {
-      uid: toNumber(r.uid),
-      firstname: r.firstname,
-      lastname: r.lastname,
-      username: r.username,
-      packageType: toNumber(r.currentaccttype),
-      packageLabel: PACKAGE_LABELS[toNumber(r.currentaccttype)] || 'Unknown',
-      basisPoints,
-      basisLabel: progress?.basisLabel || r.basis_label || 'Combined binary leg points',
-      binaryPoints: basisPoints,
-      current_rank: effectiveRank,
-      supervisorLevel: effectiveRank,
-      rankLabel: RANK_REQUIREMENTS[effectiveRank]?.label || 'Unranked',
-      rankColor: RANK_REQUIREMENTS[effectiveRank]?.color || '#6B7280',
-      incentives: RANK_INCENTIVES[effectiveRank] || 'N/A',
-      rank_date: qualifiedDate,
-      qualifiedDate,
-      incentive_status: progress ? toNumber(progress.incentiveStatus) : toNumber(r.incentive_status),
-      reward_status: progress ? toNumber(progress.rewardStatus) : toNumber(r.reward_status),
-      rewardStatus: progress ? toNumber(progress.rewardStatus) : toNumber(r.reward_status),
-      position: offset + idx + 1,
-    };
-  }));
+    hydrated.push({
+      uid: toNumber(row.uid),
+      firstname: row.firstname,
+      lastname: row.lastname,
+      username: row.username,
+      packageType: toNumber(row.currentaccttype),
+      packageLabel: snapshot.packageLabel,
+      rankingEligible: snapshot.rankingEligible,
+      rankingEligibilityReason: snapshot.rankingEligibilityReason,
+      blockedByPackageGate: snapshot.blockedByPackageGate,
+      packageRankMax: snapshot.packageRankMax,
+      packageRankMaxLabel: snapshot.packageRankMaxLabel,
+      upgradeRequiredPackageType: snapshot.upgradeRequiredPackageType,
+      upgradeRequiredPackageLabel: snapshot.upgradeRequiredPackageLabel,
+      current_rank: snapshot.currentRank,
+      currentRank: snapshot.currentRank,
+      rankLabel: snapshot.currentRankLabel,
+      currentRankLabel: snapshot.currentRankLabel,
+      rankColor: snapshot.currentRankColor,
+      basisPoints: snapshot.grossRankablePoints,
+      grossRankablePoints: snapshot.grossRankablePoints,
+      consumedPoints: snapshot.consumedPoints,
+      remainingRankablePoints: snapshot.remainingRankablePoints,
+      repurchasePoints: snapshot.grossRankablePoints,
+      pendingAchievementCount: snapshot.pendingAchievementCount,
+      qualifiedDate: snapshot.rankDate,
+      rank_date: snapshot.rankDate,
+      incentive_status: snapshot.incentiveStatus,
+      reward_status: snapshot.rewardStatus,
+    });
+  }
+
+  hydrated.sort((a, b) => {
+    if (toNumber(b.currentRank) !== toNumber(a.currentRank)) return toNumber(b.currentRank) - toNumber(a.currentRank);
+    if (toNumber(b.remainingRankablePoints) !== toNumber(a.remainingRankablePoints)) return toNumber(b.remainingRankablePoints) - toNumber(a.remainingRankablePoints);
+    if (toNumber(b.grossRankablePoints) !== toNumber(a.grossRankablePoints)) return toNumber(b.grossRankablePoints) - toNumber(a.grossRankablePoints);
+    const dateA = String(a.qualifiedDate || '9999-12-31 23:59:59');
+    const dateB = String(b.qualifiedDate || '9999-12-31 23:59:59');
+    const dateCompare = dateA.localeCompare(dateB);
+    if (dateCompare !== 0) return dateCompare;
+    return toNumber(a.uid) - toNumber(b.uid);
+  });
+
+  hydrated.forEach((row, index) => {
+    row.position = offset + index + 1;
+  });
 
   return {
-    rankings: hydratedRows,
+    rankings: hydrated,
     total,
     page: currentPage,
     totalPages: Math.max(1, Math.ceil(total / size)),
@@ -565,30 +1184,246 @@ async function getAllRankings(page = 1, perPage = 30) {
   };
 }
 
-/**
- * Process incentive claim (admin)
- */
-async function processIncentive(uid) {
+async function getRankCashIncentive(rankOrCode, conn = pool) {
+  const rankNo = toNumber(rankOrCode);
+  const fallback = rankNo > 0
+    ? (RANK_CASH_INCENTIVES[rankNo] || 0)
+    : (FULL_RANK_DEFINITIONS.find((row) => row.rank_code === String(rankOrCode || '').toLowerCase())?.cash_incentive || 0);
+
+  try {
+    if (rankNo > 0) {
+      const definitions = await getRankDefinitions(conn);
+      const match = definitions.find((definition) => toNumber(definition.rank) === rankNo);
+      return toNumber(match?.cash_incentive) || fallback;
+    }
+
+    const [rows] = await conn.query(
+      `SELECT cash_incentive
+       FROM rank_definitionstab
+       WHERE rank_code = ? AND is_active = 1
+       ORDER BY version DESC, sort_order ASC
+       LIMIT 1`,
+      [String(rankOrCode || '').toLowerCase()]
+    );
+
+    return toNumber(rows[0]?.cash_incentive) || fallback;
+  } catch (error) {
+    if (error.code === 'ER_NO_SUCH_TABLE' || error.code === 'ER_BAD_FIELD_ERROR') return fallback;
+    throw error;
+  }
+}
+
+async function processIncentive(uid, options = {}) {
   await ensureRankingTable();
 
-  const [result] = await pool.query(
-    `UPDATE rankingstab
-        SET incentive_status = 1,
-            reward_status = 1,
-            reward_claimed_date = NOW()
-      WHERE uid = ? AND (incentive_status = 0 OR reward_status = 0)`,
-    [uid]
-  );
-  return result.affectedRows > 0;
+  const memberUid = toNumber(uid);
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      `SELECT
+          ra.id,
+          ra.achievement_uid,
+          ra.member_uid,
+          ra.status,
+          rd.rank_code,
+          rd.rank_name,
+          rd.cash_incentive,
+          rd.incentive_summary,
+          rd.sort_order
+       FROM rank_achievementstab ra
+       INNER JOIN rank_definitionstab rd ON rd.definition_uid = ra.rank_definition_uid
+       WHERE ra.member_uid = ?
+         AND ra.status = 'pending_fulfillment'
+       ORDER BY rd.sort_order ASC, ra.sequence_id ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [memberUid]
+    );
+
+    const pending = rows[0];
+    if (!pending) {
+      await conn.rollback();
+      return { success: false };
+    }
+
+    const [memberRows] = await conn.query(
+      'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [memberUid]
+    );
+    const packageType = toNumber(memberRows[0]?.currentaccttype);
+    const definitions = await getRankDefinitions(conn);
+    const pendingRank = definitions.find((definition) => definition.rank_code === pending.rank_code)?.rank || 0;
+
+    if (!canReleaseRankAchievementForPackage(packageType, pendingRank)) {
+      await conn.rollback();
+      return {
+        success: false,
+        error: 'Ranking claim is blocked by the member package gate.',
+      };
+    }
+
+    const cashIncentive = toNumber(pending.cash_incentive);
+    const processKey = createProcessKey(['ranking-bonus', memberUid, pending.achievement_uid]);
+    const now = nowMySQL();
+    let beginningBalance = 0;
+    let endingBalance = 0;
+
+    if (cashIncentive > 0) {
+      const [walletRows] = await conn.query(
+        'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+        [memberUid]
+      );
+
+      beginningBalance = toNumber(walletRows[0]?.ttlcashbalance);
+      endingBalance = beginningBalance + cashIncentive;
+
+      await conn.query(
+        `INSERT INTO payouthistorytab
+         (pid, uid, mainid, beginningbalance, endingbalance, cashbalance,
+          income1, income2, income3, income4, income5, income6,
+          income7, income8, income9, income10,
+          encashment1, tax_1, encashment2, tax_2, encashmentfee, cddeduction,
+          cashstatus, transdate, transactiontype, stockistid, processid)
+         VALUES (NULL, ?, NULL, ?, ?, 0,
+          0, 0, 0, 0, 0, ?,
+          0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0,
+          0, ?, 1, 0, ?)`,
+        [memberUid, beginningBalance, endingBalance, cashIncentive, now, processKey]
+      );
+
+      await conn.query(
+        `INSERT INTO payouttotaltab
+         (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
+          ttlcashbalance, ttlpointsbalance, transdate)
+         VALUES (?, NULL, 0, 0, 0, 0, 0, 0, ?, ?, 0, ?)
+         ON DUPLICATE KEY UPDATE
+          ttlincome6 = ttlincome6 + VALUES(ttlincome6),
+          ttlcashbalance = VALUES(ttlcashbalance),
+          transdate = VALUES(transdate)`,
+        [memberUid, cashIncentive, endingBalance, now]
+      );
+
+      try {
+        await conn.query(
+          `INSERT INTO income_eventstab
+           (event_uid, process_key, beneficiary_uid, income_type, source_ref_uid, source_ref_type,
+            gross_amount, tax_deduction, processing_fee, cd_deduction, maintenance_fee,
+            net_amount, status, credited_at)
+           VALUES (?, ?, ?, 'ranking_bonus', ?, 'rank_achievementstab',
+            ?, 0, 0, 0, 0, ?, 'credited', CURRENT_TIMESTAMP(6))`,
+          [
+            createPublicId(),
+            processKey,
+            memberUid,
+            pending.achievement_uid,
+            cashIncentive,
+            cashIncentive,
+          ]
+        );
+      } catch (ledgerError) {
+        if (ledgerError.code !== 'ER_NO_SUCH_TABLE') throw ledgerError;
+      }
+    }
+
+    await conn.query(
+      `UPDATE rank_achievementstab
+          SET status = 'fulfilled',
+              fulfilled_at = NOW(),
+              admin_fulfilled_by = ?,
+              fulfillment_notes = ?
+        WHERE achievement_uid = ?`,
+      [
+        Number(options.adminUid) || null,
+        cashIncentive > 0 ? `Released ranking bonus cash via ${processKey}` : 'Marked fulfilled without cash incentive.',
+        pending.achievement_uid,
+      ]
+    );
+
+    const [pendingCountRows] = await conn.query(
+      `SELECT COUNT(*) AS total
+       FROM rank_achievementstab
+       WHERE member_uid = ?
+         AND status = 'pending_fulfillment'`,
+      [memberUid]
+    );
+    const pendingCount = toNumber(pendingCountRows[0]?.total);
+
+    await conn.query(
+      `UPDATE rankingstab
+          SET incentive_status = ?,
+              reward_status = ?,
+              pending_achievement_count = ?,
+              reward_claimed_date = NOW()
+        WHERE uid = ?`,
+      [pendingCount > 0 ? 0 : 1, pendingCount > 0 ? 0 : 1, pendingCount, memberUid]
+    );
+
+    await writeAuditLog(conn, {
+      req: options.req,
+      actorUid: Number(options.adminUid) || null,
+      actorRole: 'admin',
+      action: 'ranking.incentive.process',
+      targetUid: memberUid,
+      targetTable: 'rank_achievementstab',
+      targetId: pending.achievement_uid,
+      afterState: {
+        rankCode: pending.rank_code,
+        rankName: pending.rank_name,
+        cashIncentive,
+        beginningBalance,
+        endingBalance,
+        processKey,
+        pendingCountAfter: pendingCount,
+      },
+    });
+
+    await conn.commit();
+    return {
+      success: true,
+      rankCode: pending.rank_code,
+      rankName: pending.rank_name,
+      cashIncentive,
+      beginningBalance,
+      endingBalance,
+      processKey,
+      achievementUid: pending.achievement_uid,
+      pendingCountAfter: pendingCount,
+    };
+  } catch (error) {
+    try {
+      await conn.rollback();
+    } catch {}
+    throw error;
+  } finally {
+    conn.release();
+  }
 }
 
 module.exports = {
   ensureRankingTable,
+  getRankDefinitions,
+  getLatestPairingSnapshot,
+  getCurrentRank,
+  getCurrentRankMap,
   getRankProgress,
   getAllRankings,
+  getRankCashIncentive,
   processIncentive,
-  getCurrentRank,
-  getLatestPairingSnapshot,
+  refreshMemberRankSnapshot,
+  rebuildRankSnapshot,
+  shouldRefreshRankState,
+  buildSnapshotFromStoredRow,
+  normalizeRankDefinitions,
+  sumRepurchasePoints,
+  getPackageRankingPolicy,
+  filterRankDefinitionsForPackage,
+  canReleaseRankAchievementForPackage,
+  clampRankToPackage,
+  RANKING_BASIS_LABEL,
   RANK_REQUIREMENTS,
   RANK_INCENTIVES,
   PACKAGE_LABELS,

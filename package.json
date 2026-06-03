@@ -10,6 +10,7 @@
     "db:migrate": "node scripts/migrate.js",
     "db:backup-current": "node scripts/backupCurrentDb.js",
     "db:import-reference": "node scripts/importReferenceDb.js",
+    "db:replace-from-dump": "node scripts/replaceDbFromDump.js",
     "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
@@ -23,8 +24,11 @@
     "express-rate-limit": "^7.4.1",
     "express-session": "^1.18.1",
     "helmet": "^8.0.0",
+    "jsreport": "^4.13.0",
+    "jszip": "^3.10.1",
     "multer": "^2.1.1",
-    "mysql2": "^3.11.5"
+    "mysql2": "^3.11.5",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",

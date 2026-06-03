@@ -10,22 +10,28 @@
 const { pool } = require('../../config/database');
 const { getISOWeek } = require('../../utils/helpers');
 const { getEffectiveAccountState, countsForPairingSource } = require('../accountState');
+const {
+  getPackagePairingDepthLimit,
+  getPackagePairingWeeklyCap,
+  getPackagePairingMonthlyCap,
+  getPackageSealingPoint,
+  listPackagePolicies,
+} = require('../packagePolicy');
 
-// Weekly pairing caps by account type
-const PAIRING_CAPS = {
-  10: 10000,   // Bronze
-  20: 20000,   // Silver
-  30: 40000,   // Gold
-  40: 80000,   // Platinum
-  50: 150000,  // Garnet
-  60: 300000,  // Diamond
-};
+const PAIRING_CAPS = listPackagePolicies().reduce((caps, policy) => {
+  caps[policy.packageType] = Number(policy.pairingWeeklyCap || 0);
+  return caps;
+}, {});
 
 function normalizeToDay(dateValue) {
   if (!dateValue) return null;
   const day = String(dateValue).slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
   return day + ' 00:00:00';
+}
+
+function monthKeyForDate(dateValue) {
+  return String(dateValue).slice(0, 7);
 }
 
 async function getUpgradeAccounts(uid) {
@@ -82,8 +88,13 @@ async function getNumLevels(
   allDates,
   sideMap,
   memberAccttype,
-  totals
+  totals,
+  pairingDepthLimit
 ) {
+  if (pairingDepthLimit && level > pairingDepthLimit) {
+    return;
+  }
+
   const [rows] = await pool.query(
     `SELECT uid, refid, drefid, position, codeid, accttype, currentaccttype,
             cdamount, cdtotal, cdstatus, binarypoints,
@@ -142,7 +153,8 @@ async function getNumLevels(
       allDates,
       sideMap,
       memberAccttype,
-      totals
+      totals,
+      pairingDepthLimit
     );
   }
 }
@@ -152,15 +164,14 @@ async function getNumLevels(
  */
 function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals) {
   const sortedDates = Array.from(allDates).sort();
-  const maxPay = PAIRING_CAPS[accttype] || 10000;
+  const maxPay = getPackagePairingWeeklyCap(accttype) || 10000;
+  const monthCap = getPackagePairingMonthlyCap(accttype) || 0;
+  const sealingPoint = getPackageSealingPoint(accttype);
   let lcounter = 0;
   let rcounter = 0;
-
-  let startWeek = null;
-  let newbpay = 0;
   let ttlbpay = 0;
-  let ttlbpayTemp = 0;
-  let weekBpay = 0;
+  const weeklyCredits = new Map();
+  const monthlyCredits = new Map();
 
   const dailyReports = [];
 
@@ -201,60 +212,22 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
     }
 
     const transWeek = Number(getISOWeek(date));
-    if (startWeek === null) {
-      startWeek = transWeek;
-    }
-
-    let newBpayRecord = 0;
+    const monthKey = monthKeyForDate(date);
     const bpay = Number(ttlcounter || 0);
+    const weekKey = `${String(date).slice(0, 4)}-W${String(transWeek).padStart(2, '0')}`;
+    const weekRemaining = Math.max(0, maxPay - Number(weeklyCredits.get(weekKey) || 0));
+    const monthRemaining = monthCap > 0
+      ? Math.max(0, monthCap - Number(monthlyCredits.get(monthKey) || 0))
+      : bpay;
+    const weeklyCredited = Math.min(bpay, weekRemaining, monthRemaining);
+    const sealingRemaining = sealingPoint > 0 ? Math.max(0, sealingPoint - ttlbpay) : weeklyCredited;
+    const newBpayRecord = sealingPoint > 0 ? Math.min(weeklyCredited, sealingRemaining) : weeklyCredited;
 
-    if (startWeek === transWeek) {
-      newbpay += bpay;
-
-      if (newbpay < maxPay && weekBpay < maxPay) {
-        ttlbpay += bpay;
-        ttlbpayTemp += bpay;
-        weekBpay += bpay;
-        newBpayRecord = bpay;
-      } else if (newbpay >= maxPay && weekBpay < maxPay) {
-        ttlbpayTemp += bpay;
-
-        if (ttlbpayTemp >= maxPay) {
-          const newMaxPay = maxPay - weekBpay;
-          if (newMaxPay > 0) {
-            ttlbpay += newMaxPay;
-            weekBpay += newMaxPay;
-            newBpayRecord = newMaxPay;
-          }
-        } else {
-          const newMaxPay = maxPay - ttlbpayTemp;
-          if (newMaxPay > 0) {
-            ttlbpay += newMaxPay;
-            weekBpay += newMaxPay;
-            newBpayRecord = newMaxPay;
-          }
-        }
-      }
-    } else {
-      newbpay = 0;
-      ttlbpayTemp = 0;
-      weekBpay = 0;
-
-      newbpay += bpay;
-      if (newbpay < maxPay) {
-        ttlbpay += bpay;
-        ttlbpayTemp += bpay;
-        weekBpay += bpay;
-        newBpayRecord = bpay;
-      } else {
-        ttlbpay += maxPay;
-        ttlbpayTemp += maxPay;
-        weekBpay += maxPay;
-        newBpayRecord = maxPay;
-      }
+    weeklyCredits.set(weekKey, Number(weeklyCredits.get(weekKey) || 0) + newBpayRecord);
+    if (monthCap > 0) {
+      monthlyCredits.set(monthKey, Number(monthlyCredits.get(monthKey) || 0) + newBpayRecord);
     }
-
-    startWeek = transWeek;
+    ttlbpay += newBpayRecord;
 
     if (reportLeft >= 1 || reportRight >= 1) {
       dailyReports.push({
@@ -282,6 +255,23 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
  * @returns {{ totalPay, leftCount, leftPts, rightCount, rightPts, pairedPts }} Pairing result
  */
 async function getPairing(uid, accttype) {
+  const ownerAccount = await getEffectiveAccountState(uid);
+  if (!ownerAccount) {
+    return {
+      totalPay: 0,
+      leftCount: 0,
+      leftPts: 0,
+      rightCount: 0,
+      rightPts: 0,
+      pairedPts: 0,
+      dailyReports: [],
+    };
+  }
+
+  // Production pairing payout is driven by whether descendant source nodes are
+  // pairing-eligible. An unpaid CD owner cannot pass their own BP upward, but
+  // can still receive pairing from eligible downlines on both legs.
+
   const leftPoints = [];
   const rightPoints = [];
   const allDates = new Set();
@@ -292,8 +282,9 @@ async function getPairing(uid, accttype) {
     totalright: 0,
     totalpointsright: 0,
   };
+  const pairingDepthLimit = getPackagePairingDepthLimit(accttype);
 
-  await getNumLevels(uid, 1, leftPoints, rightPoints, allDates, sideMap, accttype, totals);
+  await getNumLevels(uid, 1, leftPoints, rightPoints, allDates, sideMap, accttype, totals, pairingDepthLimit);
 
   if (allDates.size === 0) {
     return {
@@ -447,4 +438,4 @@ async function savePairingReport(uid, reports) {
   }
 }
 
-module.exports = { getPairing, getPairingReport, savePairingReport, PAIRING_CAPS };
+module.exports = { getPairing, getPairingReport, savePairingReport, totalPairingAmount, PAIRING_CAPS };
