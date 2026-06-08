@@ -59,6 +59,24 @@ async function ensureGlobalBonusTables() {
   await assertSchemaRequirements(SCHEMA_REQUIREMENTS.GLOBAL_BONUS, 'Global bonus');
 
   await pool.query(
+    `CREATE TABLE IF NOT EXISTS globalbonus_override_tab (
+      id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      uid INT NOT NULL,
+      period_scope VARCHAR(16) NOT NULL DEFAULT 'annual',
+      period_month INT NOT NULL DEFAULT 0,
+      period_year INT NOT NULL,
+      status INT NOT NULL DEFAULT 1,
+      manual_entry TINYINT(1) NOT NULL DEFAULT 0,
+      portions FLOAT NOT NULL DEFAULT 0,
+      member_type VARCHAR(60) DEFAULT NULL,
+      created_date DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_date DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      processid VARCHAR(30) DEFAULT NULL,
+      UNIQUE KEY uq_globalbonus_override_period_member (uid, period_scope, period_month, period_year)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+  );
+
+  await pool.query(
     `UPDATE globalbonus_poolstab
      SET period_scope = CASE
        WHEN COALESCE(period_month, 0) = 0 THEN 'annual'
@@ -76,6 +94,12 @@ async function ensureGlobalBonusTables() {
      WHERE period_scope IS NULL OR period_scope = ''`
   ).catch(() => {});
 }
+
+const GLOBAL_BONUS_OVERRIDE_STATUS = {
+  ACTIVE: 1,
+  REMOVED: 2,
+  FROZEN: 3,
+};
 
 async function getRankingMap() {
   const exists = await tableExists('rankingstab');
@@ -172,25 +196,79 @@ async function getAnnualNetSales(year) {
 
 async function getEligibleMemberRows() {
   const [rows] = await pool.query(
-    `SELECT uid, currentaccttype, stockistid
+    `SELECT u.uid, u.currentaccttype, u.stockistid,
+            m.username, m.firstname, m.lastname
      FROM usertab
-     WHERE uid = mainid`
+     LEFT JOIN memberstab m ON m.uid = u.uid
+     WHERE u.uid = u.mainid`
   );
   return rows;
 }
 
-async function calculateGlobalBonus(yearInput) {
+async function getGlobalBonusOverrides(yearInput) {
   await ensureGlobalBonusTables();
+  const year = normalizeAnnualYear(yearInput);
+  const [rows] = await pool.query(
+    `SELECT o.id, o.uid, o.period_year, o.status, o.manual_entry, o.portions, o.member_type,
+            o.created_date, o.updated_date, o.processid,
+            u.currentaccttype, u.stockistid,
+            m.username, m.firstname, m.lastname
+       FROM globalbonus_override_tab o
+       LEFT JOIN usertab u ON u.uid = o.uid
+       LEFT JOIN memberstab m ON m.uid = o.uid
+      WHERE o.period_scope = 'annual' AND o.period_year = ? AND COALESCE(o.period_month, 0) = 0
+      ORDER BY o.updated_date DESC, o.id DESC`,
+    [year]
+  );
+  return rows.map((row) => ({
+    id: Number(row.id),
+    uid: Number(row.uid),
+    year: Number(row.period_year),
+    status: Number(row.status || 0),
+    manualEntry: Number(row.manual_entry || 0) === 1,
+    portions: Number(row.portions || 0),
+    memberType: row.member_type || null,
+    createdDate: row.created_date,
+    updatedDate: row.updated_date,
+    processId: row.processid || null,
+    currentaccttype: Number(row.currentaccttype || 0),
+    stockistid: Number(row.stockistid || 0),
+    username: row.username || '',
+    fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+  }));
+}
+
+function mapRecipientForResponse(row, extra = {}) {
+  return {
+    uid: Number(row.uid),
+    username: row.username || '',
+    fullname: row.fullname || '',
+    memberType: row.memberType || null,
+    portions: Number(row.portions || 0),
+    shareAmount: toMoney(row.shareAmount || 0),
+    labels: Array.isArray(row.labels) ? row.labels : [],
+    source: row.source || 'qualified',
+    adminState: extra.adminState || 'active',
+    adminStatus: extra.adminStatus || GLOBAL_BONUS_OVERRIDE_STATUS.ACTIVE,
+    manualEntry: Boolean(extra.manualEntry),
+    distributedDate: row.distributedDate || null,
+  };
+}
+
+async function calculateGlobalBonus(yearInput, options = {}) {
+  await ensureGlobalBonusTables();
+  const { includeManagement = false } = options;
   const year = assertClosedDistributionYear(yearInput);
-  const [totalNetSales, rankMap, members] = await Promise.all([
+  const [totalNetSales, rankMap, members, overrides] = await Promise.all([
     getAnnualNetSales(year),
     getRankingMap(),
     getEligibleMemberRows(),
+    getGlobalBonusOverrides(year),
   ]);
 
   const bonusPool = toMoney(totalNetSales * 0.02);
-  const recipients = [];
-  let totalPortions = 0;
+  const recipientMap = new Map();
+  const excludedMap = new Map();
 
   for (const member of members) {
     const uid = Number(member.uid);
@@ -198,20 +276,99 @@ async function calculateGlobalBonus(yearInput) {
     const detail = getPortionDetails(member, rankLevel);
     if (detail.portions <= 0) continue;
 
-    totalPortions += detail.portions;
-    recipients.push({
+    recipientMap.set(uid, {
       uid,
+      username: member.username || '',
+      fullname: `${member.firstname || ''} ${member.lastname || ''}`.trim(),
       portions: detail.portions,
       memberType: detail.memberType,
       labels: detail.labels,
       rankLevel,
+      source: 'qualified',
     });
   }
 
+  for (const override of overrides) {
+    const baseCandidate = recipientMap.get(override.uid);
+    const effectiveLabels = baseCandidate?.labels || [];
+    const effectiveMemberType = override.memberType || baseCandidate?.memberType || 'Manual Include';
+
+    if (override.manualEntry) {
+      if (override.status === GLOBAL_BONUS_OVERRIDE_STATUS.ACTIVE) {
+        recipientMap.set(override.uid, {
+          uid: override.uid,
+          username: override.username || baseCandidate?.username || '',
+          fullname: override.fullname || baseCandidate?.fullname || '',
+          portions: Math.max(0, Number(override.portions || 0)),
+          memberType: effectiveMemberType,
+          labels: effectiveLabels.length ? effectiveLabels : ['Manual Include'],
+          rankLevel: baseCandidate?.rankLevel || 0,
+          source: 'manual',
+        });
+      } else {
+        recipientMap.delete(override.uid);
+        excludedMap.set(override.uid, {
+          uid: override.uid,
+          username: override.username || baseCandidate?.username || '',
+          fullname: override.fullname || baseCandidate?.fullname || '',
+          portions: Number(override.portions || baseCandidate?.portions || 0),
+          memberType: effectiveMemberType,
+          labels: effectiveLabels.length ? effectiveLabels : ['Manual Include'],
+          source: 'manual',
+          adminState: override.status === GLOBAL_BONUS_OVERRIDE_STATUS.FROZEN ? 'frozen' : 'removed',
+          adminStatus: override.status,
+          manualEntry: true,
+        });
+      }
+      continue;
+    }
+
+    if (override.status === GLOBAL_BONUS_OVERRIDE_STATUS.REMOVED || override.status === GLOBAL_BONUS_OVERRIDE_STATUS.FROZEN) {
+      const previous = recipientMap.get(override.uid) || {
+        uid: override.uid,
+        username: override.username || '',
+        fullname: override.fullname || '',
+        portions: Number(override.portions || 0),
+        memberType: effectiveMemberType,
+        labels: effectiveLabels,
+        source: 'qualified',
+      };
+      recipientMap.delete(override.uid);
+      excludedMap.set(override.uid, {
+        ...previous,
+        adminState: override.status === GLOBAL_BONUS_OVERRIDE_STATUS.FROZEN ? 'frozen' : 'removed',
+        adminStatus: override.status,
+        manualEntry: false,
+      });
+    } else if (baseCandidate) {
+      recipientMap.set(override.uid, {
+        ...baseCandidate,
+        portions: Number(override.portions || baseCandidate.portions || 0),
+        memberType: effectiveMemberType,
+      });
+    }
+  }
+
+  const recipients = Array.from(recipientMap.values());
+  let totalPortions = recipients.reduce((sum, row) => sum + Number(row.portions || 0), 0);
   const perPortionValue = totalPortions > 0 ? toMoney(bonusPool / totalPortions) : 0;
   for (const row of recipients) {
     row.shareAmount = toMoney(perPortionValue * Number(row.portions || 0));
   }
+
+  const managementRows = includeManagement
+    ? [
+      ...recipients.map((row) => mapRecipientForResponse(row, {
+        adminState: 'active',
+        adminStatus: GLOBAL_BONUS_OVERRIDE_STATUS.ACTIVE,
+        manualEntry: row.source === 'manual',
+      })),
+      ...Array.from(excludedMap.values()).map((row) => mapRecipientForResponse(row, row)),
+    ].sort((a, b) => {
+      if (a.adminState !== b.adminState) return a.adminState.localeCompare(b.adminState);
+      return (a.fullname || a.username || '').localeCompare(b.fullname || b.username || '');
+    })
+    : [];
 
   return {
     periodScope: 'annual',
@@ -225,6 +382,7 @@ async function calculateGlobalBonus(yearInput) {
     recipientCount: recipients.length,
     canDistribute: true,
     recipients,
+    managementRows,
   };
 }
 
@@ -433,7 +591,7 @@ async function getGlobalBonusReport(yearInput, pageInput = 1, perPageInput = 30)
 
   const [poolRecord, preview, countRows, rows] = await Promise.all([
     getPoolRecord(year),
-    calculateGlobalBonus(year).catch((error) => {
+    calculateGlobalBonus(year, { includeManagement: true }).catch((error) => {
       if (String(error.message || '').includes('fully completed year')) {
         return {
           periodScope: 'annual',
@@ -448,6 +606,7 @@ async function getGlobalBonusReport(yearInput, pageInput = 1, perPageInput = 30)
           canDistribute: false,
           blockedReason: error.message,
           recipients: [],
+          managementRows: [],
         };
       }
       throw error;
@@ -486,11 +645,260 @@ async function getGlobalBonusReport(yearInput, pageInput = 1, perPageInput = 30)
       shareAmount: toMoney(row.share_amount),
       distributedDate: row.distributed_date,
     })),
+    managementRecipients: preview.managementRows || [],
     total,
     page,
     totalPages: Math.max(1, Math.ceil(total / perPage)),
     canDistribute: year < getCurrentYear(),
   };
+}
+
+async function getGlobalBonusMemberByUsername(username) {
+  const trimmed = String(username || '').trim();
+  if (!trimmed) {
+    throw new Error('Username is required.');
+  }
+
+  const [rows] = await pool.query(
+    `SELECT u.uid, u.currentaccttype, u.stockistid, m.username, m.firstname, m.lastname
+       FROM usertab u
+       INNER JOIN memberstab m ON m.uid = u.uid
+      WHERE u.uid = u.mainid AND m.username = ?
+      LIMIT 1`,
+    [trimmed]
+  );
+
+  if (!rows.length) {
+    throw new Error('Member not found.');
+  }
+
+  const row = rows[0];
+  return {
+    uid: Number(row.uid),
+    currentaccttype: Number(row.currentaccttype || 0),
+    stockistid: Number(row.stockistid || 0),
+    username: row.username || '',
+    fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+  };
+}
+
+async function getGlobalBonusMemberByUid(uid) {
+  const memberUid = Number(uid);
+  if (!memberUid) {
+    throw new Error('Member uid is required.');
+  }
+
+  const [rows] = await pool.query(
+    `SELECT u.uid, u.currentaccttype, u.stockistid, m.username, m.firstname, m.lastname
+       FROM usertab u
+       INNER JOIN memberstab m ON m.uid = u.uid
+      WHERE u.uid = u.mainid AND u.uid = ?
+      LIMIT 1`,
+    [memberUid]
+  );
+
+  if (!rows.length) {
+    throw new Error('Member not found.');
+  }
+
+  const row = rows[0];
+  return {
+    uid: Number(row.uid),
+    currentaccttype: Number(row.currentaccttype || 0),
+    stockistid: Number(row.stockistid || 0),
+    username: row.username || '',
+    fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+  };
+}
+
+async function searchGlobalBonusMembers(query, yearInput) {
+  const year = assertClosedDistributionYear(yearInput);
+  const term = `%${String(query || '').trim()}%`;
+  if (term === '%%') return [];
+
+  const rankMap = await getRankingMap();
+  const [rows] = await pool.query(
+    `SELECT u.uid, u.currentaccttype, u.stockistid, m.username, m.firstname, m.lastname
+       FROM usertab u
+       INNER JOIN memberstab m ON m.uid = u.uid
+      WHERE u.uid = u.mainid
+        AND (m.username LIKE ? OR CONCAT_WS(' ', m.firstname, m.lastname) LIKE ?)
+      ORDER BY m.username ASC
+      LIMIT 20`,
+    [term, term]
+  );
+
+  const overrides = await getGlobalBonusOverrides(year);
+  const overrideMap = new Map(overrides.map((row) => [row.uid, row]));
+
+  return rows.map((row) => {
+    const uid = Number(row.uid);
+    const detail = getPortionDetails(row, rankMap.get(uid) || 0);
+    const override = overrideMap.get(uid);
+    return {
+      uid,
+      username: row.username || '',
+      fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+      suggestedPortions: detail.portions,
+      suggestedMemberType: detail.memberType,
+      labels: detail.labels,
+      isQualified: detail.portions > 0,
+      overrideStatus: override ? Number(override.status || 0) : null,
+      manualEntry: override ? Boolean(override.manualEntry) : false,
+    };
+  });
+}
+
+async function addGlobalBonusMember(yearInput, payload = {}, processId = 'admin') {
+  await ensureGlobalBonusTables();
+  const year = assertClosedDistributionYear(yearInput);
+  const member = payload.uid
+    ? await getGlobalBonusMemberByUid(payload.uid)
+    : await getGlobalBonusMemberByUsername(payload.username);
+
+  const portions = Math.max(1, Number(payload.portions || 1));
+  const memberType = String(payload.memberType || 'Manual Include').trim().slice(0, 60) || 'Manual Include';
+
+  await pool.query(
+    `INSERT INTO globalbonus_override_tab
+      (uid, period_scope, period_month, period_year, status, manual_entry, portions, member_type, processid)
+     VALUES (?, 'annual', 0, ?, ?, 1, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+      status = VALUES(status),
+      manual_entry = 1,
+      portions = VALUES(portions),
+      member_type = VALUES(member_type),
+      processid = VALUES(processid)`,
+    [
+      member.uid,
+      year,
+      GLOBAL_BONUS_OVERRIDE_STATUS.ACTIVE,
+      portions,
+      memberType,
+      processId,
+    ]
+  );
+
+  return { year, uid: member.uid, username: member.username, portions, memberType };
+}
+
+async function removeGlobalBonusMember(yearInput, uid, processId = 'admin') {
+  await ensureGlobalBonusTables();
+  const year = assertClosedDistributionYear(yearInput);
+  const memberUid = Number(uid);
+  if (!memberUid) throw new Error('Member uid is required.');
+
+  const overrides = await getGlobalBonusOverrides(year);
+  const existing = overrides.find((row) => row.uid === memberUid);
+  if (existing?.manualEntry) {
+    await pool.query(
+      `DELETE FROM globalbonus_override_tab
+       WHERE uid = ? AND period_scope = 'annual' AND period_year = ? AND COALESCE(period_month, 0) = 0`,
+      [memberUid, year]
+    );
+    return { year, uid: memberUid, action: 'deleted-manual-entry' };
+  }
+
+  const rankMap = await getRankingMap();
+  const member = await getGlobalBonusMemberByUid(memberUid);
+  const detail = getPortionDetails(member, rankMap.get(memberUid) || 0);
+
+  await pool.query(
+    `INSERT INTO globalbonus_override_tab
+      (uid, period_scope, period_month, period_year, status, manual_entry, portions, member_type, processid)
+     VALUES (?, 'annual', 0, ?, ?, 0, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+      status = VALUES(status),
+      manual_entry = 0,
+      portions = VALUES(portions),
+      member_type = VALUES(member_type),
+      processid = VALUES(processid)`,
+    [
+      memberUid,
+      year,
+      GLOBAL_BONUS_OVERRIDE_STATUS.REMOVED,
+      Math.max(0, Number(detail.portions || 0)),
+      detail.memberType,
+      processId,
+    ]
+  );
+
+  return { year, uid: memberUid, action: 'removed' };
+}
+
+async function freezeGlobalBonusMember(yearInput, uid, processId = 'admin') {
+  await ensureGlobalBonusTables();
+  const year = assertClosedDistributionYear(yearInput);
+  const memberUid = Number(uid);
+  if (!memberUid) throw new Error('Member uid is required.');
+
+  const overrides = await getGlobalBonusOverrides(year);
+  const existing = overrides.find((row) => row.uid === memberUid);
+  if (existing?.manualEntry) {
+    await pool.query(
+      `UPDATE globalbonus_override_tab
+          SET status = ?, processid = ?
+        WHERE uid = ? AND period_scope = 'annual' AND period_year = ? AND COALESCE(period_month, 0) = 0`,
+      [GLOBAL_BONUS_OVERRIDE_STATUS.FROZEN, processId, memberUid, year]
+    );
+    return { year, uid: memberUid, action: 'frozen-manual-entry' };
+  }
+
+  const rankMap = await getRankingMap();
+  const member = await getGlobalBonusMemberByUid(memberUid);
+  const detail = getPortionDetails(member, rankMap.get(memberUid) || 0);
+
+  await pool.query(
+    `INSERT INTO globalbonus_override_tab
+      (uid, period_scope, period_month, period_year, status, manual_entry, portions, member_type, processid)
+     VALUES (?, 'annual', 0, ?, ?, 0, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+      status = VALUES(status),
+      manual_entry = 0,
+      portions = VALUES(portions),
+      member_type = VALUES(member_type),
+      processid = VALUES(processid)`,
+    [
+      memberUid,
+      year,
+      GLOBAL_BONUS_OVERRIDE_STATUS.FROZEN,
+      Math.max(0, Number(detail.portions || 0)),
+      detail.memberType,
+      processId,
+    ]
+  );
+
+  return { year, uid: memberUid, action: 'frozen' };
+}
+
+async function unfreezeGlobalBonusMember(yearInput, uid, processId = 'admin') {
+  await ensureGlobalBonusTables();
+  const year = assertClosedDistributionYear(yearInput);
+  const memberUid = Number(uid);
+  if (!memberUid) throw new Error('Member uid is required.');
+
+  const overrides = await getGlobalBonusOverrides(year);
+  const existing = overrides.find((row) => row.uid === memberUid);
+  if (!existing) {
+    return { year, uid: memberUid, action: 'noop' };
+  }
+
+  if (existing.manualEntry) {
+    await pool.query(
+      `UPDATE globalbonus_override_tab
+          SET status = ?, processid = ?
+        WHERE uid = ? AND period_scope = 'annual' AND period_year = ? AND COALESCE(period_month, 0) = 0`,
+      [GLOBAL_BONUS_OVERRIDE_STATUS.ACTIVE, processId, memberUid, year]
+    );
+    return { year, uid: memberUid, action: 'unfrozen-manual-entry' };
+  }
+
+  await pool.query(
+    `DELETE FROM globalbonus_override_tab
+      WHERE uid = ? AND period_scope = 'annual' AND period_year = ? AND COALESCE(period_month, 0) = 0`,
+    [memberUid, year]
+  );
+  return { year, uid: memberUid, action: 'unfrozen' };
 }
 
 module.exports = {
@@ -501,6 +909,12 @@ module.exports = {
   getGlobalBonusReport,
   getPoolRecord,
   getLatestPoolRecord,
+  getGlobalBonusOverrides,
+  searchGlobalBonusMembers,
+  addGlobalBonusMember,
+  removeGlobalBonusMember,
+  freezeGlobalBonusMember,
+  unfreezeGlobalBonusMember,
   normalizeAnnualYear,
   assertClosedDistributionYear,
   getLastClosedYear,

@@ -549,6 +549,8 @@ async function registerMember({
     const newUid = await generateUID();
     const newCountId = await getNextCountId();
     const { cdAmount, cdTotal, cdStatus } = deriveRegistrationCdState(codeData);
+    const memberPublicId = createPublicId();
+    const memberReferralSlug = createReferralSlug(8);
     const now = getOffsetTimestamp();
 
     await conn.query(
@@ -568,14 +570,14 @@ async function registerMember({
 
     const hashedPassword = await bcrypt.hash(password, 12);
     await conn.query(
-      `INSERT INTO memberstab (id, uid, username, password, firstname, lastname, middlename, tin, email, address, contactnos, dob)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [newCountId, newUid, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin || null, normalizedEmail.slice(0, 180), normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
+      `INSERT INTO memberstab (id, uid, public_id, referral_slug, username, password, firstname, lastname, middlename, tin, email, address, contactnos, dob)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newCountId, newUid, memberPublicId, memberReferralSlug, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin || null, normalizedEmail.slice(0, 180), normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
     );
 
     await conn.query(
       'UPDATE usertab SET public_uid = ?, referral_slug = ? WHERE uid = ? LIMIT 1',
-      [createPublicId(), createReferralSlug(8), newUid]
+      [memberPublicId, memberReferralSlug, newUid]
     ).catch(() => {});
 
     await conn.query(
