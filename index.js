@@ -290,6 +290,10 @@ app.use('/api/events', require('./routes/events'));
 app.use('/api/applications', require('./routes/applications').router);
 
 // Admin routes
+// readonlyGuard blocks all non-GET requests for accounts with role='readonly'
+const { readonlyGuard } = require('./middleware/auth');
+app.use('/api/admin', readonlyGuard);
+
 app.use('/api/admin/auth', require('./routes/admin/auth'));
 app.use('/api/admin/dashboard', require('./routes/admin/dashboard'));
 app.use('/api/admin/accounts', require('./routes/admin/accounts'));
@@ -307,6 +311,7 @@ app.use('/api/admin/messages', require('./routes/admin/messages'));
 app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 app.use('/api/admin/finance', require('./routes/admin/finance'));
 app.use('/api/admin/applications', require('./routes/admin/applications'));
+app.use('/api/admin/view-as', require('./routes/admin/viewAs'));
 
 app.get('/health', (_req, res) => {
   res.json({

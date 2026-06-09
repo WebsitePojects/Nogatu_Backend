@@ -27,7 +27,7 @@ router.post('/login', async (req, res) => {
     }
 
     const [rows] = await pool.query(
-      'SELECT id, username, password, name, rights FROM accesstab WHERE username = ?',
+      'SELECT id, username, password, name, rights, role FROM accesstab WHERE username = ?',
       [username]
     );
 
@@ -88,6 +88,7 @@ router.post('/login', async (req, res) => {
     req.session.adminid = admin.username;
     req.session.adminname = admin.name;
     req.session.adminrights = admin.rights;
+    req.session.adminrole = admin.role || 'admin';
     delete req.session.uid;
     delete req.session.publicUid;
     delete req.session.username;
@@ -114,6 +115,7 @@ router.post('/login', async (req, res) => {
         name: admin.name,
         rights: admin.rights,
         rightsName: admin.rights === 1 ? 'Administrator' : admin.rights === 2 ? 'Cashier' : 'BOD',
+        role: admin.role || 'admin',
       },
     });
   } catch (err) {
@@ -142,6 +144,7 @@ router.get('/session', (req, res) => {
         username: req.session.adminid,
         name: req.session.adminname,
         rights: req.session.adminrights,
+        role: req.session.adminrole || 'admin',
       },
     });
   } else {

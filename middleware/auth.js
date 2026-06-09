@@ -70,6 +70,17 @@ function adminRights(allowedRights) {
   };
 }
 
+// Blocks all non-GET requests for readonly admin accounts.
+// Mount this BEFORE admin routes in index.js.
+function readonlyGuard(req, res, next) {
+  if (req.session?.adminrole !== 'readonly') return next();
+  if (req.method === 'GET') return next();
+  return res.status(403).json({
+    error: 'This account is read-only. No changes can be made.',
+    code: 'READONLY_ACCOUNT',
+  });
+}
+
 function requireSelfParam(paramName = 'uid') {
   return (req, res, next) => {
     const requestedUid = Number(req.params[paramName] || req.query[paramName] || req.body[paramName]);
@@ -90,4 +101,4 @@ function adminOrMemberSelf(paramName = 'uid') {
   };
 }
 
-module.exports = { memberAuth, adminAuth, adminRights, requireSelfParam, adminOrMemberSelf };
+module.exports = { memberAuth, adminAuth, adminRights, readonlyGuard, requireSelfParam, adminOrMemberSelf };
