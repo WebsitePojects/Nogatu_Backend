@@ -453,7 +453,7 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
         row.ledgerUid,
         row.grossIncome,
         row.creditedIncome,
-        row.pairedAt,
+        String(row.pairedAt).slice(0, 19).replace('T', ' '),
       ];
       try {
         await conn.query(
