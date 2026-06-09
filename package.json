@@ -9,6 +9,8 @@
     "test": "node --test \"tests/**/*.test.js\"",
     "test:staging-smoke": "cross-env RUN_STAGING_SMOKE=1 node --test tests/integration/stagingCriticalFlows.test.js",
     "db:migrate": "node scripts/migrate.js",
+    "db:migrate:prod": "NODE_ENV=production node scripts/migrate.js",
+    "smoke:prod": "NODE_ENV=production node scripts/smoke.js",
     "db:backup-current": "node scripts/backupCurrentDb.js",
     "db:import-reference": "node scripts/importReferenceDb.js",
     "db:replace-from-dump": "node scripts/replaceDbFromDump.js",
