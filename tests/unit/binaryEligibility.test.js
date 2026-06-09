@@ -1,11 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const {
-  summarizeQualifiedDirectLegs,
-} = require('../../services/binaryEligibility');
+const { summarizeQualifiedDirectLegs } = require('../../services/binaryEligibility');
 
-test('qualified direct-leg gate ignores spillover placements from another sponsor', () => {
+test('pairing unlocks when the owner has one personally sponsored qualified direct on either leg', () => {
   const summary = summarizeQualifiedDirectLegs(7397233, [
     {
       uid: 1407558,
@@ -23,35 +21,36 @@ test('qualified direct-leg gate ignores spillover placements from another sponso
     },
   ]);
 
-  assert.equal(summary.canEarnPairing, false);
+  assert.equal(summary.canEarnPairing, true);
   assert.equal(summary.leftQualifiedCount, 0);
   assert.equal(summary.rightQualifiedCount, 1);
+  assert.deepEqual(summary.missingLegs, ['left']);
   assert.equal(summary.qualifyingDirects.left.length, 0);
   assert.deepEqual(summary.qualifyingDirects.right.map((row) => row.username), ['TestCarl']);
+  assert.equal(summary.reason, null);
 });
 
-test('qualified direct-leg gate counts the owner direct inside either subtree leg', () => {
+test('pairing stays locked until the owner has the first personally sponsored qualified direct', () => {
   const summary = summarizeQualifiedDirectLegs(1096471, [
     {
       uid: 5001,
-      drefid: 1096471,
+      drefid: 7777,
       ownerLeg: 'left',
-      username: 'LeftDirect',
+      username: 'LeftSpillover',
       codeid: 1,
     },
     {
       uid: 5002,
-      drefid: 1096471,
+      drefid: 8888,
       ownerLeg: 'right',
-      username: 'RightDirect',
-      codeid: 3,
-      cdamount: 2500,
-      cdtotal: 2500,
-      cdstatus: 2,
+      username: 'RightSpillover',
+      codeid: 1,
     },
   ]);
 
-  assert.equal(summary.canEarnPairing, true);
-  assert.equal(summary.leftQualifiedCount, 1);
-  assert.equal(summary.rightQualifiedCount, 1);
+  assert.equal(summary.canEarnPairing, false);
+  assert.equal(summary.leftQualifiedCount, 0);
+  assert.equal(summary.rightQualifiedCount, 0);
+  assert.deepEqual(summary.missingLegs.sort(), ['left', 'right']);
+  assert.match(summary.reason || '', /personally recruit your first qualified direct on either leg/i);
 });

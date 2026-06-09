@@ -14,3 +14,14 @@ test('phase1 migration creates placement audit and activation code usage tables'
   assert.match(sql, /ALTER TABLE public_registration_audittab/i);
   assert.match(sql, /memberstab/i);
 });
+
+test('member public identity repair migration adds public_id and referral_slug to memberstab', () => {
+  const sql = fs.readFileSync(
+    path.resolve(__dirname, '../../migrations/V017__member_public_identity_repairs.sql'),
+    'utf8'
+  );
+
+  assert.match(sql, /ALTER TABLE memberstab/i);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS public_id/i);
+  assert.match(sql, /ADD COLUMN IF NOT EXISTS referral_slug/i);
+});

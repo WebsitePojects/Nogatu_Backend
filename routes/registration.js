@@ -56,24 +56,6 @@ async function ensureReferralSlug(uid) {
 
 async function buildPlacementPreview(sponsorUid, conn = pool) {
   const placementPolicy = await getPlacementPolicyForSponsor(Number(sponsorUid), conn);
-  if (placementPolicy.mode === 'forced') {
-    const placement = await recommendPlacementForSponsor(Number(sponsorUid), conn, {
-      forcedSide: Number(placementPolicy.forcedPosition),
-    });
-    const [rows] = await conn.query(
-      'SELECT username FROM memberstab WHERE uid = ? LIMIT 1',
-      [placement.placementUid]
-    );
-
-    return {
-      ...placement,
-      placementUsername: rows[0]?.username || null,
-      positionLabel: Number(placement.position) === 2 ? 'Right' : 'Left',
-      note: placementPolicyMessage(placementPolicy),
-      placementPolicy,
-    };
-  }
-
   const placement = await recommendPlacementForSponsor(Number(sponsorUid), conn);
   const [rows] = await conn.query(
     'SELECT username FROM memberstab WHERE uid = ? LIMIT 1',
@@ -377,16 +359,14 @@ router.get('/referral/:token', async (req, res) => {
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
     const livePlacement = await buildPlacementPreview(Number(rows[0].sponsor_uid));
-    const placement = livePlacement?.placementPolicy?.mode === 'forced'
-      ? livePlacement
-      : {
-          ...livePlacement,
-          placementUid: Number(rows[0].placement_uid),
-          position: Number(rows[0].position),
-          side: Number(rows[0].position) === 2 ? 'right' : 'left',
-          positionLabel: Number(rows[0].position) === 2 ? 'Right' : 'Left',
-          note: 'Placement is reserved by this referral invite. The backend will re-check it before saving.',
-        };
+    const placement = {
+      ...livePlacement,
+      placementUid: Number(rows[0].placement_uid),
+      position: Number(rows[0].position),
+      side: Number(rows[0].position) === 2 ? 'right' : 'left',
+      positionLabel: Number(rows[0].position) === 2 ? 'Right' : 'Left',
+      note: 'Placement is reserved by this referral invite. The backend will re-check it before saving.',
+    };
     res.json({ invite: { ...rows[0], placement } });
   } catch (err) {
     console.error('[Registration] Public referral lookup error:', err);
@@ -415,6 +395,8 @@ router.post('/public-register', async (req, res) => {
     let invite;
     let reusableSlug = false;
     let placement;
+    const requestedPlacementUid = Number(req.body?.placementUid || 0);
+    const requestedPosition = Number(req.body?.position || 0);
     if (slug) {
       const normalizedSlug = normalizeReferralSlug(slug);
       const [sponsorRows] = await pool.query(
@@ -422,7 +404,18 @@ router.post('/public-register', async (req, res) => {
         [normalizedSlug]
       );
       if (sponsorRows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
-      placement = await buildPlacementPreview(Number(sponsorRows[0].uid));
+      const defaultPlacement = await buildPlacementPreview(Number(sponsorRows[0].uid));
+      placement = (requestedPlacementUid && [1, 2].includes(requestedPosition))
+        ? {
+            ...defaultPlacement,
+            placementUid: requestedPlacementUid,
+            position: requestedPosition,
+            side: requestedPosition === 2 ? 'right' : 'left',
+            positionLabel: requestedPosition === 2 ? 'Right' : 'Left',
+            strategy: 'manual',
+            note: 'Manual placement was selected for this referral registration.',
+          }
+        : defaultPlacement;
       invite = {
         sponsor_uid: Number(sponsorRows[0].uid),
         placement_uid: placement.placementUid,
@@ -440,15 +433,13 @@ router.post('/public-register', async (req, res) => {
       if (rows.length === 0) return res.status(404).json({ error: 'Referral invite not found or expired.' });
       invite = rows[0];
       const livePlacement = await buildPlacementPreview(Number(invite.sponsor_uid));
-      placement = livePlacement?.placementPolicy?.mode === 'forced'
-        ? livePlacement
-        : {
-            ...livePlacement,
-            placementUid: Number(invite.placement_uid),
-            position: Number(invite.position),
-            side: Number(invite.position) === 2 ? 'right' : 'left',
-            positionLabel: Number(invite.position) === 2 ? 'Right' : 'Left',
-          };
+      placement = {
+        ...livePlacement,
+        placementUid: Number(invite.placement_uid),
+        position: Number(invite.position),
+        side: Number(invite.position) === 2 ? 'right' : 'left',
+        positionLabel: Number(invite.position) === 2 ? 'Right' : 'Left',
+      };
     }
 
     const result = await registrationService.registerMember({
@@ -466,11 +457,11 @@ router.post('/public-register', async (req, res) => {
       contactno,
       dob,
       position: Number(placement?.position || invite.position),
-      requestedPosition: Number(invite.position),
+      requestedPosition: Number(placement?.position || invite.position),
       placementPolicy: placement?.placementPolicy || null,
       referralToken: invite.referral_slug || String(token || '').slice(0, 80),
       requestId: req.requestId || null,
-      autoPlacement: true,
+      autoPlacement: !(requestedPlacementUid && [1, 2].includes(requestedPosition)),
     });
 
     if (!reusableSlug) {
@@ -586,12 +577,12 @@ router.post('/register', memberAuth, async (req, res) => {
     }
 
     const recommendedPlacement = await buildPlacementPreview(Number(req.session.uid));
-    const finalPlacementUid = recommendedPlacement?.placementPolicy?.mode === 'forced'
+    const finalPlacementUid = !placementUid
       ? Number(recommendedPlacement.placementUid)
-      : (!placementUid ? Number(recommendedPlacement.placementUid) : Number(placementUid));
-    const finalPosition = recommendedPlacement?.placementPolicy?.mode === 'forced'
+      : Number(placementUid);
+    const finalPosition = !placementUid
       ? Number(recommendedPlacement.position)
-      : (!placementUid ? Number(recommendedPlacement.position) : Number(position));
+      : Number(position);
 
     const result = await registrationService.registerMember({
       activationCode,
@@ -611,7 +602,7 @@ router.post('/register', memberAuth, async (req, res) => {
       requestedPosition: Number(position),
       placementPolicy: recommendedPlacement?.placementPolicy || null,
       requestId: req.requestId || null,
-      autoPlacement: !placementUid || recommendedPlacement?.placementPolicy?.mode === 'forced',
+      autoPlacement: !placementUid,
     });
 
     await refreshSponsorIncomeAfterRegistration(

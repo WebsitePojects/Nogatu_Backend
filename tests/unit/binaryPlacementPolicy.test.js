@@ -5,7 +5,7 @@ const {
   getPlacementPolicyForSponsor,
 } = require('../../services/binaryPlacementPolicy');
 
-test('root sponsor first recruit forces left', async () => {
+test('root sponsor can manually choose placement before the first direct recruit', async () => {
   const conn = {
     query: async (sql) => {
       if (/FROM usertab\s+WHERE uid = \?/i.test(sql)) {
@@ -19,12 +19,12 @@ test('root sponsor first recruit forces left', async () => {
   };
 
   const policy = await getPlacementPolicyForSponsor(1001, conn);
-  assert.equal(policy.mode, 'forced');
-  assert.equal(policy.forcedPosition, 1);
-  assert.equal(policy.reason, 'root-sponsor-default-left');
+  assert.equal(policy.mode, 'manual');
+  assert.equal(policy.forcedPosition, null);
+  assert.equal(policy.reason, 'manual-placement-allowed');
 });
 
-test('sponsor on left inherits forced left for first recruit', async () => {
+test('sponsor on left can still manually choose placement before the first direct recruit', async () => {
   const conn = {
     query: async (sql) => {
       if (/FROM usertab\s+WHERE uid = \?/i.test(sql)) {
@@ -38,12 +38,12 @@ test('sponsor on left inherits forced left for first recruit', async () => {
   };
 
   const policy = await getPlacementPolicyForSponsor(2002, conn);
-  assert.equal(policy.mode, 'forced');
-  assert.equal(policy.forcedPosition, 1);
-  assert.equal(policy.reason, 'inherits-left-from-parent-position');
+  assert.equal(policy.mode, 'manual');
+  assert.equal(policy.forcedPosition, null);
+  assert.equal(policy.reason, 'manual-placement-allowed');
 });
 
-test('sponsor on right inherits forced right for first recruit', async () => {
+test('sponsor on right can still manually choose placement before the first direct recruit', async () => {
   const conn = {
     query: async (sql) => {
       if (/FROM usertab\s+WHERE uid = \?/i.test(sql)) {
@@ -57,9 +57,9 @@ test('sponsor on right inherits forced right for first recruit', async () => {
   };
 
   const policy = await getPlacementPolicyForSponsor(3003, conn);
-  assert.equal(policy.mode, 'forced');
-  assert.equal(policy.forcedPosition, 2);
-  assert.equal(policy.reason, 'inherits-right-from-parent-position');
+  assert.equal(policy.mode, 'manual');
+  assert.equal(policy.forcedPosition, null);
+  assert.equal(policy.reason, 'manual-placement-allowed');
 });
 
 test('sponsor with an existing direct recruit returns to manual placement', async () => {
@@ -78,5 +78,5 @@ test('sponsor with an existing direct recruit returns to manual placement', asyn
   const policy = await getPlacementPolicyForSponsor(4004, conn);
   assert.equal(policy.mode, 'manual');
   assert.equal(policy.forcedPosition, null);
-  assert.equal(policy.reason, 'first-direct-recruit-already-satisfied');
+  assert.equal(policy.reason, 'manual-placement-allowed');
 });

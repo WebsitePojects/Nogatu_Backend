@@ -37,11 +37,12 @@ function summarizeQualifiedDirectLegs(ownerUid, rows = []) {
 
   const leftQualifiedCount = qualifyingDirects.left.length;
   const rightQualifiedCount = qualifyingDirects.right.length;
+  const qualifiedDirectCount = leftQualifiedCount + rightQualifiedCount;
+  const canEarnPairing = qualifiedDirectCount >= 1;
   const missingLegs = [
     ...(leftQualifiedCount > 0 ? [] : ['left']),
     ...(rightQualifiedCount > 0 ? [] : ['right']),
   ];
-  const canEarnPairing = missingLegs.length === 0;
 
   return {
     canEarnPairing,
@@ -53,7 +54,7 @@ function summarizeQualifiedDirectLegs(ownerUid, rows = []) {
     qualifyingDirects,
     reason: canEarnPairing
       ? null
-      : 'Binary pairing unlocks only after you personally recruit at least one qualified direct on the left leg and one on the right leg. Spillover placements from your upline do not count.',
+      : 'Binary pairing unlocks after you personally recruit your first qualified direct on either leg. Spillover alone does not unlock your first pairing payout.',
   };
 }
 

@@ -79,39 +79,33 @@ function getPackageRankingPolicy(packageType) {
   const numericPackageType = toNumber(packageType);
   const policy = getPackagePolicy(numericPackageType);
   const packageLabel = policy.packageLabel || PACKAGE_LABELS[numericPackageType] || getAccountTypeName(numericPackageType) || `Type ${numericPackageType}`;
-  const rankingEligibilityReason = !policy.rankingEligible
-    ? 'Upgrade to Gold package to begin ranking.'
-    : policy.nextUpgradePackageLabel
-    ? `Upgrade to ${policy.nextUpgradePackageLabel} package to progress beyond ${policy.rankingMaxLabel || 'the current package ceiling'}.`
-    : null;
+  const maxPublishedRank = FULL_RANK_DEFINITIONS.reduce((max, row) => Math.max(max, toNumber(row.rank)), 0);
+  const maxPublishedRankLabel = FULL_RANK_DEFINITIONS.find((row) => toNumber(row.rank) === maxPublishedRank)?.rank_name || null;
 
   return {
     packageType: numericPackageType,
     packageLabel,
-    rankingEligible: Boolean(policy.rankingEligible),
-    maxRank: toNumber(policy.rankingMax),
-    maxRankLabel: policy.rankingMaxLabel || null,
-    nextUpgradePackageType: policy.nextUpgradePackageType == null ? null : toNumber(policy.nextUpgradePackageType),
-    nextUpgradePackageLabel: policy.nextUpgradePackageLabel || null,
-    reason: rankingEligibilityReason,
+    rankingEligible: true,
+    maxRank: maxPublishedRank,
+    maxRankLabel: maxPublishedRankLabel,
+    nextUpgradePackageType: null,
+    nextUpgradePackageLabel: null,
+    reason: null,
   };
 }
 
 function filterRankDefinitionsForPackage(definitions = [], packageType) {
-  const policy = getPackageRankingPolicy(packageType);
-  if (!policy.rankingEligible || policy.maxRank <= 0) return [];
-  return definitions.filter((definition) => toNumber(definition.rank) > 0 && toNumber(definition.rank) <= policy.maxRank);
+  return definitions.filter((definition) => toNumber(definition.rank) > 0);
 }
 
 function canReleaseRankAchievementForPackage(packageType, rankNo) {
-  const policy = getPackageRankingPolicy(packageType);
   const numericRank = toNumber(rankNo);
+  const policy = getPackageRankingPolicy(packageType);
   return Boolean(policy.rankingEligible) && numericRank > 0 && numericRank <= policy.maxRank;
 }
 
 function clampRankToPackage(packageType, rankNo) {
   const policy = getPackageRankingPolicy(packageType);
-  if (!policy.rankingEligible || policy.maxRank <= 0) return 0;
   return Math.min(policy.maxRank, Math.max(0, toNumber(rankNo)));
 }
 
@@ -525,9 +519,7 @@ function applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, a
   const nextRankRequirement = normalizeNextRankRequirement(
     effectiveDefinitions.find((definition) => toNumber(definition.rank) > effectiveCurrentRank) || null
   );
-  const maxPublishedRank = definitions.reduce((max, definition) => Math.max(max, toNumber(definition.rank)), 0);
-  const blockedByPackageGate = !policy.rankingEligible
-    || (policy.maxRank > 0 && policy.maxRank < maxPublishedRank && effectiveCurrentRank >= policy.maxRank && !nextRankRequirement);
+  const blockedByPackageGate = false;
 
   return {
     ...snapshot,
@@ -540,14 +532,14 @@ function applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, a
     leftRequirementMet: !nextRankRequirement || toNumber(snapshot.leftQualifiedCount) >= toNumber(nextRankRequirement.leftRankRequired),
     rightRequirementMet: !nextRankRequirement || toNumber(snapshot.rightQualifiedCount) >= toNumber(nextRankRequirement.rightRankRequired),
     rankingEligible: policy.rankingEligible,
-    rankingEligibilityReason: blockedByPackageGate ? policy.reason : null,
+    rankingEligibilityReason: null,
     blockedByPackageGate,
     packageType: toNumber(packageType),
     packageLabel: policy.packageLabel,
     packageRankMax: policy.maxRank,
     packageRankMaxLabel: policy.maxRankLabel,
-    upgradeRequiredPackageType: blockedByPackageGate ? policy.nextUpgradePackageType : null,
-    upgradeRequiredPackageLabel: blockedByPackageGate ? policy.nextUpgradePackageLabel : null,
+    upgradeRequiredPackageType: null,
+    upgradeRequiredPackageLabel: null,
     achievements: filteredAchievements,
     pendingAchievementCount: effectiveAchievementSummary.pendingCount,
     nextPendingRank: effectiveAchievementSummary.nextPendingRank,

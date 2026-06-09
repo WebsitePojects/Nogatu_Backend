@@ -503,10 +503,8 @@ async function registerMember({
 
     const livePlacementPolicy = await getPlacementPolicyForSponsor(Number(sponsorUid), conn);
     finalPlacementPolicy = livePlacementPolicy;
-    if (autoPlacement || livePlacementPolicy.mode === 'forced') {
-      const livePlacement = await recommendPlacementForSponsor(Number(sponsorUid), conn, {
-        forcedSide: livePlacementPolicy.mode === 'forced' ? Number(livePlacementPolicy.forcedPosition) : null,
-      });
+    if (autoPlacement) {
+      const livePlacement = await recommendPlacementForSponsor(Number(sponsorUid), conn);
       finalPlacementUid = Number(livePlacement.placementUid);
       finalPosition = Number(livePlacement.position);
     }
@@ -516,9 +514,6 @@ async function registerMember({
     }
 
     lockKeys.push(`placement:${finalPlacementUid}:${finalPosition}`);
-    if (finalPlacementPolicy?.mode === 'forced') {
-      lockKeys.push(`sponsor-first:${Number(sponsorUid)}`);
-    }
     for (const lockKey of lockKeys) {
       await acquirePlacementLock(conn, lockKey, requestId);
     }

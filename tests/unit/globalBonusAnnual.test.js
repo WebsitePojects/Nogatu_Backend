@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 
 const {
   normalizeAnnualYear,
@@ -53,5 +55,17 @@ test('global bonus visibility metadata stays locked for non-qualifying accounts'
       lockedReason: 'Global bonus unlocks for qualified Diamond, Ambassador, or eligible Stockist accounts.',
       unlockedBy: [],
     }
+  );
+});
+
+test('global bonus eligible-member query aliases usertab before selecting u.uid', () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, '../../services/globalBonus.js'),
+    'utf8'
+  );
+
+  assert.match(
+    source,
+    /SELECT u\.uid,\s*u\.currentaccttype,\s*u\.stockistid,\s*[\s\S]*?FROM usertab u\s+LEFT JOIN memberstab m ON m\.uid = u\.uid\s+WHERE u\.uid = u\.mainid/i
   );
 });

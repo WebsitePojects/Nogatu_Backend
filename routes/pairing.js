@@ -201,7 +201,7 @@ router.get('/', memberAuth, async (req, res) => {
         sourceReason: sourceEligible
           ? null
           : 'This account cannot pass its own BP to its sponsor and uplines yet, but it can still receive SMB from eligible paid or fully paid CD downlines when both sides of the subtree have qualified BP.',
-        rule: 'Binary payout now unlocks only after you personally recruit at least one qualified direct on the left leg and one on the right leg. Spillover placements from your upline do not count toward this unlock.',
+        rule: 'Binary pairing is based on qualified BP from the left and right subtree, but the first payout unlock requires at least one personally sponsored qualified direct on either leg.',
       },
     });
   } catch (err) {

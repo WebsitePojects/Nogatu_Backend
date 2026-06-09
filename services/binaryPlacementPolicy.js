@@ -9,18 +9,6 @@ function mapPositionLabel(position) {
   return toNumber(position) === 2 ? 'Right' : 'Left';
 }
 
-function buildForcedPolicy(forcedPosition, reason, extras = {}) {
-  return {
-    mode: 'forced',
-    forcedPosition: toNumber(forcedPosition),
-    forcedPositionLabel: mapPositionLabel(forcedPosition),
-    reason,
-    hasDirectRecruits: false,
-    autoRerouteOnConflict: true,
-    ...extras,
-  };
-}
-
 function buildManualPolicy(reason, extras = {}) {
   return {
     mode: 'manual',
@@ -61,33 +49,9 @@ async function getPlacementPolicyForSponsor(sponsorUid, conn = pool) {
   }
 
   const totalDirect = await countDirectRecruits(sponsorUid, conn);
-  if (totalDirect >= 1) {
-    return buildManualPolicy('first-direct-recruit-already-satisfied', {
-      sponsorUid: toNumber(sponsor.uid),
-      sponsorPosition: sponsor.position == null ? null : toNumber(sponsor.position),
-      totalDirectRecruits: totalDirect,
-    });
-  }
-
-  if (!toNumber(sponsor.refid) || toNumber(sponsor.refid) === toNumber(sponsor.uid)) {
-    return buildForcedPolicy(1, 'root-sponsor-default-left', {
-      sponsorUid: toNumber(sponsor.uid),
-      sponsorPosition: null,
-      totalDirectRecruits: totalDirect,
-    });
-  }
-
-  if (toNumber(sponsor.position) === 2) {
-    return buildForcedPolicy(2, 'inherits-right-from-parent-position', {
-      sponsorUid: toNumber(sponsor.uid),
-      sponsorPosition: 2,
-      totalDirectRecruits: totalDirect,
-    });
-  }
-
-  return buildForcedPolicy(1, 'inherits-left-from-parent-position', {
+  return buildManualPolicy('manual-placement-allowed', {
     sponsorUid: toNumber(sponsor.uid),
-    sponsorPosition: 1,
+    sponsorPosition: sponsor.position == null ? null : toNumber(sponsor.position),
     totalDirectRecruits: totalDirect,
   });
 }
@@ -115,9 +79,6 @@ function applyPlacementPolicy(policy, requestedPosition) {
 
 function placementPolicyMessage(policy) {
   if (!policy) return '';
-  if (policy.mode === 'forced') {
-    return `Your first direct recruit must be placed on the ${policy.forcedPositionLabel} leg.`;
-  }
   return 'You can choose the left or right placement for your next direct recruit, subject to slot availability.';
 }
 

@@ -129,6 +129,8 @@ const SCHEMA_REQUIREMENTS = {
     tables: ['memberstab'],
     columns: {
       memberstab: {
+        public_id: { typeIncludes: 'char(36)' },
+        referral_slug: { typeIncludes: 'varchar(32)' },
         tin: { typeIncludes: 'varchar(30)' },
         email: { typeIncludes: 'varchar(180)' },
         contactnos: { typeIncludes: 'varchar(30)' },
@@ -194,7 +196,7 @@ const SCHEMA_REQUIREMENTS = {
     ],
   },
   GLOBAL_BONUS: {
-    tables: ['globalbonus_poolstab', 'globalbonus_membertab'],
+    tables: ['globalbonus_poolstab', 'globalbonus_membertab', 'globalbonus_override_tab'],
     columns: {
       globalbonus_poolstab: {
         period_scope: { typeIncludes: 'varchar(16)' },

@@ -50,7 +50,7 @@ async function getUpgradeAccounts(uid) {
   return rows;
 }
 
-async function appendUpgradePairingBonus(uid, side, leftPoints, rightPoints, allDates) {
+async function appendUpgradePairingBonus(uid, side, leftPoints, rightPoints, allDates, totals) {
   const upgrades = await getUpgradeAccounts(uid);
   if (!upgrades || upgrades.length === 0) {
     return;
@@ -71,8 +71,14 @@ async function appendUpgradePairingBonus(uid, side, leftPoints, rightPoints, all
 
     if (side === 'left') {
       leftPoints.push(upgradeEntry);
+      if (totals) {
+        totals.totalpointsleft += upgradeEntry.points;
+      }
     } else {
       rightPoints.push(upgradeEntry);
+      if (totals) {
+        totals.totalpointsright += upgradeEntry.points;
+      }
     }
   }
 }
@@ -142,7 +148,7 @@ async function getNumLevels(
       }
 
       if (Number(row.accttype || 0) < Number(row.currentaccttype || 0)) {
-        await appendUpgradePairingBonus(row.uid, side, leftPoints, rightPoints, allDates);
+        await appendUpgradePairingBonus(row.uid, side, leftPoints, rightPoints, allDates, totals);
       }
     }
 

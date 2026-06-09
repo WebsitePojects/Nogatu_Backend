@@ -68,10 +68,10 @@ test('stored ranking snapshots derive next-rank gate without full rebuild', () =
   assert.equal(snapshot.leftRequirementMet, true);
   assert.equal(snapshot.rightRequirementMet, false);
   assert.equal(snapshot.rankingEligible, true);
-  assert.equal(snapshot.packageRankMax, 3);
+  assert.equal(snapshot.packageRankMax, 10);
 });
 
-test('stored ranking snapshots clamp ineligible Bronze accounts to unranked display state', () => {
+test('stored ranking snapshots keep Bronze accounts on their earned rank when all ranks are unlocked', () => {
   const definitions = [
     { rank: 1, rank_name: 'Supervisor 1', points_required: 10000, left_rank_required: 0, right_rank_required: 0 },
     { rank: 2, rank_name: 'Supervisor 2', points_required: 20000, left_rank_required: 1, right_rank_required: 1 },
@@ -101,14 +101,14 @@ test('stored ranking snapshots clamp ineligible Bronze accounts to unranked disp
     rightPoints: 0,
   });
 
-  assert.equal(snapshot.currentRank, 0);
-  assert.equal(snapshot.currentRankLabel, 'Unranked');
-  assert.equal(snapshot.rankingEligible, false);
-  assert.equal(snapshot.blockedByPackageGate, true);
-  assert.equal(snapshot.rankingEligibilityReason, 'Upgrade to Gold package to begin ranking.');
+  assert.equal(snapshot.currentRank, 2);
+  assert.equal(snapshot.currentRankLabel, 'Supervisor 2');
+  assert.equal(snapshot.rankingEligible, true);
+  assert.equal(snapshot.blockedByPackageGate, false);
+  assert.equal(snapshot.rankingEligibilityReason, null);
 });
 
-test('stored ranking snapshots stop Gold members at Supervisor 3 and ask for Platinum to continue', () => {
+test('stored ranking snapshots do not stop Gold members at a package ceiling anymore', () => {
   const definitions = [
     { rank: 1, rank_name: 'Supervisor 1', points_required: 10000, left_rank_required: 0, right_rank_required: 0 },
     { rank: 2, rank_name: 'Supervisor 2', points_required: 20000, left_rank_required: 1, right_rank_required: 1 },
@@ -141,10 +141,10 @@ test('stored ranking snapshots stop Gold members at Supervisor 3 and ask for Pla
   });
 
   assert.equal(snapshot.currentRank, 3);
-  assert.equal(snapshot.nextRank, null);
-  assert.equal(snapshot.blockedByPackageGate, true);
-  assert.equal(snapshot.upgradeRequiredPackageLabel, 'Platinum');
-  assert.equal(snapshot.rankingEligibilityReason, 'Upgrade to Platinum package to progress beyond Supervisor 3.');
+  assert.equal(snapshot.nextRank, 4);
+  assert.equal(snapshot.blockedByPackageGate, false);
+  assert.equal(snapshot.upgradeRequiredPackageLabel, null);
+  assert.equal(snapshot.rankingEligibilityReason, null);
 });
 
 test('stored ranking snapshots normalize next-rank requirement fields for the member UI', () => {

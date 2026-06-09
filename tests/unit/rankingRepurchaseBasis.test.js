@@ -77,18 +77,18 @@ test('rank definitions normalize left/right requirements from rank codes', () =>
   assert.equal(normalized[2].left_rank_required, 0);
 });
 
-test('package ranking policy excludes Bronze and Silver and gates higher packages', () => {
+test('package ranking policy unlocks the full ranking ladder for every package including Bronze and Silver', () => {
   assert.deepEqual(
     getPackageRankingPolicy(10),
     {
       packageType: 10,
       packageLabel: 'Bronze',
-      rankingEligible: false,
-      maxRank: 0,
-      maxRankLabel: null,
-      nextUpgradePackageType: 30,
-      nextUpgradePackageLabel: 'Gold',
-      reason: 'Upgrade to Gold package to begin ranking.',
+      rankingEligible: true,
+      maxRank: 10,
+      maxRankLabel: 'AMBASSADOR',
+      nextUpgradePackageType: null,
+      nextUpgradePackageLabel: null,
+      reason: null,
     }
   );
 
@@ -98,16 +98,16 @@ test('package ranking policy excludes Bronze and Silver and gates higher package
       packageType: 30,
       packageLabel: 'Gold',
       rankingEligible: true,
-      maxRank: 3,
-      maxRankLabel: 'Supervisor 3',
-      nextUpgradePackageType: 40,
-      nextUpgradePackageLabel: 'Platinum',
-      reason: 'Upgrade to Platinum package to progress beyond Supervisor 3.',
+      maxRank: 10,
+      maxRankLabel: 'AMBASSADOR',
+      nextUpgradePackageType: null,
+      nextUpgradePackageLabel: null,
+      reason: null,
     }
   );
 });
 
-test('rank definitions are filtered by package ceiling', () => {
+test('rank definitions are not filtered by package gate anymore', () => {
   const definitions = [
     { rank: 1, rank_name: 'Supervisor 1' },
     { rank: 2, rank_name: 'Supervisor 2' },
@@ -117,18 +117,19 @@ test('rank definitions are filtered by package ceiling', () => {
 
   assert.deepEqual(
     filterRankDefinitionsForPackage(definitions, 10).map((row) => row.rank),
-    []
+    [1, 2, 3, 4]
   );
 
   assert.deepEqual(
     filterRankDefinitionsForPackage(definitions, 30).map((row) => row.rank),
-    [1, 2, 3]
+    [1, 2, 3, 4]
   );
 });
 
-test('rank achievement release respects the current package gate', () => {
+test('rank achievement release is no longer blocked by package gate', () => {
   assert.equal(canReleaseRankAchievementForPackage(30, 3), true);
-  assert.equal(canReleaseRankAchievementForPackage(30, 4), false);
-  assert.equal(canReleaseRankAchievementForPackage(10, 1), false);
+  assert.equal(canReleaseRankAchievementForPackage(30, 4), true);
+  assert.equal(canReleaseRankAchievementForPackage(10, 1), true);
+  assert.equal(canReleaseRankAchievementForPackage(10, 10), true);
   assert.equal(canReleaseRankAchievementForPackage(50, 10), true);
 });
