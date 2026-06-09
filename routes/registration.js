@@ -573,7 +573,7 @@ router.post('/register', memberAuth, async (req, res) => {
     }
 
     if (rawTin && !isValidTin(rawTin)) {
-      return res.status(400).json({ error: 'TIN must contain 9-15 digits and will be saved in grouped format.' });
+      return res.status(400).json({ error: 'TIN must be 9–12 digits (e.g. 123-456-789-000). Use 000-000-000-000 if you do not have a TIN.' });
     }
 
     const recommendedPlacement = await buildPlacementPreview(Number(req.session.uid));

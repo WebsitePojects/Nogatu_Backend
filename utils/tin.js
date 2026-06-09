@@ -1,7 +1,8 @@
 const TIN_REGEX = /^[0-9-]+$/;
 const MIN_TIN_DIGITS = 9;
-const MAX_TIN_DIGITS = 15;
+const MAX_TIN_DIGITS = 12;
 const TIN_GROUP_SIZE = 3;
+// 000-000-000-000 (12 digits) is always accepted as the default "no TIN" placeholder.
 
 function extractTinDigits(value) {
   return String(value || '').replace(/\D/g, '').slice(0, MAX_TIN_DIGITS);

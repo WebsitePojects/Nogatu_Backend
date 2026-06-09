@@ -9,6 +9,7 @@ const { calculateAndStoreIncome } = require('../services/income/calculateAndStor
 const { insertEncashment, getEncashmentPreview } = require('../services/income/insertIncome');
 const { getMemberGlobalBonus } = require('../services/globalBonus');
 const { assertTinPresentForEncashment } = require('../services/memberTinPolicy');
+const { getProjectedCurrentMonthUnilevel, checkLastMaintenance } = require('../services/income/unilevel');
 
 /**
  * GET /api/wallet
@@ -22,6 +23,10 @@ router.get('/', memberAuth, async (req, res) => {
     const currentaccttype = req.session.currentaccttype;
 
     const updated = await calculateAndStoreIncome(uid, currentaccttype);
+    const [maintenanceMet, projectedUnilevel] = await Promise.all([
+      checkLastMaintenance(uid),
+      getProjectedCurrentMonthUnilevel(uid),
+    ]);
     const globalBonus = await getMemberGlobalBonus(uid).catch(() => ({
       eligible: false,
       visibilityState: 'locked',
@@ -52,6 +57,14 @@ router.get('/', memberAuth, async (req, res) => {
       totalIncome:    Number(updated.ttlincome1 || 0) + Number(updated.ttlincome2 || 0) +
                       Number(updated.ttlincome3 || 0) + Number(updated.ttlincome4 || 0) +
                       Number(updated.ttlincome5 || 0) + Number(updated.ttlincome6 || 0),
+      unilevelMaintenance: {
+        maintenanceMet,
+        projectedUnilevel: Number(projectedUnilevel || 0),
+        blockedUnilevel: maintenanceMet ? 0 : Number(projectedUnilevel || 0),
+        note: maintenanceMet
+          ? null
+          : 'Unilevel income requires 200 maintenance points from the previous month. Shown amount is what you would have earned.',
+      },
     });
   } catch (err) {
     console.error('[Wallet] Error:', err);

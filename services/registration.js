@@ -414,12 +414,15 @@ function deriveRegistrationCdState(codeData) {
   };
 }
 
-async function consumeActivationCodeForRegistration(conn, { activationCode, sponsorUid }) {
+// PHP production chk_code() does not restrict by uid — any valid released code
+// may be used regardless of who it was assigned to (ownership is tracked by uid
+// in codestab but is not a registration gate).
+async function consumeActivationCodeForRegistration(conn, { activationCode }) {
   const [codeRows] = await conn.query(
-    `SELECT * FROM codestab WHERE code = ? AND uid = ? AND codestatus = 1
+    `SELECT * FROM codestab WHERE code = ? AND codestatus = 1
      AND producttype >= 1 AND producttype <= 100
      LIMIT 1`,
-    [activationCode, sponsorUid]
+    [activationCode]
   );
   if (codeRows.length === 0) throw new Error('Invalid or used activation code');
   const codeData = codeRows[0];
@@ -427,9 +430,9 @@ async function consumeActivationCodeForRegistration(conn, { activationCode, spon
   const [updateResult] = await conn.query(
     `UPDATE codestab
         SET dateused = NOW(), codestatus = 2
-      WHERE code = ? AND uid = ? AND codestatus = 1
+      WHERE code = ? AND codestatus = 1
       LIMIT 1`,
-    [activationCode, sponsorUid]
+    [activationCode]
   );
 
   if (Number(updateResult?.affectedRows || 0) !== 1) {
@@ -520,7 +523,6 @@ async function registerMember({
 
     const codeData = await consumeActivationCodeForRegistration(conn, {
       activationCode,
-      sponsorUid,
     });
 
     const [existingUser] = await conn.query(
