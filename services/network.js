@@ -257,14 +257,20 @@ async function getPairingCounts(uid) {
     );
 
     for (const row of rows) {
+      // Count ALL members in each leg regardless of eligibility.
+      // Only add BP points for accounts that qualify as pairing sources.
+      if (row.leg === 'left') {
+        result.totalLeft += 1;
+      } else if (row.leg === 'right') {
+        result.totalRight += 1;
+      }
+
       const effectiveRow = await getEffectiveAccountState(row.uid, row);
       if (!effectiveRow || !countsForPairingSource(effectiveRow)) continue;
       const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
       if (row.leg === 'left') {
-        result.totalLeft += 1;
         result.totalPointsLeft += Number(points || 0);
       } else if (row.leg === 'right') {
-        result.totalRight += 1;
         result.totalPointsRight += Number(points || 0);
       }
     }
@@ -292,14 +298,19 @@ async function _collectSubtreePairingCounts(parentUid, leg, result) {
   );
 
   for (const row of rows) {
+    // Count ALL members regardless of eligibility; only add BP for eligible sources.
+    if (leg === 'left') {
+      result.totalLeft += 1;
+    } else {
+      result.totalRight += 1;
+    }
+
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (effectiveRow && countsForPairingSource(effectiveRow)) {
       const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
       if (leg === 'left') {
-        result.totalLeft += 1;
         result.totalPointsLeft += Number(points || 0);
       } else {
-        result.totalRight += 1;
         result.totalPointsRight += Number(points || 0);
       }
     }
@@ -318,14 +329,19 @@ async function _collectDescendantPairingCounts(uid, rootLeg, result) {
   );
 
   for (const row of rows) {
+    // Count ALL members; only add BP for eligible sources.
+    if (rootLeg === 'left') {
+      result.totalLeft += 1;
+    } else {
+      result.totalRight += 1;
+    }
+
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (effectiveRow && countsForPairingSource(effectiveRow)) {
       const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
       if (rootLeg === 'left') {
-        result.totalLeft += 1;
         result.totalPointsLeft += Number(points || 0);
       } else {
-        result.totalRight += 1;
         result.totalPointsRight += Number(points || 0);
       }
     }

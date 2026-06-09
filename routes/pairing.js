@@ -159,7 +159,36 @@ router.get('/', memberAuth, async (req, res) => {
 
     const walletPairingTotal = Number(walletRows[0]?.ttlincome2 || 0);
     const balances = trace?.balances || {};
-    const historyRowsAll = buildPairingHistoryRows(trace?.allRows || trace?.rows || []);
+
+    // Build history from the new ledger (income_eventstab).
+    const ledgerHistoryRows = buildPairingHistoryRows(trace?.allRows || trace?.rows || []);
+
+    // If the new ledger has no credited events, fall back to the historical PHP records
+    // stored in payouthistorytab.income2 so members can always see their full history.
+    let historyRowsAll = ledgerHistoryRows;
+    if (ledgerHistoryRows.length === 0) {
+      const [legacyRows] = await pool.query(
+        `SELECT pid, uid, transdate, income2
+           FROM payouthistorytab
+          WHERE uid = ? AND income2 > 0
+          ORDER BY transdate DESC`,
+        [uid]
+      );
+      if (legacyRows.length > 0) {
+        historyRowsAll = legacyRows.map((row) => ({
+          historyUid: `legacy-${row.pid}`,
+          pairedAt: row.transdate,
+          matchedPoints: null,
+          creditedIncome: Number(row.income2 || 0),
+          left: null,
+          right: null,
+          leftRemainingAfter: null,
+          rightRemainingAfter: null,
+          isLegacy: true,
+        }));
+      }
+    }
+
     const historyTotal = Number(historyRowsAll.length || 0);
     const historyTotalPages = Math.max(1, Math.ceil(historyTotal / historyPerPage));
     const safeHistoryPage = Math.min(historyTotalPages, Math.max(1, historyPage));
