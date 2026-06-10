@@ -19,14 +19,48 @@ function pickName(username, fallback) {
   return username || fallback || 'Unknown';
 }
 
+// Parses legacy codehistorytab.history strings like:
+//   "(nogatuadmin)Ann050890 -> (Ann050890)Malou05"
+// into a human-readable sentence identifying the final recipient.
+function parseLegacySummary(history) {
+  if (!history) return 'Recorded code event.';
+  const segments = history.split('->').map(s => s.trim());
+  // Each segment: "(actor)recipient" — extract the part after ')'
+  const parseRecipient = (seg) => {
+    const m = seg.match(/\)\s*(.+)$/);
+    return m ? m[1].trim() : seg;
+  };
+  const parseActor = (seg) => {
+    const m = seg.match(/^\(([^)]+)\)/);
+    return m ? m[1].trim() : null;
+  };
+  if (segments.length === 1) {
+    const actor = parseActor(segments[0]);
+    const recipient = parseRecipient(segments[0]);
+    return actor
+      ? `${actor} transferred this code to ${recipient}.`
+      : `Transferred to ${recipient}.`;
+  }
+  const firstActor = parseActor(segments[0]) || 'Admin';
+  const finalRecipient = parseRecipient(segments[segments.length - 1]);
+  const steps = segments.map((seg, i) => {
+    const actor = parseActor(seg) || '?';
+    const recipient = parseRecipient(seg);
+    return i === 0 ? `${actor} → ${recipient}` : `${actor} → ${recipient}`;
+  });
+  return `${firstActor} issued → currently held by ${finalRecipient}. Trail: ${steps.join(', ')}.`;
+}
+
 function formatActivationHistoryEntry(row) {
   const eventType = row.event_type || null;
-  const eventLabel = EVENT_LABELS[eventType] || (row.legacy_history ? 'Legacy History' : 'Code Event');
+  const eventLabel = EVENT_LABELS[eventType] || (row.legacy_history ? 'Transfer History' : 'Code Event');
   const actorName = pickName(row.actor_username, row.actor_admin_name ? row.actor_admin_name : (row.actor_admin_id ? `Admin #${row.actor_admin_id}` : null));
   const fromName = pickName(row.from_username, row.from_uid ? `UID ${row.from_uid}` : null);
   const toName = pickName(row.to_username, row.to_uid ? `UID ${row.to_uid}` : null);
 
-  let summary = row.legacy_history || 'Recorded code event.';
+  let summary = row.legacy_history
+    ? parseLegacySummary(row.legacy_history)
+    : 'Recorded code event.';
   if (eventType === 'generated') {
     summary = actorName !== 'Unknown'
       ? `${actorName} generated this code.`

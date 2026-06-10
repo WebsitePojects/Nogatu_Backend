@@ -58,24 +58,33 @@ router.get('/', adminAuth, async (req, res) => {
     const q = (req.query.q || '').trim();
 
     // Cashier (rights=2) can manage transfer/release-ready codes only.
-    let whereSql = adminRight === 2 ? 'WHERE codestatus <= 1' : 'WHERE codestatus <= 2';
+    let whereSql = adminRight === 2 ? 'WHERE c.codestatus <= 1' : 'WHERE c.codestatus <= 2';
+    let countWhereSql = adminRight === 2 ? 'WHERE codestatus <= 1' : 'WHERE codestatus <= 2';
     const whereParams = [];
     if (q) {
-      whereSql += ' AND code LIKE ?';
+      whereSql += ' AND c.code LIKE ?';
+      countWhereSql += ' AND code LIKE ?';
       whereParams.push(`%${q}%`);
     }
 
     const [countRows] = await pool.query(
-      `SELECT COUNT(*) as total FROM codestab ${whereSql}`,
+      `SELECT COUNT(*) as total FROM codestab ${countWhereSql}`,
       whereParams
     );
     const total = Number(countRows[0].total);
 
     const [rows] = await pool.query(
-      `SELECT id, code, producttype, uid, codestatus, releasedate,
-              DATE_FORMAT(dategen, '%Y-%m-%d %H:%i') as dategen
-       FROM codestab ${whereSql}
-       ORDER BY id DESC LIMIT ?, ?`,
+      `SELECT c.id, c.code, c.producttype, c.uid, c.codestatus, c.releasedate,
+              DATE_FORMAT(c.dategen, '%Y-%m-%d %H:%i') AS dategen,
+              m.username AS owner_username,
+              TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS owner_fullname,
+              ch.history AS transfer_history,
+              DATE_FORMAT(ch.datetransfer, '%Y-%m-%d %H:%i') AS last_transfer_date
+       FROM codestab c
+       LEFT JOIN memberstab m ON m.uid = c.uid
+       LEFT JOIN codehistorytab ch ON ch.code = c.code
+       ${whereSql}
+       ORDER BY c.id DESC LIMIT ?, ?`,
       [...whereParams, offset, perPage]
     );
 
@@ -85,6 +94,10 @@ router.get('/', adminAuth, async (req, res) => {
       producttype: r.producttype,
       producttypeName: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
       uid: r.uid,
+      ownerUsername: r.owner_username || null,
+      ownerFullname: r.owner_fullname ? r.owner_fullname.trim() || null : null,
+      transferHistory: r.transfer_history || null,
+      lastTransferDate: r.last_transfer_date || null,
       codestatus: r.codestatus,
       statusLabel: r.codestatus === 0 ? 'Not Released' : r.codestatus === 1 ? 'Released' : 'Used',
       releasedate: r.releasedate,
