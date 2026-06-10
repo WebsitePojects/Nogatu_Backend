@@ -77,6 +77,8 @@ function readonlyGuard(req, res, next) {
   const role = req.session?.adminrole;
   if (role !== 'readonly') return next();
   if (req.method === 'GET') return next();
+  // Always allow logout so readonly accounts can sign out
+  if (req.originalUrl.includes('/auth/logout')) return next();
   return res.status(403).json({
     error: 'This account is read-only. No changes can be made.',
     code: 'READONLY_ACCOUNT',
