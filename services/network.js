@@ -256,26 +256,31 @@ async function getPairingCounts(uid) {
       [uid]
     );
 
-    for (const row of rows) {
-      // Count ALL members in each leg regardless of eligibility.
-      // Only add BP points for accounts that qualify as pairing sources.
-      if (row.leg === 'left') {
-        result.totalLeft += 1;
-      } else if (row.leg === 'right') {
-        result.totalRight += 1;
-      }
+    // Only use the closure table result if it actually has entries for this member.
+    // If the table exists but is not yet backfilled for this member (rows.length === 0),
+    // fall through to the recursive usertab traversal below.
+    if (rows.length > 0) {
+      for (const row of rows) {
+        if (row.leg === 'left') {
+          result.totalLeft += 1;
+        } else if (row.leg === 'right') {
+          result.totalRight += 1;
+        }
 
-      const effectiveRow = await getEffectiveAccountState(row.uid, row);
-      if (!effectiveRow || !countsForPairingSource(effectiveRow)) continue;
-      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
-      if (row.leg === 'left') {
-        result.totalPointsLeft += Number(points || 0);
-      } else if (row.leg === 'right') {
-        result.totalPointsRight += Number(points || 0);
+        const effectiveRow = await getEffectiveAccountState(row.uid, row);
+        if (!effectiveRow || !countsForPairingSource(effectiveRow)) continue;
+        const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+        if (row.leg === 'left') {
+          result.totalPointsLeft += Number(points || 0);
+        } else if (row.leg === 'right') {
+          result.totalPointsRight += Number(points || 0);
+        }
       }
+      return result;
     }
 
-    return result;
+    // Closure table exists but has no entries for this member — fall through to
+    // the recursive usertab traversal so counts are never silently zero.
   } catch (error) {
     if (error.code !== 'ER_NO_SUCH_TABLE') {
       throw error;

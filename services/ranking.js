@@ -1033,8 +1033,48 @@ async function getAllRankings(page = 1, perPage = 30) {
     [offset, size]
   );
 
+  // Batch-fetch repurchase validation data for all listed UIDs.
+  // Ties each member's ranking points back to the actual repurchase records
+  // so inactive or zero-downline members are easy to identify.
+  const listedUids = rows.map((r) => toNumber(r.uid)).filter((v) => v > 0);
+  const repurchaseValidation = new Map();
+  if (listedUids.length > 0) {
+    try {
+      const uidPlaceholders = listedUids.map(() => '?').join(',');
+      const [rpRows] = await pool.query(
+        `SELECT c.ancestor_uid AS member_uid,
+                COUNT(DISTINCT r.uid) AS contributor_count,
+                COUNT(*) AS repurchase_events,
+                COALESCE(SUM(r.incentivepoints1), 0) AS total_points,
+                MAX(r.transdate) AS last_repurchase_date
+           FROM repurchasetab r
+           INNER JOIN binary_tree_closuretab c
+                   ON c.descendant_uid = r.uid AND c.ancestor_uid IN (${uidPlaceholders})
+          WHERE COALESCE(r.incentivepoints1, 0) > 0
+          GROUP BY c.ancestor_uid`,
+        listedUids
+      );
+      for (const rpRow of rpRows) {
+        repurchaseValidation.set(toNumber(rpRow.member_uid), {
+          contributorCount: toNumber(rpRow.contributor_count),
+          repurchaseEvents: toNumber(rpRow.repurchase_events),
+          verifiedPoints: toNumber(rpRow.total_points),
+          lastRepurchaseDate: rpRow.last_repurchase_date || null,
+        });
+      }
+    } catch (rpErr) {
+      // Closure table may not exist on this environment — skip validation silently.
+      if (rpErr.code !== 'ER_NO_SUCH_TABLE' && rpErr.code !== 'ER_NO_SUCH_TABLE') {
+        // non-fatal: continue without validation data
+      }
+    }
+  }
+
   const hydrated = [];
   for (const row of rows) {
+    const rpData = repurchaseValidation.get(toNumber(row.uid)) || {
+      contributorCount: 0, repurchaseEvents: 0, verifiedPoints: 0, lastRepurchaseDate: null,
+    };
     const snapshot = applyPackageRankingGateToSnapshot({
       currentRank: Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level)),
       currentRankLabel: RANK_REQUIREMENTS[Math.max(toNumber(row.highest_rank_no), toNumber(row.current_rank), toNumber(row.rank_level))]?.label || 'Unranked',
@@ -1083,6 +1123,11 @@ async function getAllRankings(page = 1, perPage = 30) {
       rank_date: snapshot.rankDate,
       incentive_status: snapshot.incentiveStatus,
       reward_status: snapshot.rewardStatus,
+      // Repurchase validation — ties ranking points back to actual repurchase records
+      repurchaseContributorCount: rpData.contributorCount,
+      repurchaseEvents: rpData.repurchaseEvents,
+      verifiedRepurchasePoints: rpData.verifiedPoints,
+      lastRepurchaseDate: rpData.lastRepurchaseDate,
     });
   }
 

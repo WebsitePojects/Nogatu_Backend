@@ -13,6 +13,7 @@ const {
   getUnilevelProductPointContributors,
 } = require('../services/income/unilevel');
 const { getLeadershipTraceability } = require('../services/income/leadership');
+const { getPairingCounts } = require('../services/network');
 const {
   getEffectiveAccountState,
   getAccountEntryAuditInfo,
@@ -130,42 +131,16 @@ router.get('/', memberAuth, async (req, res) => {
       drefByType[typeName] = Number(row.cnt);
     }
 
-    // 4. Get latest pairing summary from pairingstab (production chkPairing parity)
-    const [pairSummaryRows] = await pool.query(
-      `SELECT totalleft, totalpointsleft, totalright, totalpointsright,
-              \`left\`, \`right\`, totalpoints
-       FROM pairingstab WHERE uid = ?
-       ORDER BY id DESC LIMIT 1`,
-      [uid]
-    );
-
-    let leftAccounts = 0;
-    let rightAccounts = 0;
-    let leftPoints = 0;
-    let rightPoints = 0;
-    let pairingBalance = 0;
-
-    if (pairSummaryRows.length > 0) {
-      const p = pairSummaryRows[0];
-      leftAccounts = Number(p.totalleft || 0);
-      rightAccounts = Number(p.totalright || 0);
-      // Production dashboard displays these as /250-converted points.
-      leftPoints = Number(p.totalpointsleft || 0) / 250;
-      rightPoints = Number(p.totalpointsright || 0) / 250;
-      pairingBalance = Math.abs(Number(p.left || 0) - Number(p.right || 0));
-    } else {
-      // Fallback when pairing table has no rows yet.
-      const [pairingRows] = await pool.query(
-        `SELECT position, COUNT(*) as total
-         FROM usertab WHERE refid = ? GROUP BY position`,
-        [uid]
-      );
-
-      for (const row of pairingRows) {
-        if (Number(row.position) === 1) leftAccounts = Number(row.total);
-        if (Number(row.position) === 2) rightAccounts = Number(row.total);
-      }
-    }
+    // 4. Get live left/right account counts from the full binary subtree.
+    //    getPairingCounts uses binary_tree_closuretab when available and falls
+    //    back to recursive usertab traversal — always counts ALL descendants,
+    //    not just direct children.
+    const pairingCounts = await getPairingCounts(uid);
+    const leftAccounts = pairingCounts.totalLeft;
+    const rightAccounts = pairingCounts.totalRight;
+    const leftPoints = pairingCounts.totalPointsLeft;
+    const rightPoints = pairingCounts.totalPointsRight;
+    const pairingBalance = Math.abs(leftPoints - rightPoints);
 
     res.json({
       totalCashIncome,
@@ -385,12 +360,47 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
         amount: Number(row.amount || 0),
         rowType: 'credited_unilevel_payout',
       }));
+      // Aggregate by level so the UI can render a clear per-level breakdown
+      // with rate, total points contributed, projected commission, and member count.
+      const levelMap = {};
+      for (const r of productPointTrace.rows) {
+        const l = Number(r.level || 0);
+        if (!levelMap[l]) {
+          levelMap[l] = {
+            level: l,
+            ratePercent: Number(r.ratePercent || 0),
+            totalPoints: 0,
+            projectedAmount: 0,
+            contributorCount: 0,
+            members: [],
+          };
+        }
+        levelMap[l].totalPoints += Number(r.productPoints || 0);
+        levelMap[l].projectedAmount += Number(r.projectedAmount || r.amount || 0);
+        levelMap[l].contributorCount += 1;
+        levelMap[l].members.push({
+          uid: r.uid,
+          username: r.username,
+          fullname: r.fullname,
+          productPoints: Number(r.productPoints || 0),
+          amount: Number(r.amount || 0),
+        });
+      }
+      const byLevel = Object.values(levelMap).sort((a, b) => a.level - b.level);
       response.rows = [...productPointTrace.rows, ...creditedRows].slice(0, limit);
       response.total = creditedRows.reduce((sum, row) => sum + row.amount, 0);
+      response.byLevel = byLevel;
       response.summary = {
         creditedTotal: response.total,
         downlineProductPoints: productPointTrace.totalPoints,
         projectedDownlineAmount: productPointTrace.projectedAmount,
+        levelBreakdown: byLevel.map((b) => ({
+          level: b.level,
+          ratePercent: b.ratePercent,
+          totalPoints: b.totalPoints,
+          projectedAmount: b.projectedAmount,
+          contributorCount: b.contributorCount,
+        })),
       };
     } else if (metric === 'leadership-bonus') {
       const leadership = await buildLeadershipBreakdown(uid, page, perPage);
@@ -422,20 +432,63 @@ router.get('/breakdown/:metric', memberAuth, async (req, res) => {
       response.total = response.rows.reduce((sum, row) => sum + row.amount, 0);
     } else if (['left-accounts', 'right-accounts'].includes(metric)) {
       const leg = metric.startsWith('left') ? 'left' : 'right';
-      const position = leg === 'left' ? 1 : 2;
-      const [rows] = await pool.query(
-        `SELECT u.uid, u.public_uid, u.currentaccttype, u.binarypoints, u.datereg,
-                m.username, m.firstname, m.lastname
-         FROM usertab u
-         LEFT JOIN memberstab m ON m.uid = u.uid
-         WHERE u.refid = ? AND u.position = ?
-         ORDER BY u.id ASC
-         LIMIT ?`,
-        [uid, position, limit]
-      );
-      response.formula = `${leg} direct binary placement rows under the current member.`;
-      response.rows = rows;
-      response.total = rows.length;
+      // Try closure table first for ALL descendants in this leg.
+      try {
+        const [closureRows] = await pool.query(
+          `SELECT c.descendant_uid AS uid, c.depth, c.leg,
+                  u.accttype, u.currentaccttype, u.binarypoints, u.datereg,
+                  m.username, m.firstname, m.lastname
+           FROM binary_tree_closuretab c
+           INNER JOIN usertab u ON u.uid = c.descendant_uid
+           LEFT JOIN memberstab m ON m.uid = u.uid
+           WHERE c.ancestor_uid = ? AND c.depth > 0 AND c.leg = ?
+           ORDER BY c.depth ASC, u.datereg ASC
+           LIMIT ?`,
+          [uid, leg, limit]
+        );
+        if (closureRows.length > 0) {
+          response.formula = `All members in the ${leg} binary subtree (via closure table), ordered by depth.`;
+          response.rows = closureRows.map((r) => ({
+            uid: Number(r.uid),
+            depth: Number(r.depth || 0),
+            leg: r.leg,
+            currentaccttype: r.currentaccttype,
+            binarypoints: r.binarypoints,
+            datereg: r.datereg,
+            username: r.username,
+            fullname: `${r.firstname || ''} ${r.lastname || ''}`.trim(),
+          }));
+          response.total = closureRows.length;
+        } else {
+          throw Object.assign(new Error('no closure entries'), { code: '_EMPTY' });
+        }
+      } catch (closureErr) {
+        if (closureErr.code !== 'ER_NO_SUCH_TABLE' && closureErr.code !== '_EMPTY') throw closureErr;
+        // Fallback: show direct children only when closure table unavailable/empty
+        const position = leg === 'left' ? 1 : 2;
+        const [rows] = await pool.query(
+          `SELECT u.uid, u.accttype, u.currentaccttype, u.binarypoints, u.datereg,
+                  m.username, m.firstname, m.lastname
+           FROM usertab u
+           LEFT JOIN memberstab m ON m.uid = u.uid
+           WHERE u.refid = ? AND u.position = ?
+           ORDER BY u.id ASC
+           LIMIT ?`,
+          [uid, position, limit]
+        );
+        response.formula = `${leg} direct binary placement only (closure table unavailable or not yet backfilled).`;
+        response.rows = rows.map((r) => ({
+          uid: Number(r.uid),
+          depth: 1,
+          leg,
+          currentaccttype: r.currentaccttype,
+          binarypoints: r.binarypoints,
+          datereg: r.datereg,
+          username: r.username,
+          fullname: `${r.firstname || ''} ${r.lastname || ''}`.trim(),
+        }));
+        response.total = rows.length;
+      }
     } else {
       return res.status(404).json({ error: 'Unknown dashboard metric.' });
     }

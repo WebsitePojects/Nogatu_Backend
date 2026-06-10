@@ -72,7 +72,7 @@ async function buildPairingSourceMetaMap(sourceUids = [], conn = pool) {
 
   const placeholders = uniqueUids.map(() => '?').join(', ');
   const [rows] = await conn.query(
-    `SELECT uid, currentaccttype, codeid, cdamount, cdtotal, cdstatus
+    `SELECT uid, accttype, currentaccttype, codeid, cdamount, cdtotal, cdstatus
        FROM usertab
       WHERE uid IN (${placeholders})`,
     uniqueUids
@@ -670,7 +670,8 @@ async function getPairingLegAccounts(ownerUid, accttype, side, options = {}, con
 
   const [metaRows] = await conn.query(
     `SELECT c.descendant_uid AS uid, c.depth, c.leg,
-            u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus, u.position, u.refid, u.drefid, u.datereg,
+            u.accttype, u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+            u.position, u.refid, u.drefid, u.datereg,
             m.username, m.firstname, m.lastname,
             pm.username AS placement_username
        FROM binary_tree_closuretab c
