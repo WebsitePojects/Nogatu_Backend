@@ -72,8 +72,10 @@ function adminRights(allowedRights) {
 
 // Blocks all non-GET requests for readonly admin accounts.
 // Mount this BEFORE admin routes in index.js.
+// Role values: 'administrator', 'cashier', 'bod', 'readonly' (or legacy 'admin').
 function readonlyGuard(req, res, next) {
-  if (req.session?.adminrole !== 'readonly') return next();
+  const role = req.session?.adminrole;
+  if (role !== 'readonly') return next();
   if (req.method === 'GET') return next();
   return res.status(403).json({
     error: 'This account is read-only. No changes can be made.',

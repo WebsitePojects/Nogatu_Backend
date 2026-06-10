@@ -278,7 +278,7 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
   }
 });
 
-router.post('/release-transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
+router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
     const { targetUsername, codes: selectedCodes } = req.body;
     const targetSanitized = sanitizeAlphaNum(targetUsername);

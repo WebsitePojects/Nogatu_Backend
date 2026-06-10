@@ -26,10 +26,20 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required' });
     }
 
-    const [rows] = await pool.query(
-      'SELECT id, username, password, name, rights, role FROM accesstab WHERE username = ?',
-      [username]
-    );
+    let rows;
+    try {
+      [rows] = await pool.query(
+        'SELECT id, username, password, name, rights, role FROM accesstab WHERE username = ?',
+        [username]
+      );
+    } catch (fieldErr) {
+      if (fieldErr.code !== 'ER_BAD_FIELD_ERROR') throw fieldErr;
+      // role column not yet migrated — query without it
+      [rows] = await pool.query(
+        'SELECT id, username, password, name, rights FROM accesstab WHERE username = ?',
+        [username]
+      );
+    }
 
     if (rows.length === 0) {
       return res.status(401).json({
@@ -85,10 +95,15 @@ router.post('/login', async (req, res) => {
       });
     });
 
+    // Normalise legacy 'admin' role value to 'administrator' in-session
+    // so all downstream code sees a consistent role label.
+    const rawRole = admin.role || 'admin';
+    const normalizedRole = rawRole === 'admin' ? 'administrator' : rawRole;
+
     req.session.adminid = admin.username;
     req.session.adminname = admin.name;
     req.session.adminrights = admin.rights;
-    req.session.adminrole = admin.role || 'admin';
+    req.session.adminrole = normalizedRole;
     delete req.session.uid;
     delete req.session.publicUid;
     delete req.session.username;
@@ -114,8 +129,8 @@ router.post('/login', async (req, res) => {
         username: admin.username,
         name: admin.name,
         rights: admin.rights,
-        rightsName: admin.rights === 1 ? 'Administrator' : admin.rights === 2 ? 'Cashier' : 'BOD',
-        role: admin.role || 'admin',
+        rightsName: admin.rights === 1 ? 'Administrator' : admin.rights === 2 ? 'Cashier' : admin.rights === 3 ? 'BOD' : 'Admin',
+        role: normalizedRole,
       },
     });
   } catch (err) {
@@ -138,13 +153,14 @@ router.post('/logout', (req, res) => {
  */
 router.get('/session', (req, res) => {
   if (req.session && req.session.adminid) {
+    const sessionRole = req.session.adminrole || 'administrator';
     res.json({
       authenticated: true,
       admin: {
         username: req.session.adminid,
         name: req.session.adminname,
         rights: req.session.adminrights,
-        role: req.session.adminrole || 'admin',
+        role: sessionRole === 'admin' ? 'administrator' : sessionRole,
       },
     });
   } else {
