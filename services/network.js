@@ -243,50 +243,9 @@ async function getPairingCounts(uid) {
     totalRight: 0, totalPointsRight: 0,
   };
 
-  try {
-    const [rows] = await pool.query(
-      `SELECT c.descendant_uid AS uid, c.leg, u.currentaccttype, u.binarypoints,
-              u.codeid, u.cdamount, u.cdtotal, u.cdstatus
-         FROM binary_tree_closuretab c
-         INNER JOIN usertab u ON u.uid = c.descendant_uid
-        WHERE c.ancestor_uid = ?
-          AND c.depth > 0
-          AND c.leg IN ('left', 'right')
-        ORDER BY c.depth ASC, u.uid ASC`,
-      [uid]
-    );
-
-    // Only use the closure table result if it actually has entries for this member.
-    // If the table exists but is not yet backfilled for this member (rows.length === 0),
-    // fall through to the recursive usertab traversal below.
-    if (rows.length > 0) {
-      for (const row of rows) {
-        if (row.leg === 'left') {
-          result.totalLeft += 1;
-        } else if (row.leg === 'right') {
-          result.totalRight += 1;
-        }
-
-        const effectiveRow = await getEffectiveAccountState(row.uid, row);
-        if (!effectiveRow || !countsForPairingSource(effectiveRow)) continue;
-        const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
-        if (row.leg === 'left') {
-          result.totalPointsLeft += Number(points || 0);
-        } else if (row.leg === 'right') {
-          result.totalPointsRight += Number(points || 0);
-        }
-      }
-      return result;
-    }
-
-    // Closure table exists but has no entries for this member — fall through to
-    // the recursive usertab traversal so counts are never silently zero.
-  } catch (error) {
-    if (error.code !== 'ER_NO_SUCH_TABLE') {
-      throw error;
-    }
-  }
-
+  // Always traverse usertab recursively so that PHP-era registrations (not yet
+  // in binary_tree_closuretab) are counted. The closure table is only partially
+  // backfilled and using it alone produces silently truncated counts.
   await _collectSubtreePairingCounts(uid, 'left', result);
   await _collectSubtreePairingCounts(uid, 'right', result);
   return result;
@@ -295,7 +254,7 @@ async function getPairingCounts(uid) {
 async function _collectSubtreePairingCounts(parentUid, leg, result) {
   const position = leg === 'left' ? 1 : 2;
   const [rows] = await pool.query(
-    `SELECT uid, refid, drefid, position, currentaccttype, binarypoints,
+    `SELECT uid, refid, drefid, position, accttype, currentaccttype, binarypoints,
             codeid, cdamount, cdtotal, cdstatus
        FROM usertab
       WHERE refid = ? AND position = ?`,
@@ -326,7 +285,7 @@ async function _collectSubtreePairingCounts(parentUid, leg, result) {
 
 async function _collectDescendantPairingCounts(uid, rootLeg, result) {
   const [rows] = await pool.query(
-    `SELECT uid, refid, drefid, position, currentaccttype, binarypoints,
+    `SELECT uid, refid, drefid, position, accttype, currentaccttype, binarypoints,
             codeid, cdamount, cdtotal, cdstatus
        FROM usertab
       WHERE refid = ?`,

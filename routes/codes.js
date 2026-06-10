@@ -35,19 +35,31 @@ router.get('/', memberAuth, async (req, res) => {
       [uid, offset, perPage]
     );
 
-    const formatted = codes.map(c => ({
-      id: c.id,
-      code: c.code,
-      producttype: c.producttype,
-      codetype: Number(c.codetype || 0),
-      codeTypeLabel: CODE_PREFIXES[Number(c.codetype || 0)] || 'Unknown',
-      producttypeName: PRODUCT_TYPES[c.producttype] || `Type ${c.producttype}`,
-      accountLabel: `${ACCOUNT_TYPES[c.producttype] || PRODUCT_TYPES[c.producttype] || `Type ${c.producttype}`} - ${CODE_PREFIXES[Number(c.codetype || 0)] || 'Unknown'}`,
-      productamount: Number(c.productamount || 0),
-      codestatus: c.codestatus,
-      statusLabel: c.codestatus === 0 ? 'For Release' : c.codestatus === 1 ? 'Available' : 'Used',
-      dategen: c.dategen,
-    }));
+    const formatted = codes.map(c => {
+      const isMaintenance = Number(c.producttype || 0) >= 100;
+      // PHP stores codetype = producttype for maintenance codes (not 1/2/3).
+      // Treat any codetype outside 1-3 on a maintenance code as 'MC'.
+      const rawCodetype = Number(c.codetype || 0);
+      const resolvedCodetype = isMaintenance ? 0 : rawCodetype;
+      const codeTypeLabel = isMaintenance ? 'MC' : (CODE_PREFIXES[rawCodetype] || 'Unknown');
+      const productName = PRODUCT_TYPES[c.producttype] || `Type ${c.producttype}`;
+      const accountLabel = isMaintenance
+        ? `${productName} — Repurchase`
+        : `${ACCOUNT_TYPES[c.producttype] || productName} - ${CODE_PREFIXES[rawCodetype] || 'Unknown'}`;
+      return {
+        id: c.id,
+        code: c.code,
+        producttype: c.producttype,
+        codetype: resolvedCodetype,
+        codeTypeLabel,
+        producttypeName: productName,
+        accountLabel,
+        productamount: Number(c.productamount || 0),
+        codestatus: c.codestatus,
+        statusLabel: c.codestatus === 0 ? 'For Release' : c.codestatus === 1 ? 'Available' : 'Used',
+        dategen: c.dategen,
+      };
+    });
 
     res.json({
       codes: formatted,
