@@ -282,14 +282,23 @@ async function backfillHistoricalBinaryPointEvents(ownerUid, conn = pool) {
     return { inserted: 0, skipped: 0 };
   }
 
+  // Only load descendants that do not yet have a registration event.
+  // On the first page load this processes everyone; on repeat loads it only
+  // processes newly-joined members — preventing thousands of sequential DB
+  // round-trips that would otherwise run on every visit.
   const [descendants] = await conn.query(
     `SELECT u.uid, u.refid, u.drefid, u.position, u.accttype, u.currentaccttype,
             u.codeid, u.cdamount, u.cdtotal, u.cdstatus, u.binarypoints,
             DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i:%s') AS datereg
        FROM binary_tree_closuretab c
        INNER JOIN usertab u ON u.uid = c.descendant_uid
+       LEFT JOIN binary_point_eventstab existing
+              ON existing.source_member_uid = u.uid
+             AND existing.event_type = 'registration'
+             AND existing.deleted_at IS NULL
       WHERE c.ancestor_uid = ?
         AND c.depth > 0
+        AND existing.id IS NULL
       ORDER BY c.depth ASC, u.datereg ASC, u.uid ASC`,
     [ownerUid]
   );
@@ -331,12 +340,16 @@ async function backfillHistoricalBinaryPointEvents(ownerUid, conn = pool) {
     }
 
     const [upgradeRows] = await conn.query(
-      `SELECT id, uid, producttype, binarypoints,
-              DATE_FORMAT(transdate, '%Y-%m-%d %H:%i:%s') AS transdate
-         FROM upgradetab
-        WHERE uid = ?
-          AND transtype = 1
-        ORDER BY transdate ASC, id ASC`,
+      `SELECT ut.id, ut.uid, ut.producttype, ut.binarypoints,
+              DATE_FORMAT(ut.transdate, '%Y-%m-%d %H:%i:%s') AS transdate
+         FROM upgradetab ut
+         LEFT JOIN binary_point_eventstab existing_upg
+                ON existing_upg.reference_key = SHA2(CONCAT('binary-point-event:upgrade:', ut.id), 256)
+               AND existing_upg.deleted_at IS NULL
+        WHERE ut.uid = ?
+          AND ut.transtype = 1
+          AND existing_upg.id IS NULL
+        ORDER BY ut.transdate ASC, ut.id ASC`,
       [descendant.uid]
     );
 
@@ -415,31 +428,20 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
   const leftEvents = events.filter((row) => row.ownerLeg === 'left');
   const rightEvents = events.filter((row) => row.ownerLeg === 'right');
   const eligibility = await getBinaryPairingEligibility(ownerUid, conn);
+  // PHP production has no personal-direct unlock gate: all account types
+  // can receive pairing income whenever eligible source nodes exist on both
+  // legs of their subtree.  Credits are never locked — eligibility is
+  // informational only (shown in the UI but does not block earnings).
   const ledgerRows = buildPairingLedgerEntries({
     ownerUid,
     accttype,
     leftEvents,
     rightEvents,
-    creditsLocked: !eligibility.canEarnPairing,
-    creditsLockedReason: eligibility.reason,
+    creditsLocked: false,
+    creditsLockedReason: null,
   });
-  const balances = summarizePairingBalances({
-    leftEvents,
-    rightEvents,
-    ledgerRows: eligibility.canEarnPairing ? ledgerRows : [],
-  });
+  const balances = summarizePairingBalances({ leftEvents, rightEvents, ledgerRows });
   const hasIncomeEventTable = await ensureIncomeEventTable(conn);
-
-  if (!eligibility.canEarnPairing) {
-    return {
-      rows: ledgerRows,
-      summary: summarizePairingTrace(ledgerRows),
-      sourceBackfill,
-      eligibility,
-      balances,
-      previewOnly: true,
-    };
-  }
 
   for (const row of ledgerRows) {
     let incomeEventUid = null;
@@ -664,7 +666,7 @@ async function getPairingLegAccounts(ownerUid, accttype, side, options = {}, con
   const syncResult = await syncPairingLedger(ownerUid, accttype, conn);
   const events = await loadOwnerBinaryPointEvents(ownerUid, conn);
   const legEvents = events.filter((row) => row.ownerLeg === normalizedSide);
-  const ledgerRows = normalizeLedgerTraceRows(syncResult.rows || [], null);
+  const ledgerRows = await normalizeLedgerTraceRows(syncResult.rows || [], null);
 
   const [metaRows] = await conn.query(
     `SELECT c.descendant_uid AS uid, c.depth, c.leg,

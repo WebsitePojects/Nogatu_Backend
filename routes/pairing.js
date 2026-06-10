@@ -144,7 +144,9 @@ router.get('/', memberAuth, async (req, res) => {
           }
           throw error;
         }),
-      pool.query('SELECT ttlincome2 FROM payouttotaltab WHERE uid = ? LIMIT 1', [uid]).then(([rows]) => rows),
+      pool.query('SELECT ttlincome2 FROM payouttotaltab WHERE uid = ? LIMIT 1', [uid])
+        .then(([rows]) => rows)
+        .catch(() => []),
       getBinaryPairingEligibility(uid).catch(() => ({
         canEarnPairing: true,
         leftQualifiedCount: 0,
@@ -230,7 +232,7 @@ router.get('/', memberAuth, async (req, res) => {
         sourceReason: sourceEligible
           ? null
           : 'This account cannot pass its own BP to its sponsor and uplines yet, but it can still receive SMB from eligible paid or fully paid CD downlines when both sides of the subtree have qualified BP.',
-        rule: 'Binary pairing is based on qualified BP from the left and right subtree, but the first payout unlock requires at least one personally sponsored qualified direct on either leg.',
+        rule: 'Binary pairing income is earned whenever eligible BP exists on both the left and right legs of your subtree. All account types (PD, FS, CD) can receive pairing income.',
       },
     });
   } catch (err) {
