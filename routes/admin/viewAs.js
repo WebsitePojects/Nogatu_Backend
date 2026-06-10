@@ -27,7 +27,9 @@ router.get('/search', async (req, res) => {
       return res.json({ members: [] });
     }
     const [rows] = await pool.query(
-      `SELECT m.uid, m.username, m.fullname, u.accttype, u.codeid, u.cdstatus, u.activedate
+      `SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')) AS fullname,
+              u.accttype, u.codeid, u.cdstatus, u.activedate
          FROM memberstab m
          JOIN usertab u ON u.uid = m.uid
         WHERE m.username LIKE ?
@@ -39,7 +41,7 @@ router.get('/search', async (req, res) => {
       members: rows.map((r) => ({
         uid: r.uid,
         username: r.username,
-        fullname: r.fullname,
+        fullname: String(r.fullname || '').trim(),
         accttype: r.accttype,
         acctTypeName: getAccountTypeName(r.accttype),
         codeid: r.codeid,
