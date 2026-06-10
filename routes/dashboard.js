@@ -138,8 +138,11 @@ router.get('/', memberAuth, async (req, res) => {
     const pairingCounts = await getPairingCounts(uid);
     const leftAccounts = pairingCounts.totalLeft;
     const rightAccounts = pairingCounts.totalRight;
-    const leftPoints = pairingCounts.totalPointsLeft;
-    const rightPoints = pairingCounts.totalPointsRight;
+    // binarypoints in usertab are stored as peso values (250=Bronze, 5000=Garnet, etc.)
+    // Divide by 250 to convert to PV units for dashboard display (1 PV = PHP 250 SMB)
+    const BP_PESO = 250;
+    const leftPoints = Math.round(pairingCounts.totalPointsLeft / BP_PESO);
+    const rightPoints = Math.round(pairingCounts.totalPointsRight / BP_PESO);
     const pairingBalance = Math.abs(leftPoints - rightPoints);
 
     res.json({
