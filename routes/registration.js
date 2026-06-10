@@ -612,7 +612,15 @@ router.post('/register', memberAuth, async (req, res) => {
 
     res.json(result);
   } catch (err) {
-    console.error('[Registration] Error:', err);
+    // Only write to error.log for unexpected system errors (e.g. DB failures).
+    // User-input validation rejections (plain Error, no code) and known business
+    // rule codes go to warn so they don't pollute the PM2 error stream.
+    const isKnownCode = err.code === 'DUPLICATE_ACCOUNT' || err.code === 'USERNAME_TAKEN';
+    if (!isKnownCode && err.code) {
+      console.error('[Registration] Error:', err);
+    } else if (!isKnownCode) {
+      console.warn('[Registration] Rejected:', err.message);
+    }
     if (err.code === 'DUPLICATE_ACCOUNT') {
       await writeDuplicateRegistrationAudit(req, Number(req.session.uid), err.details, {
         firstname: req.body?.firstname,
