@@ -363,7 +363,7 @@ router.put('/:uid/status', adminAuth, adminRights([1, 3]), async (req, res) => {
       [
         nextStatus,
         nextStatus === 'active' ? null : reason,
-        Number(req.session.adminid || 0) || null,
+        req.session.adminNumericId || null,
         uid,
       ]
     );
@@ -377,7 +377,7 @@ router.put('/:uid/status', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     await writeAuditLog(conn, {
       req,
-      actorUid: Number(req.session.adminid || 0) || null,
+      actorUid: req.session.adminNumericId || null,
       actorRole: 'admin',
       action: 'account.status_update',
       targetUid: uid,

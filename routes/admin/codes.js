@@ -79,30 +79,56 @@ router.get('/', adminAuth, async (req, res) => {
               m.username AS owner_username,
               TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS owner_fullname,
               ch.history AS transfer_history,
-              DATE_FORMAT(ch.datetransfer, '%Y-%m-%d %H:%i') AS last_transfer_date
+              DATE_FORMAT(ch.datetransfer, '%Y-%m-%d %H:%i') AS last_transfer_date,
+              lat.to_username AS audit_transfer_to,
+              DATE_FORMAT(lat.created_at, '%Y-%m-%d %H:%i') AS audit_transfer_date,
+              lat.admin_name AS audit_admin_name
        FROM codestab c
        LEFT JOIN memberstab m ON m.uid = c.uid
        LEFT JOIN codehistorytab ch ON ch.code = c.code
+       LEFT JOIN (
+         SELECT a.code, a.to_uid, a.created_at, tm.username AS to_username, aa.username AS admin_name
+         FROM activation_code_usagetab a
+         LEFT JOIN memberstab tm ON tm.uid = a.to_uid
+         LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
+         WHERE a.event_type = 'admin_transfer'
+           AND a.id = (
+             SELECT MAX(a2.id) FROM activation_code_usagetab a2
+             WHERE a2.code = a.code AND a2.event_type = 'admin_transfer'
+           )
+       ) lat ON lat.code = c.code
        ${whereSql}
        ORDER BY c.id DESC LIMIT ?, ?`,
       [...whereParams, offset, perPage]
     );
 
-    const codes = rows.map(r => ({
-      id: r.id,
-      code: r.code,
-      producttype: r.producttype,
-      producttypeName: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
-      uid: r.uid,
-      ownerUsername: r.owner_username || null,
-      ownerFullname: r.owner_fullname ? r.owner_fullname.trim() || null : null,
-      transferHistory: r.transfer_history || null,
-      lastTransferDate: r.last_transfer_date || null,
-      codestatus: r.codestatus,
-      statusLabel: r.codestatus === 0 ? 'Not Released' : r.codestatus === 1 ? 'Released' : 'Used',
-      releasedate: r.releasedate,
-      dategen: r.dategen,
-    }));
+    const codes = rows.map(r => {
+      const legacyHistory = r.transfer_history || null;
+      const auditTo = r.audit_transfer_to || null;
+      const auditAdmin = r.audit_admin_name || null;
+      // Build a display-ready transfer trail from whichever source has data
+      let transferHistory = legacyHistory;
+      if (!transferHistory && auditTo) {
+        transferHistory = auditAdmin
+          ? `(${auditAdmin})${auditTo}`
+          : `(admin)${auditTo}`;
+      }
+      return {
+        id: r.id,
+        code: r.code,
+        producttype: r.producttype,
+        producttypeName: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
+        uid: r.uid,
+        ownerUsername: r.owner_username || null,
+        ownerFullname: r.owner_fullname ? r.owner_fullname.trim() || null : null,
+        transferHistory,
+        lastTransferDate: r.last_transfer_date || r.audit_transfer_date || null,
+        codestatus: r.codestatus,
+        statusLabel: r.codestatus === 0 ? 'Not Released' : r.codestatus === 1 ? 'Released' : 'Used',
+        releasedate: r.releasedate,
+        dategen: r.dategen,
+      };
+    });
 
     res.json({ codes, total, page, totalPages: Math.ceil(total / perPage) });
   } catch (err) {
@@ -212,7 +238,7 @@ router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
           codeRowId: codeRows[0].id,
           eventType: 'release',
           toUid: codeRows[0].uid || null,
-          actorAdminId: Number(req.session.adminid) || null,
+          actorAdminId: req.session.adminNumericId || null,
           processKey: createProcessKey(['code-release', code, req.session.adminid, Date.now()]),
         });
       }
@@ -274,7 +300,7 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
         eventType: 'admin_transfer',
         fromUid: codeRows[0].uid || null,
         toUid: targetUid,
-        actorAdminId: Number(req.session.adminid) || null,
+        actorAdminId: req.session.adminNumericId || null,
         notes: {
           targetUsername: targetSanitized,
         },
@@ -328,7 +354,7 @@ router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, 
             codeRowId: codeRow.id,
             eventType: 'release',
             toUid: codeRow.uid || null,
-            actorAdminId: Number(req.session.adminid) || null,
+            actorAdminId: req.session.adminNumericId || null,
             processKey: createProcessKey(['code-release', code, req.session.adminid, 'release-transfer', Date.now()]),
           });
         }
@@ -353,7 +379,7 @@ router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, 
         eventType: 'admin_transfer',
         fromUid: codeRow.uid || null,
         toUid: targetUid,
-        actorAdminId: Number(req.session.adminid) || null,
+        actorAdminId: req.session.adminNumericId || null,
         notes: {
           targetUsername: targetSanitized,
           releasedAndTransferred: true,

@@ -101,6 +101,7 @@ router.post('/login', async (req, res) => {
     const normalizedRole = rawRole === 'admin' ? 'administrator' : rawRole;
 
     req.session.adminid = admin.username;
+    req.session.adminNumericId = admin.id;
     req.session.adminname = admin.name;
     req.session.adminrights = admin.rights;
     req.session.adminrole = normalizedRole;
