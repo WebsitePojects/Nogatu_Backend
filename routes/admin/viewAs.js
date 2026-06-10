@@ -63,8 +63,10 @@ router.get('/:uid/profile', async (req, res) => {
   try {
     const uid = Number(req.params.uid);
     const [rows] = await pool.query(
-      `SELECT m.uid, m.username, m.fullname, m.email, m.mobileno, m.tin,
-              m.address, m.birthdate, m.gender,
+      `SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')) AS fullname,
+              m.email, m.contactnos AS mobileno, m.address,
+              m.dob AS birthdate, m.gender,
               u.accttype, u.codeid, u.cdstatus, u.cdamount, u.cdtotal,
               u.activedate, u.position, u.refid, u.drefid, u.binarypoints,
               u.account_status, u.account_status_reason
@@ -77,26 +79,27 @@ router.get('/:uid/profile', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'Member not found' });
 
     const r = rows[0];
+    r.fullname = String(r.fullname || '').trim();
     const effective = await getEffectiveAccountState(r);
 
     // Fetch binary parent info
     let binaryParent = null;
     if (r.refid) {
       const [pRows] = await pool.query(
-        'SELECT uid, username, fullname FROM memberstab WHERE uid = ? LIMIT 1',
+        `SELECT uid, username, CONCAT(COALESCE(firstname,''), ' ', COALESCE(lastname,'')) AS fullname FROM memberstab WHERE uid = ? LIMIT 1`,
         [r.refid]
       );
-      if (pRows.length) binaryParent = { uid: pRows[0].uid, username: pRows[0].username, fullname: pRows[0].fullname };
+      if (pRows.length) binaryParent = { uid: pRows[0].uid, username: pRows[0].username, fullname: String(pRows[0].fullname || '').trim() };
     }
 
     // Fetch sponsor info
     let sponsor = null;
     if (r.drefid) {
       const [sRows] = await pool.query(
-        'SELECT uid, username, fullname FROM memberstab WHERE uid = ? LIMIT 1',
+        `SELECT uid, username, CONCAT(COALESCE(firstname,''), ' ', COALESCE(lastname,'')) AS fullname FROM memberstab WHERE uid = ? LIMIT 1`,
         [r.drefid]
       );
-      if (sRows.length) sponsor = { uid: sRows[0].uid, username: sRows[0].username, fullname: sRows[0].fullname };
+      if (sRows.length) sponsor = { uid: sRows[0].uid, username: sRows[0].username, fullname: String(sRows[0].fullname || '').trim() };
     }
 
     res.json({
@@ -105,7 +108,6 @@ router.get('/:uid/profile', async (req, res) => {
       fullname: r.fullname,
       email: r.email,
       mobileno: r.mobileno,
-      tin: r.tin,
       address: r.address,
       birthdate: r.birthdate,
       gender: r.gender,
@@ -138,7 +140,9 @@ router.get('/:uid/dashboard', async (req, res) => {
   try {
     const uid = Number(req.params.uid);
     const [memberRows] = await pool.query(
-      `SELECT m.uid, m.username, m.fullname, u.accttype, u.codeid, u.cdstatus
+      `SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')) AS fullname,
+              u.accttype, u.codeid, u.cdstatus
          FROM memberstab m JOIN usertab u ON u.uid = m.uid
         WHERE m.uid = ? LIMIT 1`,
       [uid]
@@ -166,7 +170,7 @@ router.get('/:uid/dashboard', async (req, res) => {
     res.json({
       uid: member.uid,
       username: member.username,
-      fullname: member.fullname,
+      fullname: String(member.fullname || '').trim(),
       accttype: member.accttype,
       acctTypeName: getAccountTypeName(member.accttype),
       codeid: member.codeid,
@@ -236,7 +240,7 @@ router.get('/:uid/genealogy', async (req, res) => {
     const type = String(req.query.type || 'binary');
 
     const [memberRows] = await pool.query(
-      'SELECT uid, username, fullname FROM memberstab WHERE uid = ? LIMIT 1',
+      `SELECT uid, username FROM memberstab WHERE uid = ? LIMIT 1`,
       [uid]
     );
     if (memberRows.length === 0) return res.status(404).json({ error: 'Member not found' });
@@ -244,21 +248,24 @@ router.get('/:uid/genealogy', async (req, res) => {
     if (type === 'unilevel') {
       // Fetch up to 3 levels of unilevel (drefid-based) tree
       const [rows] = await pool.query(
-        `SELECT m.uid, m.username, m.fullname,
+        `SELECT m.uid, m.username,
+                CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')) AS fullname,
                 u.accttype, u.codeid, u.cdstatus, u.drefid, u.activedate,
                 1 AS level
            FROM usertab u
            JOIN memberstab m ON m.uid = u.uid
           WHERE u.drefid = ?
           UNION ALL
-         SELECT m.uid, m.username, m.fullname,
+         SELECT m.uid, m.username,
+                CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')),
                 u.accttype, u.codeid, u.cdstatus, u.drefid, u.activedate,
                 2 AS level
            FROM usertab u
            JOIN memberstab m ON m.uid = u.uid
           WHERE u.drefid IN (SELECT uid FROM usertab WHERE drefid = ?)
           UNION ALL
-         SELECT m.uid, m.username, m.fullname,
+         SELECT m.uid, m.username,
+                CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')),
                 u.accttype, u.codeid, u.cdstatus, u.drefid, u.activedate,
                 3 AS level
            FROM usertab u
@@ -290,21 +297,24 @@ router.get('/:uid/genealogy', async (req, res) => {
 
     // Binary tree — 3 levels deep
     const [rows] = await pool.query(
-      `SELECT m.uid, m.username, m.fullname,
+      `SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')) AS fullname,
               u.accttype, u.codeid, u.cdstatus, u.refid, u.position, u.binarypoints, u.activedate,
               1 AS level
          FROM usertab u
          JOIN memberstab m ON m.uid = u.uid
         WHERE u.refid = ?
         UNION ALL
-       SELECT m.uid, m.username, m.fullname,
+       SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')),
               u.accttype, u.codeid, u.cdstatus, u.refid, u.position, u.binarypoints, u.activedate,
               2 AS level
          FROM usertab u
          JOIN memberstab m ON m.uid = u.uid
         WHERE u.refid IN (SELECT uid FROM usertab WHERE refid = ?)
         UNION ALL
-       SELECT m.uid, m.username, m.fullname,
+       SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')),
               u.accttype, u.codeid, u.cdstatus, u.refid, u.position, u.binarypoints, u.activedate,
               3 AS level
          FROM usertab u
@@ -396,7 +406,8 @@ router.get('/:uid/referrals', async (req, res) => {
     if (memberRows.length === 0) return res.status(404).json({ error: 'Member not found' });
 
     const [rows] = await pool.query(
-      `SELECT m.uid, m.username, m.fullname,
+      `SELECT m.uid, m.username,
+              CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,'')) AS fullname,
               u.accttype, u.codeid, u.cdstatus, u.activedate, u.position
          FROM usertab u
          JOIN memberstab m ON m.uid = u.uid
