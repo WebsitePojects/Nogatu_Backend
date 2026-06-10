@@ -311,7 +311,6 @@ app.use('/api/admin/messages', require('./routes/admin/messages'));
 app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 app.use('/api/admin/finance', require('./routes/admin/finance'));
 app.use('/api/admin/applications', require('./routes/admin/applications'));
-app.use('/api/admin/view-as', require('./routes/admin/viewAs'));
 
 app.get('/health', (_req, res) => {
   res.json({
