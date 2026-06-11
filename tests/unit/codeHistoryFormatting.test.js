@@ -5,36 +5,46 @@ const {
   formatActivationHistoryEntry,
 } = require('../../services/codeHistory');
 
-test('activation history formatter exposes clear transfer and release labels', () => {
+test('activation history formatter exposes generator, release, and transfer actors clearly', () => {
+  const generatedRow = formatActivationHistoryEntry({
+    code: 'GEN123',
+    event_type: 'generated',
+    code_processid: 'nogatucashier',
+    created_at: '2026-06-11 20:00:00',
+  });
+
   const releaseRow = formatActivationHistoryEntry({
     code: 'ABC123',
     event_type: 'release',
-    actor_admin_name: 'Admin 1',
-    created_at: '2026-05-15 10:00:00',
+    actor_admin_name: 'nogatucashier',
+    created_at: '2026-06-11 20:05:00',
   });
 
   const transferRow = formatActivationHistoryEntry({
     code: 'XYZ789',
-    event_type: 'transfer',
-    from_username: 'sponsor1',
-    to_username: 'member2',
-    actor_username: 'sponsor1',
-    created_at: '2026-05-15 11:00:00',
+    event_type: 'admin_transfer',
+    from_username: 'nogatucashier',
+    to_username: '00001',
+    actor_admin_name: 'nogatucashier',
+    created_at: '2026-06-11 20:10:00',
   });
 
+  assert.equal(generatedRow.eventLabel, 'Generated');
+  assert.equal(generatedRow.summary, 'nogatucashier generated this code.');
   assert.equal(releaseRow.eventLabel, 'Released');
-  assert.equal(releaseRow.summary, 'Admin 1 released this code.');
-  assert.equal(transferRow.eventLabel, 'Transferred');
-  assert.equal(transferRow.summary, 'sponsor1 transferred this code to member2.');
+  assert.equal(releaseRow.summary, 'nogatucashier released this code.');
+  assert.equal(transferRow.eventLabel, 'Admin Transfer');
+  assert.equal(transferRow.summary, 'nogatucashier transferred this code to 00001.');
 });
 
-test('activation history formatter falls back to legacy history strings when structured data is absent', () => {
+test('activation history formatter turns legacy transfer chains into readable summaries', () => {
   const row = formatActivationHistoryEntry({
     code: 'LEGACY1',
-    legacy_history: 'admin->ver->bri',
-    created_at: '2026-05-15 12:00:00',
+    legacy_history: '(nogatuadmin)Ann050890 -> (Ann050890)Malou05',
+    datetransfer: '2026-06-11 20:15:00',
   });
 
-  assert.equal(row.eventLabel, 'Legacy History');
-  assert.equal(row.summary, 'admin->ver->bri');
+  assert.equal(row.eventLabel, 'Transfer History');
+  assert.match(row.summary, /currently held by Malou05/i);
+  assert.match(row.summary, /nogatuadmin/i);
 });

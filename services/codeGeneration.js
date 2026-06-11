@@ -64,7 +64,22 @@ function buildGeneratedCode(num, productType, codeType) {
  * @param {string} adminId - Admin who generated codes
  * @returns {Array} Generated codes
  */
-async function generateCodes(noOfCodes, productType, codeType, stockistId, adminId) {
+function normalizeAdminContext(adminContext) {
+  if (adminContext && typeof adminContext === 'object' && !Array.isArray(adminContext)) {
+    return {
+      adminUsername: adminContext.adminUsername || adminContext.adminId || null,
+      actorAdminId: Number(adminContext.actorAdminId || adminContext.adminNumericId || 0) || null,
+    };
+  }
+
+  return {
+    adminUsername: adminContext ? String(adminContext) : null,
+    actorAdminId: null,
+  };
+}
+
+async function generateCodes(noOfCodes, productType, codeType, stockistId, adminContext) {
+  const normalizedAdmin = normalizeAdminContext(adminContext);
   // Get current max ID from codestab
   const [maxRows] = await pool.query('SELECT MAX(id) as maxId FROM codestab');
   const currentMax = Number(maxRows[0]?.maxId || 0);
@@ -98,7 +113,7 @@ async function generateCodes(noOfCodes, productType, codeType, stockistId, admin
       code = buildGeneratedCode(num, productType, codeType);
     }
 
-    await codeInsert(code, productType, codeType, stockistId, adminId);
+    await codeInsert(code, productType, codeType, stockistId, normalizedAdmin);
     generatedCodes.push(code);
   }
 
@@ -109,33 +124,47 @@ async function generateCodes(noOfCodes, productType, codeType, stockistId, admin
  * Insert a single code into the database
  * Mirrors PHP codeInsert()
  */
-async function codeInsert(code, productType, codeType, stockistId, adminId) {
+async function codeInsert(code, productType, codeType, stockistId, adminContext) {
   const config = PRODUCT_CONFIG[productType];
   if (!config) throw new Error(`Unknown product type: ${productType}`);
+  const { adminUsername, actorAdminId } = normalizeAdminContext(adminContext);
 
-  const [result] = await pool.query(
-    `INSERT INTO codestab
-     (id, code, producttype, productamount, codetype, directreferral,
-      binarypoints, unilevelpoints, incentivepoints, profitsharing,
-      stockistid, invoiceid, uid, dateused, dategen, releasedate, codestatus, processid)
-     VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NOW(), 0, 0, NULL)`,
-    [code, productType, config.productamount, codeType,
-     config.directreferral, config.binarypoints, config.unilevelpoints,
-     config.incentivepoints, config.profitsharing, stockistId]
-  );
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
 
-  await appendActivationCodeUsage(pool, {
-    code,
-    codeRowId: result.insertId || null,
-    eventType: 'generated',
-    actorAdminId: Number(adminId) || null,
-    notes: {
-      productType: Number(productType),
-      codeType: Number(codeType),
-      stockistId: Number(stockistId) || null,
-    },
-    processKey: createProcessKey(['code-generated', code, result.insertId || code, adminId || 'system']),
-  });
+    const [result] = await conn.query(
+      `INSERT INTO codestab
+       (id, code, producttype, productamount, codetype, directreferral,
+        binarypoints, unilevelpoints, incentivepoints, profitsharing,
+        stockistid, invoiceid, uid, dateused, dategen, releasedate, codestatus, processid)
+       VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NOW(), 0, 0, ?)`,
+      [code, productType, config.productamount, codeType,
+       config.directreferral, config.binarypoints, config.unilevelpoints,
+       config.incentivepoints, config.profitsharing, stockistId, adminUsername]
+    );
+
+    await appendActivationCodeUsage(conn, {
+      code,
+      codeRowId: result.insertId || null,
+      eventType: 'generated',
+      actorAdminId,
+      notes: {
+        productType: Number(productType),
+        codeType: Number(codeType),
+        stockistId: Number(stockistId) || null,
+        generatedByUsername: adminUsername || null,
+      },
+      processKey: createProcessKey(['code-generated', code, result.insertId || code, adminUsername || 'system']),
+    });
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }
 
 module.exports = {

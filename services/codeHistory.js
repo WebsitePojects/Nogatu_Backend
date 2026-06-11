@@ -57,6 +57,7 @@ function formatActivationHistoryEntry(row) {
   const actorName = pickName(row.actor_username, row.actor_admin_name ? row.actor_admin_name : (row.actor_admin_id ? `Admin #${row.actor_admin_id}` : null));
   const fromName = pickName(row.from_username, row.from_uid ? `UID ${row.from_uid}` : null);
   const toName = pickName(row.to_username, row.to_uid ? `UID ${row.to_uid}` : null);
+  const generatorUsername = row.generator_username || row.code_processid || null;
 
   let summary = row.legacy_history
     ? parseLegacySummary(row.legacy_history)
@@ -64,7 +65,9 @@ function formatActivationHistoryEntry(row) {
   if (eventType === 'generated') {
     summary = actorName !== 'Unknown'
       ? `${actorName} generated this code.`
-      : toName !== 'Unknown'
+      : generatorUsername
+        ? `${generatorUsername} generated this code.`
+        : toName !== 'Unknown'
         ? `Generated this code for ${toName}.`
         : 'Generated this code.';
   } else if (eventType === 'release') {
@@ -113,6 +116,8 @@ function formatActivationHistoryEntry(row) {
     fromUsername: row.from_username || null,
     toUid: toNumber(row.to_uid),
     toUsername: row.to_username || null,
+    generatorUsername,
+    generatorName: row.generator_name || null,
     registrationUid: toNumber(row.registration_uid),
     upgradeUid: toNumber(row.upgrade_uid),
     legacyHistory: row.legacy_history || null,
@@ -146,12 +151,17 @@ async function listMemberActivationHistory(uid, page = 1, perPage = 20, conn = p
           fm.username AS from_username,
           tm.username AS to_username,
           am.username AS actor_username,
-          aa.username AS actor_admin_name
+          aa.username AS actor_admin_name,
+          c.processid AS code_processid,
+          ga.username AS generator_username,
+          ga.name AS generator_name
        FROM activation_code_usagetab a
        LEFT JOIN memberstab fm ON fm.uid = a.from_uid
        LEFT JOIN memberstab tm ON tm.uid = a.to_uid
        LEFT JOIN memberstab am ON am.uid = a.actor_uid
        LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
+       LEFT JOIN codestab c ON c.code = a.code
+       LEFT JOIN accesstab ga ON ga.username = c.processid
        WHERE a.from_uid = ? OR a.to_uid = ? OR a.actor_uid = ? OR a.registration_uid = ? OR a.upgrade_uid = ?
        ORDER BY a.created_at DESC, a.id DESC
        LIMIT ?, ?`,
@@ -214,12 +224,17 @@ async function listAdminActivationHistory({ page = 1, perPage = 30, codeQuery = 
           fm.username AS from_username,
           tm.username AS to_username,
           am.username AS actor_username,
-          aa.username AS actor_admin_name
+          aa.username AS actor_admin_name,
+          c.processid AS code_processid,
+          ga.username AS generator_username,
+          ga.name AS generator_name
        FROM activation_code_usagetab a
        LEFT JOIN memberstab fm ON fm.uid = a.from_uid
        LEFT JOIN memberstab tm ON tm.uid = a.to_uid
        LEFT JOIN memberstab am ON am.uid = a.actor_uid
        LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
+       LEFT JOIN codestab c ON c.code = a.code
+       LEFT JOIN accesstab ga ON ga.username = c.processid
        ${whereSql}
        ORDER BY a.created_at DESC, a.id DESC
        LIMIT ?, ?`,

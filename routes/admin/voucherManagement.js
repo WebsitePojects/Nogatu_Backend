@@ -6,8 +6,14 @@ const { getAccountTypeName } = require('../../utils/helpers');
 const {
   PACKAGE_AMOUNTS,
   buildVoucherExpiryLabel,
+  createManualVoucherAvailment,
   grantVouchersToExistingMembers,
   getVoucherExpiryMode,
+  getVoucherAvailmentById,
+  getVoucherAvailments,
+  listVoucherGrantCandidates,
+  markVoucherAvailmentClaimed,
+  updateManualVoucherAvailment,
   UNUSED_VOUCHER_EXPIRY_MONTHS,
 } = require('../../services/voucher');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
@@ -16,22 +22,40 @@ async function ensureVoucherTables() {
   await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
 }
 
+async function ensureVoucherListTables() {
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHER_LIST, 'Voucher list');
+}
+
+async function ensureVoucherGrantTables() {
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHER_GRANTS, 'Voucher grants');
+}
+
+async function ensureVoucherTransactionTables() {
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHER_TRANSACTIONS, 'Voucher transactions');
+}
+
 router.use(adminAuth, adminRights([1, 2, 3]));
-router.use(async (_req, res, next) => {
-  try {
-    await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
-    next();
-  } catch (error) {
-    if (error.code === 'SCHEMA_NOT_READY') {
-      return res.status(503).json({ error: error.message });
-    }
-    return next(error);
-  }
-});
 
 function normalizeVoucherStatus(raw) {
   const value = String(raw || 'all').toLowerCase();
   return ['1', '2', '3', '4'].includes(value) ? Number(value) : 'all';
+}
+
+function getVoucherActor(req) {
+  return {
+    actorAdminId: Number(req.session?.adminid || 0) || null,
+    actorAdmin: String(req.session?.adminusername || req.session?.adminname || req.session?.username || '').trim() || null,
+  };
+}
+
+function isOptionalVoucherDetailSchemaError(error) {
+  return ['SCHEMA_NOT_READY', 'ER_NO_SUCH_TABLE', 'ER_BAD_FIELD_ERROR'].includes(error?.code);
+}
+
+function getVoucherTransactionType(row) {
+  if (row.source_type === 'manual_availment') return 'Manual Voucher Availment';
+  if (row.source_type === 'voucher_product_request') return 'Voucher Product Request';
+  return 'Voucher Redemption';
 }
 
 /**
@@ -39,7 +63,7 @@ function normalizeVoucherStatus(raw) {
  */
 router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
-    await ensureVoucherTables();
+    await ensureVoucherListTables();
 
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = 30;
@@ -147,31 +171,123 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
  */
 router.get('/:id/transactions', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
-    await ensureVoucherTables();
+    await ensureVoucherTransactionTables();
     const voucherId = Number(req.params.id);
 
-    const [rows] = await pool.query(
-      `SELECT id,
-              DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') AS transaction_date,
-              cash_paid, voucher_used, total_value
-       FROM voucher_transactionstab
-       WHERE voucher_id = ?
-       ORDER BY transaction_date DESC, id DESC`,
-      [voucherId]
-    );
+    let rows;
+    try {
+      [rows] = await pool.query(
+        `SELECT id,
+                DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') AS transaction_date,
+                cash_paid, voucher_used, total_value,
+                source_type, availment_id, external_reference
+         FROM voucher_transactionstab
+         WHERE voucher_id = ?
+         ORDER BY transaction_date DESC, id DESC`,
+        [voucherId]
+      );
+    } catch (error) {
+      if (!isOptionalVoucherDetailSchemaError(error)) throw error;
+      [rows] = await pool.query(
+        `SELECT id,
+                DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') AS transaction_date,
+                cash_paid, voucher_used, total_value
+         FROM voucher_transactionstab
+         WHERE voucher_id = ?
+         ORDER BY transaction_date DESC, id DESC`,
+        [voucherId]
+      );
+    }
 
     res.json({
       transactions: rows.map((row) => ({
         id: Number(row.id),
         date: row.transaction_date,
-        type: 'Voucher Redemption',
+        type: getVoucherTransactionType(row),
         amount: Number(row.voucher_used || row.total_value || 0),
-        reference: `VTX-${row.id}`,
+        reference: row.external_reference || (row.source_type === 'manual_availment' ? `ER-${row.availment_id}` : `VTX-${row.id}`),
+        sourceType: row.source_type || 'member_checkout',
+        availmentId: row.availment_id ? Number(row.availment_id) : null,
       })),
     });
   } catch (error) {
     console.error('[Admin Voucher Management] Transactions error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/:id/availments', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const voucherId = Number(req.params.id);
+    const availments = await getVoucherAvailments(voucherId);
+    res.json({ availments });
+  } catch (error) {
+    if (isOptionalVoucherDetailSchemaError(error)) {
+      return res.json({ availments: [] });
+    }
+    console.error('[Admin Voucher Management] Availment list error:', error);
+    res.status(400).json({ error: error.message || 'Failed to load voucher availments' });
+  }
+});
+
+router.post('/:id/availments', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const voucherId = Number(req.params.id);
+    const availment = await createManualVoucherAvailment({
+      voucherId,
+      availmentDate: req.body?.availmentDate,
+      erNumber: req.body?.erNumber,
+      items: req.body?.items,
+      ...getVoucherActor(req),
+    });
+    res.status(201).json({ success: true, availment });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Availment create error:', error);
+    res.status(400).json({ error: error.message || 'Failed to create voucher availment' });
+  }
+});
+
+router.get('/availments/:availmentId', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const availment = await getVoucherAvailmentById(req.params.availmentId);
+    res.json({ availment });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Availment detail error:', error);
+    res.status(404).json({ error: error.message || 'Voucher availment not found' });
+  }
+});
+
+router.put('/availments/:availmentId', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const availment = await updateManualVoucherAvailment({
+      availmentId: req.params.availmentId,
+      availmentDate: req.body?.availmentDate,
+      erNumber: req.body?.erNumber,
+      items: req.body?.items,
+      ...getVoucherActor(req),
+    });
+    res.json({ success: true, availment });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Availment update error:', error);
+    res.status(400).json({ error: error.message || 'Failed to update voucher availment' });
+  }
+});
+
+router.put('/availments/:availmentId/claim', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  try {
+    await ensureVoucherTables();
+    const availment = await markVoucherAvailmentClaimed({
+      availmentId: req.params.availmentId,
+      ...getVoucherActor(req),
+    });
+    res.json({ success: true, availment });
+  } catch (error) {
+    console.error('[Admin Voucher Management] Availment claim error:', error);
+    res.status(400).json({ error: error.message || 'Failed to mark voucher request as claimed' });
   }
 });
 
@@ -239,7 +355,7 @@ router.put('/:id/unsuspend', adminAuth, adminRights([1, 2, 3]), async (req, res)
  */
 router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
-    await ensureVoucherTables();
+    await ensureVoucherGrantTables();
     const inserted = await grantVouchersToExistingMembers();
 
     res.json({
@@ -258,64 +374,19 @@ router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, re
  */
 router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
-    await ensureVoucherTables();
-
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = 30;
-    const offset = (page - 1) * perPage;
-    const search = String(req.query.search || '').trim();
-
-    const filters = ['u.uid = u.mainid'];
-    const params = [];
-
-    if (search) {
-      filters.push('(m.username LIKE ? OR m.firstname LIKE ? OR m.lastname LIKE ? OR CONCAT(u.uid, \'\') LIKE ?)');
-      const pattern = `%${search}%`;
-      params.push(pattern, pattern, pattern, pattern);
-    }
-
-    const whereSql = `WHERE ${filters.join(' AND ')}`;
-
-    const [countRows] = await pool.query(
-      `SELECT COUNT(*) AS total
-       FROM usertab u
-       INNER JOIN memberstab m ON m.uid = u.uid
-       LEFT JOIN voucherstab v ON v.uid = u.uid
-       ${whereSql} AND v.id IS NULL`,
-      params
-    );
-
-    const [rows] = await pool.query(
-      `SELECT u.uid, u.currentaccttype, u.accttype,
-              DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg,
-              m.username, m.firstname, m.lastname
-       FROM usertab u
-       INNER JOIN memberstab m ON m.uid = u.uid
-       LEFT JOIN voucherstab v ON v.uid = u.uid
-       ${whereSql} AND v.id IS NULL
-       ORDER BY u.datereg DESC
-       LIMIT ?, ?`,
-      [...params, offset, perPage]
-    );
-
-    res.json({
-      users: rows.map((row) => {
-        const accttype = Number(row.currentaccttype || row.accttype || 0);
-        return {
-          uid: Number(row.uid),
-          username: row.username,
-          fullname: `${row.firstname} ${row.lastname}`.trim(),
-          accttype,
-          datereg: row.datereg,
-          voucherAmount: Number(PACKAGE_AMOUNTS[accttype] || 0),
-        };
-      }),
-      total: Number(countRows[0]?.total || 0),
-      page,
-      totalPages: Math.max(1, Math.ceil(Number(countRows[0]?.total || 0) / perPage)),
+    await ensureVoucherGrantTables();
+    const result = await listVoucherGrantCandidates({
+      page: Number(req.query.page) || 1,
+      perPage: 30,
+      search: String(req.query.search || '').trim(),
+      includeAll: req.query.includeAll === '1' || req.query.includeAll === 'true',
     });
+    res.json(result);
   } catch (error) {
     console.error('[Admin Voucher Management] Grant candidates error:', error);
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -327,7 +398,7 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
-    await ensureVoucherTables();
+    await ensureVoucherGrantTables();
 
     const uids = Array.isArray(req.body?.uids)
       ? req.body.uids.map((uid) => Number(uid)).filter((uid) => Number.isFinite(uid) && uid > 0)

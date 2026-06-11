@@ -25,7 +25,7 @@ async function appendPlacementAudit(conn, payload) {
 
 async function appendActivationCodeUsage(conn, payload) {
   await conn.query(
-    `INSERT INTO activation_code_usagetab
+    `INSERT IGNORE INTO activation_code_usagetab
      (code, code_row_id, event_type, from_uid, to_uid, actor_uid, actor_admin_id,
       referral_token, registration_uid, upgrade_uid, notes, process_key)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

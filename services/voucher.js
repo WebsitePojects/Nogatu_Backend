@@ -11,9 +11,17 @@
 const { pool } = require('../config/database');
 const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
+const { TableQueryPager } = require('./tableQueryPager');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
+let voucherGrantTableReady = false;
+
+async function ensureVoucherGrantTable() {
+  if (voucherGrantTableReady) return;
+  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHER_GRANTS, 'Voucher grants');
+  voucherGrantTableReady = true;
+}
 
 async function ensureVoucherTable() {
   if (voucherTableReady) return;
@@ -58,13 +66,205 @@ const PACKAGE_AMOUNTS = {
 };
 
 const VOUCHER_PRODUCT_BY_CODE = Object.fromEntries(
-  Object.values(VOUCHER_PRODUCT_CATALOG).map((product) => [product.code, product])
+  Object.entries(VOUCHER_PRODUCT_CATALOG).map(([voucherKey, product]) => [product.code, { ...product, voucherKey }])
 );
+const VOUCHER_MEMBER_DISCOUNT_RATE = 0.3;
+const VOUCHER_MEMBER_DISCOUNT_PERCENT = Math.round(VOUCHER_MEMBER_DISCOUNT_RATE * 100);
+
+function roundCurrency(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+function computeVoucherMemberPricing(price) {
+  const originalPrice = roundCurrency(price);
+  const discountValue = roundCurrency(originalPrice * VOUCHER_MEMBER_DISCOUNT_RATE);
+  const memberPrice = roundCurrency(originalPrice - discountValue);
+
+  return {
+    originalPrice,
+    discountRate: VOUCHER_MEMBER_DISCOUNT_RATE,
+    discountPercent: VOUCHER_MEMBER_DISCOUNT_PERCENT,
+    discountValue,
+    memberPrice,
+  };
+}
+
+function toIsoStringOrNull(value) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+function toDateOrNull(value) {
+  const isoValue = toIsoStringOrNull(value);
+  return isoValue ? new Date(isoValue) : null;
+}
+
+function parseAvailmentDate(value) {
+  const parsed = new Date(value || '');
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('Availment date is required');
+  }
+  return parsed;
+}
+
+function normalizeVoucherAvailmentItems(rawItems = []) {
+  const normalizedItems = [];
+
+  for (const rawItem of Array.isArray(rawItems) ? rawItems : []) {
+    const selectedProduct = normalizeVoucherProductSelection(rawItem || {});
+    const productPricing = selectedProduct ? computeVoucherMemberPricing(selectedProduct.price) : null;
+    const description = selectedProduct
+      ? selectedProduct.name
+      : String(rawItem?.description || rawItem?.label || rawItem?.item || '').trim();
+    const manualAmount = roundCurrency(rawItem?.amount);
+    const amount = selectedProduct
+      ? (
+          Number.isFinite(manualAmount) && manualAmount > 0
+            ? manualAmount
+            : productPricing.memberPrice
+        )
+      : manualAmount;
+    if (!description || !Number.isFinite(amount) || amount <= 0) {
+      continue;
+    }
+
+    normalizedItems.push({
+      lineNo: normalizedItems.length + 1,
+      description,
+      amount,
+      ...(selectedProduct ? {
+        productCode: Number(selectedProduct.code),
+        productKey: String(selectedProduct.voucherKey || rawItem?.productKey || '').trim(),
+        originalPrice: productPricing.originalPrice,
+        discountValue: productPricing.discountValue,
+        discountPercent: productPricing.discountPercent,
+      } : {}),
+    });
+  }
+
+  return {
+    items: normalizedItems,
+    totalAmount: roundCurrency(
+      normalizedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0)
+    ),
+  };
+}
+
+function resolveVoucherAvailmentClaimUpdate({ currentStatus, now = new Date() }) {
+  const status = String(currentStatus || 'requested').toLowerCase();
+  if (status === 'claimed') {
+    throw new Error('Voucher request is already claimed');
+  }
+  if (status !== 'requested') {
+    throw new Error('Only requested voucher entries can be marked claimed');
+  }
+
+  return {
+    nextStatus: 'claimed',
+    claimedAt: (toDateOrNull(now) || new Date()).toISOString(),
+  };
+}
+
+function resolveInitialVoucherAvailmentClaimState({
+  requestSource = 'cashier',
+  actorAdminId = null,
+  actorAdmin = null,
+  claimDate = new Date(),
+}) {
+  const source = String(requestSource || 'cashier').trim().toLowerCase() || 'cashier';
+  if (source === 'member') {
+    return {
+      claimStatus: 'requested',
+      claimedAt: null,
+      claimedByAdminId: null,
+      claimedByAdmin: null,
+    };
+  }
+
+  return {
+    claimStatus: 'claimed',
+    claimedAt: (toDateOrNull(claimDate) || new Date()).toISOString(),
+    claimedByAdminId: actorAdminId,
+    claimedByAdmin: actorAdmin,
+  };
+}
+
+function computeVoucherAvailmentBalanceUpdate({
+  voucher,
+  previousTotal = 0,
+  nextTotal,
+  now = new Date(),
+}) {
+  const currentRemaining = roundCurrency(voucher?.remaining_balance);
+  const priorDeduction = roundCurrency(previousTotal);
+  const requestedDeduction = roundCurrency(nextTotal);
+
+  if (!Number.isFinite(requestedDeduction) || requestedDeduction <= 0) {
+    throw new Error('Voucher availment total must be greater than 0');
+  }
+
+  const effectiveRemaining = roundCurrency(currentRemaining + priorDeduction);
+  if (requestedDeduction > effectiveRemaining) {
+    throw new Error('Voucher balance is not enough for this availment');
+  }
+
+  const nowDate = toDateOrNull(now) || new Date();
+  let firstUsedAt = toIsoStringOrNull(voucher?.first_used_at);
+  let useExpiresAt = toIsoStringOrNull(voucher?.use_expires_at);
+
+  if (!firstUsedAt) {
+    firstUsedAt = nowDate.toISOString();
+    const firstUseDays = Number(USED_VOUCHER_EXPIRY_DAYS[Number(voucher?.package_type || 0)] || 0);
+    if (firstUseDays > 0) {
+      useExpiresAt = new Date(nowDate.getTime() + (firstUseDays * 86400000)).toISOString();
+    }
+  }
+
+  const remainingBalance = roundCurrency(effectiveRemaining - requestedDeduction);
+  const status = remainingBalance <= 0 ? 3 : 1;
+
+  return {
+    firstUsedAt,
+    useExpiresAt,
+    remainingBalance,
+    status,
+    redeemedAt: status === 3 ? nowDate.toISOString() : null,
+  };
+}
+
+function computeVoucherManualAvailmentWalletUpdate({
+  walletBalance,
+  previousTotal = 0,
+  nextTotal,
+}) {
+  const currentWalletBalance = roundCurrency(walletBalance);
+  const priorCashPaid = roundCurrency(previousTotal);
+  const nextCashPaid = roundCurrency(nextTotal);
+
+  if (!Number.isFinite(nextCashPaid) || nextCashPaid <= 0) {
+    throw new Error('Voucher availment total must be greater than 0');
+  }
+
+  const cashDelta = roundCurrency(nextCashPaid - priorCashPaid);
+  if (cashDelta > currentWalletBalance) {
+    throw new Error('Insufficient wallet balance for this voucher availment');
+  }
+
+  return {
+    cashDelta,
+    cashPaid: nextCashPaid,
+    voucherUsed: nextCashPaid,
+    totalValue: roundCurrency(nextCashPaid * 2),
+    walletBalance: roundCurrency(currentWalletBalance - cashDelta),
+  };
+}
 
 function normalizeVoucherProductSelection(options = {}) {
   const productKey = String(options.productKey || '').trim().toLowerCase();
   if (productKey && VOUCHER_PRODUCT_CATALOG[productKey]) {
-    return VOUCHER_PRODUCT_CATALOG[productKey];
+    return { ...VOUCHER_PRODUCT_CATALOG[productKey], voucherKey: productKey };
   }
 
   const productCode = Number(options.productCode || 0);
@@ -271,11 +471,11 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       throw new Error('Insufficient wallet balance for this checkout');
     }
 
-    // Buy 1 Take 1: voucher deduction matches cash paid, capped by remaining voucher balance.
-    const voucherDeduction = Math.min(cashPaid, remaining);
-    if (voucherDeduction <= 0) {
-      throw new Error('Voucher deduction must be greater than 0');
+    // Buy 1 Take 1: voucher deduction must fully match the wallet cash paid.
+    if (remaining < cashPaid) {
+      throw new Error('Voucher balance must match the wallet amount for this product request');
     }
+    const voucherDeduction = cashPaid;
 
     const newBalance = remaining - voucherDeduction;
     const newStatus = newBalance <= 0 ? 3 : 1;
@@ -305,14 +505,40 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       throw new Error('Unable to update wallet balance');
     }
 
-    // Log the transaction
-    await conn.query(
-      `INSERT INTO voucher_transactionstab (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date)
-       VALUES (?, ?, ?, ?, ?, NOW())`,
-      [memberUid, resolvedVoucherId, cashPaid, voucherDeduction, cashPaid + voucherDeduction]
+    const requestReference = `VREQ-${resolvedVoucherId}-${Date.now()}`;
+    const [transactionResult] = await conn.query(
+      `INSERT INTO voucher_transactionstab
+        (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, external_reference)
+       VALUES (?, ?, ?, ?, ?, NOW(), 'voucher_product_request', ?)`,
+      [memberUid, resolvedVoucherId, cashPaid, voucherDeduction, cashPaid + voucherDeduction, requestReference]
     );
 
     if (selectedProduct) {
+      const [availmentResult] = await conn.query(
+        `INSERT INTO voucher_availmentstab
+          (voucher_id, uid, er_number, availment_date, total_amount, transaction_id, request_source, claim_status)
+         VALUES (?, ?, ?, NOW(), ?, ?, 'member', 'requested')`,
+        [
+          resolvedVoucherId,
+          memberUid,
+          requestReference,
+          voucherDeduction,
+          Number(transactionResult.insertId || 0),
+        ]
+      );
+      const availmentId = Number(availmentResult.insertId || 0);
+      await replaceVoucherAvailmentItems(conn, availmentId, [{
+        lineNo: 1,
+        description: selectedProduct.name,
+        amount: voucherDeduction,
+        productCode: selectedProduct.code,
+        productKey: selectedProduct.voucherKey,
+      }]);
+      await conn.query(
+        'UPDATE voucher_transactionstab SET availment_id = ? WHERE id = ? LIMIT 1',
+        [availmentId, Number(transactionResult.insertId || 0)]
+      );
+
       const voucherReferenceCode = `VCHR-${resolvedVoucherId}-${Date.now()}`;
       const repurchasePoints = getVoucherRepurchasePoints();
       await conn.query(
@@ -362,6 +588,7 @@ async function getVoucherTransactions(uid) {
 
   const [rows] = await pool.query(
     `SELECT id, uid, voucher_id, cash_paid, voucher_used, total_value,
+            source_type, availment_id, external_reference,
             DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') as transaction_date
      FROM voucher_transactionstab
      WHERE uid = ?
@@ -371,6 +598,680 @@ async function getVoucherTransactions(uid) {
   );
 
   return rows;
+}
+
+function assertVoucherManualAvailmentAllowed(voucher, { allowFullyUsed = false } = {}) {
+  if (!voucher) {
+    throw new Error('Voucher not found');
+  }
+
+  const status = Number(voucher.status || 0);
+  if (status === 4) {
+    throw new Error('Suspended vouchers cannot be edited');
+  }
+  if (!allowFullyUsed && status === 3) {
+    throw new Error('Voucher is already fully used');
+  }
+
+  const now = Date.now();
+  const unusedExpiry = voucher.first_used_at ? null : toDateOrNull(voucher.expiry_date);
+  const usedExpiry = voucher.first_used_at ? toDateOrNull(voucher.use_expires_at) : null;
+  if ((unusedExpiry && unusedExpiry.getTime() < now) || (usedExpiry && usedExpiry.getTime() < now) || status === 2) {
+    throw new Error('Expired vouchers cannot be edited');
+  }
+}
+
+async function replaceVoucherAvailmentItems(conn, availmentId, items) {
+  await conn.query('DELETE FROM voucher_availment_itemstab WHERE availment_id = ?', [availmentId]);
+  for (const item of items) {
+    await conn.query(
+      `INSERT INTO voucher_availment_itemstab (availment_id, line_no, product_code, product_key, item_label, amount)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        availmentId,
+        item.lineNo,
+        item.productCode || null,
+        item.productKey || null,
+        item.description,
+        item.amount,
+      ]
+    );
+  }
+}
+
+async function getVoucherAvailmentItemsByAvailmentIds(conn, availmentIds = []) {
+  const cleanIds = Array.from(new Set(
+    (Array.isArray(availmentIds) ? availmentIds : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+  ));
+
+  if (cleanIds.length === 0) {
+    return new Map();
+  }
+
+  const placeholders = cleanIds.map(() => '?').join(',');
+  const [rows] = await conn.query(
+    `SELECT availment_id, line_no, product_code, product_key, item_label, amount
+     FROM voucher_availment_itemstab
+     WHERE availment_id IN (${placeholders})
+     ORDER BY availment_id ASC, line_no ASC, id ASC`,
+    cleanIds
+  );
+
+  const itemMap = new Map();
+  for (const row of rows) {
+    const availmentId = Number(row.availment_id || 0);
+    if (!itemMap.has(availmentId)) itemMap.set(availmentId, []);
+    itemMap.get(availmentId).push({
+      lineNo: Number(row.line_no || 0),
+      description: row.item_label,
+      amount: Number(row.amount || 0),
+      productCode: row.product_code ? Number(row.product_code) : null,
+      productKey: row.product_key || null,
+    });
+  }
+
+  return itemMap;
+}
+
+function formatVoucherAvailmentRow(row, items = []) {
+  return {
+    id: Number(row.id),
+    voucherId: Number(row.voucher_id),
+    uid: Number(row.uid),
+    erNumber: row.er_number,
+    availmentDate: row.availment_date,
+    totalAmount: Number(row.total_amount || 0),
+    requestSource: row.request_source || 'cashier',
+    claimStatus: row.claim_status || 'requested',
+    claimedAt: row.claimed_at || null,
+    claimedBy: row.claimed_by_admin || null,
+    itemCount: Array.isArray(items) && items.length > 0 ? items.length : Number(row.item_count || 0),
+    reference: row.external_reference || row.er_number || `ERA-${row.id}`,
+    transactionId: row.transaction_id ? Number(row.transaction_id) : null,
+    createdBy: row.created_by_admin || null,
+    updatedBy: row.updated_by_admin || null,
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+    items,
+  };
+}
+
+async function fetchVoucherAvailmentRecord(conn, availmentId) {
+  const [rows] = await conn.query(
+    `SELECT a.id, a.voucher_id, a.uid, a.er_number,
+            DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date,
+            a.total_amount, a.transaction_id, a.request_source, a.claim_status,
+            DATE_FORMAT(a.claimed_at, '%Y-%m-%d %H:%i') AS claimed_at,
+            a.claimed_by_admin,
+            a.created_by_admin, a.updated_by_admin,
+            DATE_FORMAT(a.created_at, '%Y-%m-%d %H:%i') AS created_at,
+            DATE_FORMAT(a.updated_at, '%Y-%m-%d %H:%i') AS updated_at,
+            tx.external_reference
+     FROM voucher_availmentstab a
+     LEFT JOIN voucher_transactionstab tx ON tx.availment_id = a.id
+     WHERE a.id = ?
+     LIMIT 1`,
+    [availmentId]
+  );
+
+  return rows[0] || null;
+}
+
+async function getVoucherAvailments(voucherId) {
+  await ensureVoucherTxTable();
+
+  const safeVoucherId = Number(voucherId || 0);
+  if (!Number.isFinite(safeVoucherId) || safeVoucherId <= 0) {
+    throw new Error('Invalid voucher ID');
+  }
+
+  const [rows] = await pool.query(
+    `SELECT a.id, a.voucher_id, a.uid, a.er_number,
+            DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date,
+            a.total_amount, a.transaction_id, a.request_source, a.claim_status,
+            DATE_FORMAT(a.claimed_at, '%Y-%m-%d %H:%i') AS claimed_at,
+            a.claimed_by_admin,
+            a.created_by_admin, a.updated_by_admin,
+            DATE_FORMAT(a.created_at, '%Y-%m-%d %H:%i') AS created_at,
+            DATE_FORMAT(a.updated_at, '%Y-%m-%d %H:%i') AS updated_at,
+            tx.external_reference,
+            COUNT(i.id) AS item_count
+     FROM voucher_availmentstab a
+     LEFT JOIN voucher_availment_itemstab i ON i.availment_id = a.id
+     LEFT JOIN voucher_transactionstab tx ON tx.availment_id = a.id
+     WHERE a.voucher_id = ?
+     GROUP BY a.id
+     ORDER BY a.availment_date DESC, a.id DESC`,
+    [safeVoucherId]
+  );
+
+  return rows.map((row) => formatVoucherAvailmentRow(row));
+}
+
+async function getVoucherAvailmentById(availmentId) {
+  await ensureVoucherTxTable();
+
+  const safeAvailmentId = Number(availmentId || 0);
+  if (!Number.isFinite(safeAvailmentId) || safeAvailmentId <= 0) {
+    throw new Error('Invalid availment ID');
+  }
+
+  const row = await fetchVoucherAvailmentRecord(pool, safeAvailmentId);
+  if (!row) {
+    throw new Error('Voucher availment not found');
+  }
+
+  const itemsMap = await getVoucherAvailmentItemsByAvailmentIds(pool, [safeAvailmentId]);
+  return formatVoucherAvailmentRow(row, itemsMap.get(safeAvailmentId) || []);
+}
+
+async function appendVoucherAvailmentAudit(conn, {
+  availmentId,
+  voucherId,
+  actionType,
+  actorAdminId = null,
+  actorAdmin = null,
+  beforeState = null,
+  afterState = null,
+}) {
+  await conn.query(
+    `INSERT INTO voucher_availment_audittab
+      (availment_id, voucher_id, action_type, actor_admin_id, actor_admin, snapshot_before, snapshot_after)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      availmentId,
+      voucherId,
+      actionType,
+      actorAdminId,
+      actorAdmin,
+      beforeState ? JSON.stringify(beforeState) : null,
+      afterState ? JSON.stringify(afterState) : null,
+    ]
+  );
+}
+
+async function createManualVoucherAvailment({
+  voucherId,
+  availmentDate,
+  erNumber,
+  items,
+  actorAdminId = null,
+  actorAdmin = null,
+  requestSource = 'cashier',
+}) {
+  await ensureVoucherTxTable();
+
+  const safeVoucherId = Number(voucherId || 0);
+  if (!Number.isFinite(safeVoucherId) || safeVoucherId <= 0) {
+    throw new Error('Invalid voucher ID');
+  }
+
+  const safeErNumber = String(erNumber || '').trim();
+  if (!safeErNumber) {
+    throw new Error('ER number is required');
+  }
+
+  const normalized = normalizeVoucherAvailmentItems(items);
+  if (normalized.items.length === 0) {
+    throw new Error('At least one availed item is required');
+  }
+
+  const safeAvailmentDate = parseAvailmentDate(availmentDate);
+  const claimState = resolveInitialVoucherAvailmentClaimState({
+    requestSource,
+    actorAdminId,
+    actorAdmin,
+    claimDate: safeAvailmentDate,
+  });
+  const conn = await pool.getConnection();
+  const lockKey = `nogatu_voucher_availment_${safeVoucherId}`;
+  let lockAcquired = false;
+  let txStarted = false;
+
+  try {
+    const [lockRows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
+    lockAcquired = Number(lockRows[0]?.lockState || 0) === 1;
+    if (!lockAcquired) {
+      throw new Error('Unable to edit voucher right now. Please retry.');
+    }
+
+    await conn.beginTransaction();
+    txStarted = true;
+
+    const [voucherRows] = await conn.query(
+      'SELECT * FROM voucherstab WHERE id = ? LIMIT 1 FOR UPDATE',
+      [safeVoucherId]
+    );
+    const voucher = voucherRows[0];
+    assertVoucherManualAvailmentAllowed(voucher);
+
+    const balanceUpdate = computeVoucherAvailmentBalanceUpdate({
+      voucher,
+      previousTotal: 0,
+      nextTotal: normalized.totalAmount,
+      now: safeAvailmentDate,
+    });
+    const [walletRows] = await conn.query(
+      'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [Number(voucher.uid || 0)]
+    );
+    if (walletRows.length === 0) {
+      throw new Error('Member wallet balance was not found');
+    }
+    const walletUpdate = computeVoucherManualAvailmentWalletUpdate({
+      walletBalance: walletRows[0].ttlcashbalance,
+      previousTotal: 0,
+      nextTotal: normalized.totalAmount,
+    });
+
+    const [availmentResult] = await conn.query(
+      `INSERT INTO voucher_availmentstab
+        (voucher_id, uid, er_number, availment_date, total_amount, request_source, claim_status, claimed_at, claimed_by_admin_id, claimed_by_admin, created_by_admin_id, created_by_admin, updated_by_admin_id, updated_by_admin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        safeVoucherId,
+        Number(voucher.uid || 0),
+        safeErNumber,
+        safeAvailmentDate,
+        normalized.totalAmount,
+        String(requestSource || 'cashier').trim() || 'cashier',
+        claimState.claimStatus,
+        toDateOrNull(claimState.claimedAt),
+        claimState.claimedByAdminId,
+        claimState.claimedByAdmin,
+        actorAdminId,
+        actorAdmin,
+        actorAdminId,
+        actorAdmin,
+      ]
+    );
+
+    const availmentId = Number(availmentResult.insertId || 0);
+    await replaceVoucherAvailmentItems(conn, availmentId, normalized.items);
+
+    const [transactionResult] = await conn.query(
+      `INSERT INTO voucher_transactionstab
+        (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, availment_id, external_reference)
+       VALUES (?, ?, ?, ?, ?, ?, 'manual_availment', ?, ?)`,
+      [
+        Number(voucher.uid || 0),
+        safeVoucherId,
+        walletUpdate.cashPaid,
+        walletUpdate.voucherUsed,
+        walletUpdate.totalValue,
+        safeAvailmentDate,
+        availmentId,
+        safeErNumber,
+      ]
+    );
+
+    await conn.query(
+      'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = NOW() WHERE uid = ? LIMIT 1',
+      [
+        walletUpdate.walletBalance,
+        Number(voucher.uid || 0),
+      ]
+    );
+
+    await conn.query(
+      'UPDATE voucher_availmentstab SET transaction_id = ? WHERE id = ? LIMIT 1',
+      [Number(transactionResult.insertId || 0), availmentId]
+    );
+
+    await conn.query(
+      `UPDATE voucherstab
+          SET remaining_balance = ?,
+              status = ?,
+              first_used_at = ?,
+              use_expires_at = ?,
+              redeemed_date = CASE
+                WHEN ? = 3 THEN COALESCE(redeemed_date, ?)
+                ELSE NULL
+              END
+        WHERE id = ? LIMIT 1`,
+      [
+        balanceUpdate.remainingBalance,
+        balanceUpdate.status,
+        toDateOrNull(balanceUpdate.firstUsedAt),
+        toDateOrNull(balanceUpdate.useExpiresAt),
+        balanceUpdate.status,
+        toDateOrNull(balanceUpdate.redeemedAt),
+        safeVoucherId,
+      ]
+    );
+
+    const createdRecord = await fetchVoucherAvailmentRecord(conn, availmentId);
+    const createdItems = normalized.items;
+    const response = formatVoucherAvailmentRow(createdRecord, createdItems);
+
+    await appendVoucherAvailmentAudit(conn, {
+      availmentId,
+      voucherId: safeVoucherId,
+      actionType: 'created',
+      actorAdminId,
+      actorAdmin,
+      afterState: response,
+    });
+
+    await conn.commit();
+    txStarted = false;
+
+    return response;
+  } catch (error) {
+    if (txStarted) {
+      await conn.rollback();
+    }
+    throw error;
+  } finally {
+    if (lockAcquired) {
+      try {
+        await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]);
+      } catch {
+        // Ignore lock release failures.
+      }
+    }
+    conn.release();
+  }
+}
+
+async function markVoucherAvailmentClaimed({
+  availmentId,
+  actorAdminId = null,
+  actorAdmin = null,
+}) {
+  await ensureVoucherTxTable();
+
+  const safeAvailmentId = Number(availmentId || 0);
+  if (!Number.isFinite(safeAvailmentId) || safeAvailmentId <= 0) {
+    throw new Error('Invalid availment ID');
+  }
+
+  const conn = await pool.getConnection();
+  let txStarted = false;
+
+  try {
+    await conn.beginTransaction();
+    txStarted = true;
+
+    const [rows] = await conn.query(
+      'SELECT * FROM voucher_availmentstab WHERE id = ? LIMIT 1 FOR UPDATE',
+      [safeAvailmentId]
+    );
+    const existing = rows[0];
+    if (!existing) {
+      throw new Error('Voucher request not found');
+    }
+
+    const beforeItemsMap = await getVoucherAvailmentItemsByAvailmentIds(conn, [safeAvailmentId]);
+    const beforeState = formatVoucherAvailmentRow(
+      await fetchVoucherAvailmentRecord(conn, safeAvailmentId),
+      beforeItemsMap.get(safeAvailmentId) || []
+    );
+    const claimUpdate = resolveVoucherAvailmentClaimUpdate({
+      currentStatus: existing.claim_status,
+      now: new Date(),
+    });
+
+    await conn.query(
+      `UPDATE voucher_availmentstab
+          SET claim_status = ?,
+              claimed_at = ?,
+              claimed_by_admin_id = ?,
+              claimed_by_admin = ?,
+              updated_by_admin_id = ?,
+              updated_by_admin = ?
+        WHERE id = ? LIMIT 1`,
+      [
+        claimUpdate.nextStatus,
+        toDateOrNull(claimUpdate.claimedAt),
+        actorAdminId,
+        actorAdmin,
+        actorAdminId,
+        actorAdmin,
+        safeAvailmentId,
+      ]
+    );
+
+    const response = formatVoucherAvailmentRow(
+      await fetchVoucherAvailmentRecord(conn, safeAvailmentId),
+      beforeItemsMap.get(safeAvailmentId) || []
+    );
+
+    await appendVoucherAvailmentAudit(conn, {
+      availmentId: safeAvailmentId,
+      voucherId: Number(existing.voucher_id || 0),
+      actionType: 'claimed',
+      actorAdminId,
+      actorAdmin,
+      beforeState,
+      afterState: response,
+    });
+
+    await conn.commit();
+    txStarted = false;
+    return response;
+  } catch (error) {
+    if (txStarted) {
+      await conn.rollback();
+    }
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+async function updateManualVoucherAvailment({
+  availmentId,
+  availmentDate,
+  erNumber,
+  items,
+  actorAdminId = null,
+  actorAdmin = null,
+}) {
+  await ensureVoucherTxTable();
+
+  const safeAvailmentId = Number(availmentId || 0);
+  if (!Number.isFinite(safeAvailmentId) || safeAvailmentId <= 0) {
+    throw new Error('Invalid availment ID');
+  }
+
+  const safeErNumber = String(erNumber || '').trim();
+  if (!safeErNumber) {
+    throw new Error('ER number is required');
+  }
+
+  const normalized = normalizeVoucherAvailmentItems(items);
+  if (normalized.items.length === 0) {
+    throw new Error('At least one availed item is required');
+  }
+
+  const safeAvailmentDate = parseAvailmentDate(availmentDate);
+  const conn = await pool.getConnection();
+  let lockAcquired = false;
+  let txStarted = false;
+  let lockKey = null;
+
+  try {
+    await conn.beginTransaction();
+    txStarted = true;
+
+    const [availmentRows] = await conn.query(
+      'SELECT * FROM voucher_availmentstab WHERE id = ? LIMIT 1 FOR UPDATE',
+      [safeAvailmentId]
+    );
+    const existingAvailment = availmentRows[0];
+    if (!existingAvailment) {
+      throw new Error('Voucher availment not found');
+    }
+
+    lockKey = `nogatu_voucher_availment_${Number(existingAvailment.voucher_id || 0)}`;
+    const [lockRows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
+    lockAcquired = Number(lockRows[0]?.lockState || 0) === 1;
+    if (!lockAcquired) {
+      throw new Error('Unable to edit voucher right now. Please retry.');
+    }
+
+    const [voucherRows] = await conn.query(
+      'SELECT * FROM voucherstab WHERE id = ? LIMIT 1 FOR UPDATE',
+      [Number(existingAvailment.voucher_id || 0)]
+    );
+    const voucher = voucherRows[0];
+    assertVoucherManualAvailmentAllowed(voucher, { allowFullyUsed: true });
+
+    const beforeItemsMap = await getVoucherAvailmentItemsByAvailmentIds(conn, [safeAvailmentId]);
+    const beforeState = formatVoucherAvailmentRow(
+      await fetchVoucherAvailmentRecord(conn, safeAvailmentId),
+      beforeItemsMap.get(safeAvailmentId) || []
+    );
+
+    const balanceUpdate = computeVoucherAvailmentBalanceUpdate({
+      voucher,
+      previousTotal: Number(existingAvailment.total_amount || 0),
+      nextTotal: normalized.totalAmount,
+      now: safeAvailmentDate,
+    });
+    const [walletRows] = await conn.query(
+      'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [Number(voucher.uid || 0)]
+    );
+    if (walletRows.length === 0) {
+      throw new Error('Member wallet balance was not found');
+    }
+    const walletUpdate = computeVoucherManualAvailmentWalletUpdate({
+      walletBalance: walletRows[0].ttlcashbalance,
+      previousTotal: Number(existingAvailment.total_amount || 0),
+      nextTotal: normalized.totalAmount,
+    });
+
+    await conn.query(
+      `UPDATE voucher_availmentstab
+          SET er_number = ?,
+              availment_date = ?,
+              total_amount = ?,
+              updated_by_admin_id = ?,
+              updated_by_admin = ?
+        WHERE id = ? LIMIT 1`,
+      [
+        safeErNumber,
+        safeAvailmentDate,
+        normalized.totalAmount,
+        actorAdminId,
+        actorAdmin,
+        safeAvailmentId,
+      ]
+    );
+
+    await replaceVoucherAvailmentItems(conn, safeAvailmentId, normalized.items);
+
+    if (existingAvailment.transaction_id) {
+      await conn.query(
+        `UPDATE voucher_transactionstab
+            SET cash_paid = ?,
+                voucher_used = ?,
+                total_value = ?,
+                transaction_date = ?,
+                source_type = 'manual_availment',
+                availment_id = ?,
+                external_reference = ?
+          WHERE id = ? LIMIT 1`,
+        [
+          walletUpdate.cashPaid,
+          walletUpdate.voucherUsed,
+          walletUpdate.totalValue,
+          safeAvailmentDate,
+          safeAvailmentId,
+          safeErNumber,
+          Number(existingAvailment.transaction_id || 0),
+        ]
+      );
+    } else {
+      const [transactionResult] = await conn.query(
+        `INSERT INTO voucher_transactionstab
+          (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, availment_id, external_reference)
+         VALUES (?, ?, ?, ?, ?, ?, 'manual_availment', ?, ?)`,
+        [
+          Number(voucher.uid || 0),
+          Number(existingAvailment.voucher_id || 0),
+          walletUpdate.cashPaid,
+          walletUpdate.voucherUsed,
+          walletUpdate.totalValue,
+          safeAvailmentDate,
+          safeAvailmentId,
+          safeErNumber,
+        ]
+      );
+
+      await conn.query(
+        'UPDATE voucher_availmentstab SET transaction_id = ? WHERE id = ? LIMIT 1',
+        [Number(transactionResult.insertId || 0), safeAvailmentId]
+      );
+    }
+
+    await conn.query(
+      'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = NOW() WHERE uid = ? LIMIT 1',
+      [
+        walletUpdate.walletBalance,
+        Number(voucher.uid || 0),
+      ]
+    );
+
+    await conn.query(
+      `UPDATE voucherstab
+          SET remaining_balance = ?,
+              status = ?,
+              first_used_at = ?,
+              use_expires_at = ?,
+              redeemed_date = CASE
+                WHEN ? = 3 THEN COALESCE(redeemed_date, ?)
+                ELSE NULL
+              END
+        WHERE id = ? LIMIT 1`,
+      [
+        balanceUpdate.remainingBalance,
+        balanceUpdate.status,
+        toDateOrNull(balanceUpdate.firstUsedAt),
+        toDateOrNull(balanceUpdate.useExpiresAt),
+        balanceUpdate.status,
+        toDateOrNull(balanceUpdate.redeemedAt),
+        Number(existingAvailment.voucher_id || 0),
+      ]
+    );
+
+    const response = formatVoucherAvailmentRow(
+      await fetchVoucherAvailmentRecord(conn, safeAvailmentId),
+      normalized.items
+    );
+
+    await appendVoucherAvailmentAudit(conn, {
+      availmentId: safeAvailmentId,
+      voucherId: Number(existingAvailment.voucher_id || 0),
+      actionType: 'updated',
+      actorAdminId,
+      actorAdmin,
+      beforeState,
+      afterState: response,
+    });
+
+    await conn.commit();
+    txStarted = false;
+    return response;
+  } catch (error) {
+    if (txStarted) {
+      await conn.rollback();
+    }
+    throw error;
+  } finally {
+    if (lockAcquired && lockKey) {
+      try {
+        await conn.query('SELECT RELEASE_LOCK(?)', [lockKey]);
+      } catch {
+        // Ignore lock release failures.
+      }
+    }
+    conn.release();
+  }
 }
 
 /**
@@ -421,76 +1322,108 @@ async function getAllVouchers(page = 1, perPage = 30) {
  * Eligibility: main account, valid package tier, and no voucher record at all.
  */
 async function getGrantEligibleMembers(page = 1, perPage = 30, search = '') {
-  await ensureVoucherTable();
+  return listVoucherGrantCandidates({ page, perPage, search, includeAll: false });
+}
 
-  const safePage = Math.max(1, Number(page) || 1);
-  const safePerPage = Math.max(1, Math.min(100, Number(perPage) || 30));
-  const offset = (safePage - 1) * safePerPage;
+async function listVoucherGrantCandidates({
+  page = 1,
+  perPage = 30,
+  search = '',
+  includeAll = false,
+  queryExecutor = pool,
+} = {}) {
+  await ensureVoucherGrantTable();
 
-  const where = [
+  const pager = new TableQueryPager(queryExecutor);
+  const safeIncludeAll = includeAll === true || includeAll === '1' || includeAll === 'true';
+  const filters = [
     'u.uid = u.mainid',
     'u.currentaccttype IN (10,20,30,40,50,60)',
-    'v.uid IS NULL',
   ];
   const params = [];
 
   const keyword = String(search || '').trim();
   if (keyword) {
     const like = `%${keyword}%`;
-    where.push('(m.username LIKE ? OR m.firstname LIKE ? OR m.lastname LIKE ? OR CAST(m.uid AS CHAR) LIKE ?)');
+    filters.push('(m.username LIKE ? OR m.firstname LIKE ? OR m.lastname LIKE ? OR CAST(u.uid AS CHAR) LIKE ?)');
     params.push(like, like, like, like);
   }
 
-  const whereSql = `WHERE ${where.join(' AND ')}`;
+  if (!safeIncludeAll) {
+    filters.push('NOT EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
+  }
 
-  const [countRows] = await pool.query(
-    `SELECT COUNT(*) AS total
-     FROM usertab u
-     JOIN memberstab m ON m.uid = u.uid
-     LEFT JOIN voucherstab v ON v.uid = u.uid
-     ${whereSql}`,
-    params
-  );
-
-  const total = Number(countRows[0]?.total || 0);
-
-  const [rows] = await pool.query(
-    `SELECT
-       m.uid,
-       m.username,
-       m.firstname,
-       m.lastname,
-       u.currentaccttype,
-       DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg
-     FROM usertab u
-     JOIN memberstab m ON m.uid = u.uid
-     LEFT JOIN voucherstab v ON v.uid = u.uid
-     ${whereSql}
-     ORDER BY u.datereg DESC
-     LIMIT ?, ?`,
-    [...params, offset, safePerPage]
-  );
-
-  const users = rows.map((row) => {
-    const accttype = Number(row.currentaccttype || 0);
-    return {
-      uid: Number(row.uid),
-      username: row.username,
-      firstname: row.firstname,
-      lastname: row.lastname,
-      fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
-      accttype,
-      voucherAmount: Number(PACKAGE_AMOUNTS[accttype] || 0),
-      datereg: row.datereg,
-    };
+  const whereSql = `WHERE ${filters.join(' AND ')}`;
+  const pageResult = await pager.fetchPage({
+    page,
+    perPage,
+    countSql: `SELECT COUNT(*) AS total
+               FROM usertab u
+               INNER JOIN memberstab m ON m.uid = u.uid
+               ${whereSql}`,
+    countParams: params,
+    dataSql: `SELECT u.uid, u.currentaccttype, u.accttype,
+                     DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg,
+                     m.username, m.firstname, m.lastname
+              FROM usertab u
+              INNER JOIN memberstab m ON m.uid = u.uid
+              ${whereSql}
+              ORDER BY u.datereg DESC, u.uid DESC`,
+    dataParams: params,
   });
 
+  let voucherRowsByUid = new Map();
+  if (safeIncludeAll && pageResult.rows.length > 0) {
+    voucherRowsByUid = await pager.fetchByKeys({
+      rows: pageResult.rows,
+      rowKey: 'uid',
+      keyField: 'uid',
+      mode: 'first',
+      queryFactory: (placeholders) => `
+        SELECT uid, id, remaining_balance, status
+        FROM voucherstab
+        WHERE uid IN (${placeholders})
+        ORDER BY uid ASC,
+                 CASE status
+                   WHEN 1 THEN 0
+                   WHEN 4 THEN 1
+                   WHEN 2 THEN 2
+                   WHEN 3 THEN 3
+                   ELSE 4
+                 END ASC,
+                 id DESC`,
+      mapRow: (row) => ({
+        voucherId: Number(row.id || 0),
+        voucherRemaining: row.remaining_balance != null ? Number(row.remaining_balance) : null,
+        voucherStatus: row.status != null ? Number(row.status) : null,
+      }),
+    });
+  }
+
   return {
-    users,
-    page: safePage,
-    perPage: safePerPage,
-    total,
-    totalPages: Math.max(1, Math.ceil(total / safePerPage)),
+    users: pageResult.rows.map((row) => {
+      const uid = Number(row.uid);
+      const accttype = Number(row.currentaccttype || row.accttype || 0);
+      const voucherRow = voucherRowsByUid.get(uid) || null;
+      return {
+        uid,
+        username: row.username,
+        firstname: row.firstname,
+        lastname: row.lastname,
+        fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+        accttype,
+        voucherAmount: Number(PACKAGE_AMOUNTS[accttype] || 0),
+        datereg: row.datereg,
+        hasVoucher: Boolean(voucherRow),
+        voucherId: voucherRow?.voucherId || null,
+        voucherRemaining: voucherRow?.voucherRemaining ?? null,
+        voucherStatus: voucherRow?.voucherStatus ?? null,
+      };
+    }),
+    total: pageResult.pagination.total,
+    page: pageResult.pagination.page,
+    perPage: pageResult.pagination.perPage,
+    totalPages: pageResult.pagination.totalPages,
   };
 }
 
@@ -499,7 +1432,7 @@ async function getGrantEligibleMembers(page = 1, perPage = 30, search = '') {
  * Members with existing voucher history are skipped.
  */
 async function grantVouchersToMembers(uids = []) {
-  await ensureVoucherTable();
+  await ensureVoucherGrantTable();
 
   const cleanUids = Array.from(new Set(
     (Array.isArray(uids) ? uids : [])
@@ -578,7 +1511,7 @@ async function grantVouchersToMembers(uids = []) {
  * Idempotent: reruns only insert for members without any voucher row.
  */
 async function grantVouchersToExistingMembers() {
-  await ensureVoucherTable();
+  await ensureVoucherGrantTable();
 
   const [result] = await pool.query(
     `INSERT INTO voucherstab
@@ -632,12 +1565,27 @@ module.exports = {
   getVoucherTransactions,
   getAllVouchers,
   getGrantEligibleMembers,
+  listVoucherGrantCandidates,
   grantVouchersToMembers,
   grantVouchersToExistingMembers,
+  ensureVoucherGrantTable,
   ensureVoucherTable,
   ensureVoucherTxTable,
   normalizeVoucherProductSelection,
+  normalizeVoucherAvailmentItems,
+  computeVoucherAvailmentBalanceUpdate,
+  computeVoucherManualAvailmentWalletUpdate,
+  computeVoucherMemberPricing,
+  resolveVoucherAvailmentClaimUpdate,
+  resolveInitialVoucherAvailmentClaimState,
+  getVoucherAvailments,
+  getVoucherAvailmentById,
+  createManualVoucherAvailment,
+  markVoucherAvailmentClaimed,
+  updateManualVoucherAvailment,
   VOUCHER_PRODUCT_CATALOG,
+  VOUCHER_MEMBER_DISCOUNT_RATE,
+  VOUCHER_MEMBER_DISCOUNT_PERCENT,
   UNUSED_VOUCHER_EXPIRY_MONTHS,
   USED_VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,

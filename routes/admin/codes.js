@@ -17,12 +17,28 @@ const {
   sendCsv,
 } = require('../../services/csvExport');
 
+async function tableExists(tableName) {
+  const [rows] = await pool.query('SHOW TABLES LIKE ?', [tableName]);
+  return rows.length > 0;
+}
+
+function firstRowByCode(rows, codeField = 'code') {
+  const map = new Map();
+  for (const row of rows || []) {
+    const code = row?.[codeField];
+    if (code && !map.has(code)) {
+      map.set(code, row);
+    }
+  }
+  return map;
+}
+
 /**
  * POST /api/admin/codes/generate
  * Generate activation codes
  * Mirrors PHP adminpanel/generate-codes.php
  */
-router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
+router.post('/generate', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   try {
     const { noOfCodes, productType, codeType } = req.body;
 
@@ -35,7 +51,10 @@ router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
       Number(productType),
       Number(codeType),
       1, // stockistId always 1
-      req.session.adminid
+      {
+        adminUsername: req.session.adminid || null,
+        actorAdminId: req.session.adminNumericId || null,
+      }
     );
 
     res.json({ success: true, count: codes.length, codes });
@@ -74,45 +93,86 @@ router.get('/', adminAuth, async (req, res) => {
     const total = Number(countRows[0].total);
 
     const [rows] = await pool.query(
-      `SELECT c.id, c.code, c.producttype, c.uid, c.codestatus, c.releasedate,
+      `SELECT c.id, c.code, c.producttype, c.uid, c.codestatus, c.releasedate, c.processid,
               DATE_FORMAT(c.dategen, '%Y-%m-%d %H:%i') AS dategen,
               m.username AS owner_username,
               TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS owner_fullname,
-              ch.history AS transfer_history,
-              DATE_FORMAT(ch.datetransfer, '%Y-%m-%d %H:%i') AS last_transfer_date,
-              lat.to_username AS audit_transfer_to,
-              DATE_FORMAT(lat.created_at, '%Y-%m-%d %H:%i') AS audit_transfer_date,
-              lat.admin_name AS audit_admin_name
+              ga.username AS generated_by_username,
+              ga.name AS generated_by_name
        FROM codestab c
        LEFT JOIN memberstab m ON m.uid = c.uid
-       LEFT JOIN codehistorytab ch ON ch.code = c.code
-       LEFT JOIN (
-         SELECT a.code, a.to_uid, a.created_at, tm.username AS to_username, aa.username AS admin_name
-         FROM activation_code_usagetab a
-         LEFT JOIN memberstab tm ON tm.uid = a.to_uid
-         LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
-         WHERE a.event_type = 'admin_transfer'
-           AND a.id = (
-             SELECT MAX(a2.id) FROM activation_code_usagetab a2
-             WHERE a2.code = a.code AND a2.event_type = 'admin_transfer'
-           )
-       ) lat ON lat.code = c.code
+       LEFT JOIN accesstab ga ON ga.username = c.processid
        ${whereSql}
        ORDER BY c.id DESC LIMIT ?, ?`,
       [...whereParams, offset, perPage]
     );
 
-    const codes = rows.map(r => {
-      const legacyHistory = r.transfer_history || null;
-      const auditTo = r.audit_transfer_to || null;
-      const auditAdmin = r.audit_admin_name || null;
-      // Build a display-ready transfer trail from whichever source has data
-      let transferHistory = legacyHistory;
-      if (!transferHistory && auditTo) {
-        transferHistory = auditAdmin
-          ? `(${auditAdmin})${auditTo}`
-          : `(admin)${auditTo}`;
+    const pageCodes = rows.map((row) => row.code).filter(Boolean);
+    const codePlaceholders = pageCodes.map(() => '?').join(', ');
+    let legacyHistoryByCode = new Map();
+    let latestReleaseByCode = new Map();
+    let latestTransferByCode = new Map();
+
+    if (pageCodes.length > 0) {
+      const [legacyHistoryRows] = await pool.query(
+        `SELECT code, history, DATE_FORMAT(datetransfer, '%Y-%m-%d %H:%i') AS datetransfer
+         FROM codehistorytab
+         WHERE code IN (${codePlaceholders})
+         ORDER BY datetransfer DESC, id DESC`,
+        pageCodes
+      );
+      legacyHistoryByCode = firstRowByCode(legacyHistoryRows);
+
+      if (await tableExists('activation_code_usagetab')) {
+        const [releaseRows] = await pool.query(
+          `SELECT a.code,
+                  DATE_FORMAT(a.created_at, '%Y-%m-%d %H:%i') AS created_at,
+                  aa.username AS admin_username
+           FROM activation_code_usagetab a
+           LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
+           WHERE a.event_type = 'release'
+             AND a.code IN (${codePlaceholders})
+           ORDER BY a.id DESC`,
+          pageCodes
+        );
+        latestReleaseByCode = firstRowByCode(releaseRows);
+
+        const [transferRows] = await pool.query(
+          `SELECT a.code,
+                  DATE_FORMAT(a.created_at, '%Y-%m-%d %H:%i') AS created_at,
+                  aa.username AS admin_username,
+                  fm.username AS from_username,
+                  tm.username AS to_username
+           FROM activation_code_usagetab a
+           LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
+           LEFT JOIN memberstab fm ON fm.uid = a.from_uid
+           LEFT JOIN memberstab tm ON tm.uid = a.to_uid
+           WHERE a.event_type = 'admin_transfer'
+             AND a.code IN (${codePlaceholders})
+           ORDER BY a.id DESC`,
+          pageCodes
+        );
+        latestTransferByCode = firstRowByCode(transferRows);
       }
+    }
+
+    const codes = rows.map(r => {
+      const legacyHistory = legacyHistoryByCode.get(r.code) || null;
+      const releaseAudit = latestReleaseByCode.get(r.code) || null;
+      const transferAudit = latestTransferByCode.get(r.code) || null;
+      const generatedByUsername = r.generated_by_username || r.processid || null;
+      const generatedByName = r.generated_by_name || null;
+      const currentOwnerUsername = r.owner_username || transferAudit?.to_username || generatedByUsername || null;
+      const currentOwnerFullname = r.owner_fullname
+        ? r.owner_fullname.trim() || null
+        : (!r.owner_username && generatedByName ? generatedByName : null);
+
+      let transferHistory = legacyHistory?.history || null;
+      if (!transferHistory && transferAudit?.to_username) {
+        const transferActor = transferAudit.admin_username || transferAudit.from_username || 'admin';
+        transferHistory = `(${transferActor})${transferAudit.to_username}`;
+      }
+
       return {
         id: r.id,
         code: r.code,
@@ -121,8 +181,17 @@ router.get('/', adminAuth, async (req, res) => {
         uid: r.uid,
         ownerUsername: r.owner_username || null,
         ownerFullname: r.owner_fullname ? r.owner_fullname.trim() || null : null,
+        currentOwnerUsername,
+        currentOwnerFullname,
+        currentOwnerLabel: r.owner_username ? 'Member Owner' : generatedByUsername ? 'Initial Owner / Generator' : null,
+        generatedByUsername,
+        generatedByName,
+        releasedByUsername: releaseAudit?.admin_username || null,
+        transferredByUsername: transferAudit?.admin_username || transferAudit?.from_username || null,
+        transferredToUsername: transferAudit?.to_username || null,
         transferHistory,
-        lastTransferDate: r.last_transfer_date || r.audit_transfer_date || null,
+        lastTransferDate: legacyHistory?.datetransfer || transferAudit?.created_at || null,
+        lastReleaseDate: releaseAudit?.created_at || null,
         codestatus: r.codestatus,
         statusLabel: r.codestatus === 0 ? 'Not Released' : r.codestatus === 1 ? 'Released' : 'Used',
         releasedate: r.releasedate,

@@ -144,6 +144,11 @@ function loadWalletRouter({ calculateAndStoreIncome, getMemberGlobalBonus, asser
   delete require.cache[routePath];
 
   return withStubbedModules({
+    [path.join(repoRoot, 'config', 'database.js')]: {
+      pool: {
+        query: async () => [[{ total: 0 }]],
+      },
+    },
     [path.join(repoRoot, 'middleware', 'auth.js')]: {
       memberAuth: (req, res, next) => next(),
     },
@@ -271,6 +276,31 @@ test('wallet summary exposes rankingBonus but not deprecated LPC fields', async 
   assert.equal(res.body.rankingBonus, 600);
   assert.equal('lpc' in res.body, false);
   assert.equal('legacyIncome6' in res.body, false);
+});
+
+test('wallet summary totalIncome sums credited income streams without double-counting cash balance', async () => {
+  const router = loadWalletRouter({
+    calculateAndStoreIncome: async () => ({
+      ttlincome1: 6250,
+      ttlincome2: 397750,
+      ttlincome3: 29307.5,
+      ttlincome4: 0,
+      ttlincome5: 0,
+      ttlincome6: 0,
+      ttlcashbalance: 2000,
+    }),
+  });
+  const handlers = getRouteHandlers(router, 'get', '/');
+  const req = {
+    session: { uid: 44, currentaccttype: 30 },
+  };
+  const res = createResponse();
+
+  await runHandlers(handlers, req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.totalIncome, 433307.5);
+  assert.equal(res.body.cashBalance, 2000);
 });
 
 test('wallet encashment preview returns 422 when TIN is missing', async () => {

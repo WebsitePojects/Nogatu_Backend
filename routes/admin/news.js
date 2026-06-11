@@ -6,30 +6,44 @@ const { adminAuth, adminRights } = require('../../middleware/auth');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 const { cloudinary } = require('../../utils/cloudinary');
 
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB
+const VIDEO_MAX_BYTES = 100 * 1024 * 1024; // 100 MB
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: VIDEO_MAX_BYTES },
   fileFilter: (_req, file, cb) => {
-    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
-      return cb(new Error('Only image files are allowed'));
+    const isImage = file.mimetype?.startsWith('image/');
+    const isVideo = file.mimetype?.startsWith('video/');
+    if (!isImage && !isVideo) {
+      return cb(new Error('Only image or video files are allowed'));
     }
     cb(null, true);
   },
 });
 
 function handleUpload(req, res, next) {
-  upload.single('image')(req, res, (err) => {
-    if (!err) return next();
+  upload.single('media')(req, res, (err) => {
+    if (!err) {
+      // Enforce per-type size limit after multer passes
+      if (req.file) {
+        const isImage = req.file.mimetype?.startsWith('image/');
+        if (isImage && req.file.size > IMAGE_MAX_BYTES) {
+          return res.status(400).json({ error: 'Image exceeds 5 MB file size limit' });
+        }
+      }
+      return next();
+    }
 
     if (err instanceof multer.MulterError) {
       if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'Image exceeds 5MB file size limit' });
+        return res.status(400).json({ error: 'Video exceeds 100 MB file size limit' });
       }
-      return res.status(400).json({ error: err.message || 'Invalid image upload' });
+      return res.status(400).json({ error: err.message || 'Invalid upload' });
     }
 
-    if (String(err.message || '').includes('Only image files are allowed')) {
-      return res.status(400).json({ error: 'Only image files are allowed' });
+    if (String(err.message || '').includes('Only image or video files')) {
+      return res.status(400).json({ error: err.message });
     }
 
     return res.status(400).json({ error: 'Invalid upload payload' });
@@ -52,26 +66,49 @@ function toBool(value, fallback = true) {
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
 }
 
+// Extract Cloudinary public_id from a secure_url
+function extractCloudinaryPublicId(url) {
+  if (!url || typeof url !== 'string') return null;
+  if (!url.includes('res.cloudinary.com')) return null;
+  // https://res.cloudinary.com/{cloud}/{type}/upload/[transform/]v{ver}/{public_id}.{ext}
+  const match = url.match(/\/upload\/(?:[^/]+\/)*(?:v\d+\/)?(.+)\.[^.]+$/);
+  return match ? match[1] : null;
+}
+
+async function deleteFromCloudinary(mediaUrl) {
+  if (!cloudinary || !mediaUrl) return;
+  const publicId = extractCloudinaryPublicId(mediaUrl);
+  if (!publicId) return;
+  const resourceType = mediaUrl.includes('/video/') ? 'video' : 'image';
+  try {
+    await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
+  } catch (err) {
+    // Log but don't block — DB operation is already done
+    console.error('[Cloudinary] Delete error for', publicId, ':', err.message);
+  }
+}
+
 async function uploadToCloudinary(file) {
   if (!file) return null;
   if (!cloudinary) {
-    const error = new Error('Image upload service is not configured');
+    const error = new Error('Media upload service is not configured');
     error.code = 'UPLOAD_NOT_CONFIGURED';
     throw error;
   }
+
+  const isVideo = file.mimetype?.startsWith('video/');
 
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       {
         folder: 'nogatu/news',
-        resource_type: 'image',
+        resource_type: isVideo ? 'video' : 'image',
       },
       (err, result) => {
         if (err) return reject(err);
         resolve(result?.secure_url || null);
       }
     );
-
     uploadStream.end(file.buffer);
   });
 }
@@ -90,7 +127,7 @@ router.use(async (_req, res, next) => {
   }
 });
 
-// GET /api/admin/news - List all news (including unpublished)
+// GET /api/admin/news
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(
@@ -103,7 +140,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST /api/admin/news - Create new post
+// POST /api/admin/news
 router.post('/', handleUpload, async (req, res) => {
   try {
     const { title, content, type = 'news', image_url = null } = req.body;
@@ -125,14 +162,14 @@ router.post('/', handleUpload, async (req, res) => {
     }
 
     const uploadedUrl = await uploadToCloudinary(req.file);
-    const imageUrl = uploadedUrl || normalizeImageUrl(image_url);
+    const mediaUrl = uploadedUrl || normalizeImageUrl(image_url);
 
     const [result] = await pool.query(
       'INSERT INTO newstab (title, content, type, image_url, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-      [normalizedTitle, normalizedContent, type, imageUrl, isPublished ? 1 : 0, req.session.adminid]
+      [normalizedTitle, normalizedContent, type, mediaUrl, isPublished ? 1 : 0, req.session.adminid]
     );
 
-    res.json({ success: true, id: result.insertId, image_url: imageUrl });
+    res.json({ success: true, id: result.insertId, image_url: mediaUrl });
   } catch (err) {
     console.error('[Admin/News] POST error:', err.message);
     if (err.code === 'UPLOAD_NOT_CONFIGURED' || String(err.message || '').includes('Image URL must start')) {
@@ -142,15 +179,15 @@ router.post('/', handleUpload, async (req, res) => {
   }
 });
 
-// PUT /api/admin/news/:id - Update post
+// PUT /api/admin/news/:id
 router.put('/:id', handleUpload, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { title, content, type, image_url } = req.body;
-        if (!Number.isFinite(id) || id <= 0) {
-          return res.status(400).json({ error: 'Invalid post reference' });
-        }
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid post reference' });
+    }
 
+    const { title, content, type, image_url } = req.body;
     const isPublished = toBool(req.body?.is_published, true);
     const normalizedTitle = String(title || '').trim();
     const normalizedContent = String(content || '').trim();
@@ -168,15 +205,37 @@ router.put('/:id', handleUpload, async (req, res) => {
       return res.status(400).json({ error: 'Content is too long (max 8000 characters)' });
     }
 
-    const uploadedUrl = await uploadToCloudinary(req.file);
-    const imageUrl = uploadedUrl || normalizeImageUrl(image_url);
+    // Fetch existing post to get old media URL for cleanup
+    const [[existing]] = await pool.query('SELECT image_url FROM newstab WHERE id = ?', [id]);
+    const oldMediaUrl = existing?.image_url || null;
+
+    let mediaUrl;
+    if (req.file) {
+      // New file uploaded — upload it, then delete old Cloudinary asset
+      const uploadedUrl = await uploadToCloudinary(req.file);
+      mediaUrl = uploadedUrl;
+      if (oldMediaUrl && oldMediaUrl !== mediaUrl) {
+        await deleteFromCloudinary(oldMediaUrl);
+      }
+    } else if (image_url !== undefined) {
+      // image_url field explicitly sent — respect it (could be empty to clear media)
+      const requestedUrl = normalizeImageUrl(image_url);
+      if (!requestedUrl && oldMediaUrl) {
+        // Clearing media — delete old Cloudinary asset
+        await deleteFromCloudinary(oldMediaUrl);
+      }
+      mediaUrl = requestedUrl;
+    } else {
+      // Not changing media — keep existing
+      mediaUrl = oldMediaUrl;
+    }
 
     await pool.query(
       'UPDATE newstab SET title = ?, content = ?, type = ?, image_url = ?, is_published = ? WHERE id = ?',
-      [normalizedTitle, normalizedContent, type || 'news', imageUrl, isPublished ? 1 : 0, id]
+      [normalizedTitle, normalizedContent, type || 'news', mediaUrl, isPublished ? 1 : 0, id]
     );
 
-    res.json({ success: true, image_url: imageUrl });
+    res.json({ success: true, image_url: mediaUrl });
   } catch (err) {
     console.error('[Admin/News] PUT error:', err.message);
     if (err.code === 'UPLOAD_NOT_CONFIGURED' || String(err.message || '').includes('Image URL must start')) {
@@ -186,7 +245,7 @@ router.put('/:id', handleUpload, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/news/:id - Delete post
+// DELETE /api/admin/news/:id
 router.delete('/:id', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -194,7 +253,17 @@ router.delete('/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid post reference' });
     }
 
+    // Fetch media URL before deleting so we can clean up Cloudinary
+    const [[existing]] = await pool.query('SELECT image_url FROM newstab WHERE id = ?', [id]);
+    const mediaUrl = existing?.image_url || null;
+
     await pool.query('DELETE FROM newstab WHERE id = ?', [id]);
+
+    // Delete Cloudinary asset after DB row is gone (non-blocking if it fails)
+    if (mediaUrl) {
+      deleteFromCloudinary(mediaUrl).catch(() => {});
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error('[Admin/News] DELETE error:', err.message);
@@ -202,7 +271,7 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// PATCH /api/admin/news/:id/toggle - Toggle publish status
+// PATCH /api/admin/news/:id/toggle
 router.patch('/:id/toggle', async (req, res) => {
   try {
     const id = Number(req.params.id);

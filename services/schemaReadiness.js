@@ -175,7 +175,13 @@ const SCHEMA_REQUIREMENTS = {
     },
   },
   VOUCHERS: {
-    tables: ['voucherstab', 'voucher_transactionstab'],
+    tables: [
+      'voucherstab',
+      'voucher_transactionstab',
+      'voucher_availmentstab',
+      'voucher_availment_itemstab',
+      'voucher_availment_audittab',
+    ],
     columns: {
       voucherstab: {
         suspend_reason: { typeIncludes: 'varchar(500)' },
@@ -185,6 +191,73 @@ const SCHEMA_REQUIREMENTS = {
         use_expires_at: {},
         revoked_at: {},
         revocation_reason: { typeIncludes: 'varchar(500)' },
+      },
+      voucher_transactionstab: {
+        source_type: { typeIncludes: 'varchar(32)' },
+        availment_id: {},
+        external_reference: { typeIncludes: 'varchar(120)' },
+      },
+      voucher_availmentstab: {
+        er_number: { typeIncludes: 'varchar(120)' },
+        transaction_id: {},
+        created_by_admin: { typeIncludes: 'varchar(120)' },
+        updated_by_admin: { typeIncludes: 'varchar(120)' },
+        request_source: { typeIncludes: 'varchar(32)' },
+        claim_status: { typeIncludes: 'varchar(32)' },
+        claimed_at: {},
+        claimed_by_admin: { typeIncludes: 'varchar(120)' },
+      },
+      voucher_availment_itemstab: {
+        item_label: { typeIncludes: 'varchar(255)' },
+        product_code: {},
+        product_key: { typeIncludes: 'varchar(32)' },
+      },
+      voucher_availment_audittab: {
+        action_type: { typeIncludes: 'varchar(32)' },
+      },
+    },
+  },
+  VOUCHER_GRANTS: {
+    tables: ['voucherstab'],
+    columns: {
+      voucherstab: {
+        uid: {},
+        package_type: {},
+        voucher_amount: {},
+        remaining_balance: {},
+        issued_date: {},
+        expiry_date: {},
+        status: {},
+      },
+    },
+  },
+  VOUCHER_LIST: {
+    tables: ['voucherstab'],
+    columns: {
+      voucherstab: {
+        uid: {},
+        package_type: {},
+        voucher_amount: {},
+        remaining_balance: {},
+        issued_date: {},
+        expiry_date: {},
+        status: {},
+        suspend_reason: { typeIncludes: 'varchar(500)' },
+        first_used_at: {},
+        use_expires_at: {},
+      },
+    },
+  },
+  VOUCHER_TRANSACTIONS: {
+    tables: ['voucher_transactionstab'],
+    columns: {
+      voucher_transactionstab: {
+        id: {},
+        voucher_id: {},
+        cash_paid: {},
+        voucher_used: {},
+        total_value: {},
+        transaction_date: {},
       },
     },
   },
