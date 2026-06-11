@@ -371,53 +371,64 @@ async function calculateGlobalBonus(yearInput, options = {}) {
 async function distributeGlobalBonus(yearInput, processId = 'system') {
   await ensureGlobalBonusTables();
   const summary = await calculateGlobalBonus(yearInput);
+  const conn = await pool.getConnection();
 
-  await pool.query(
-    `INSERT INTO globalbonus_poolstab
-      (period_scope, period_month, period_year, total_net_sales, bonus_pool, total_portions, per_portion_value,
-       status, distributed_date, created_date, processid)
-     VALUES ('annual', 0, ?, ?, ?, ?, ?, 1, NOW(), NOW(), ?)
-     ON DUPLICATE KEY UPDATE
-       total_net_sales = VALUES(total_net_sales),
-       bonus_pool = VALUES(bonus_pool),
-       total_portions = VALUES(total_portions),
-       per_portion_value = VALUES(per_portion_value),
-       status = 1,
-       distributed_date = NOW(),
-       processid = VALUES(processid)`,
-    [
-      summary.year,
-      summary.totalNetSales,
-      summary.bonusPool,
-      summary.totalPortions,
-      summary.perPortionValue,
-      processId,
-    ]
-  );
+  try {
+    await conn.beginTransaction();
 
-  await pool.query(
-    `DELETE FROM globalbonus_membertab
-     WHERE period_scope = 'annual' AND period_year = ? AND period_month = 0`,
-    [summary.year]
-  );
-
-  for (const row of summary.recipients) {
-    await pool.query(
-      `INSERT INTO globalbonus_membertab
-        (uid, period_scope, period_month, period_year, member_type, portions, share_amount, distributed_date, processid)
-       VALUES (?, 'annual', 0, ?, ?, ?, ?, NOW(), ?)`,
+    await conn.query(
+      `INSERT INTO globalbonus_poolstab
+        (period_scope, period_month, period_year, total_net_sales, bonus_pool, total_portions, per_portion_value,
+         status, distributed_date, created_date, processid)
+       VALUES ('annual', 0, ?, ?, ?, ?, ?, 1, NOW(), NOW(), ?)
+       ON DUPLICATE KEY UPDATE
+         total_net_sales = VALUES(total_net_sales),
+         bonus_pool = VALUES(bonus_pool),
+         total_portions = VALUES(total_portions),
+         per_portion_value = VALUES(per_portion_value),
+         status = 1,
+         distributed_date = NOW(),
+         processid = VALUES(processid)`,
       [
-        row.uid,
         summary.year,
-        row.memberType,
-        row.portions,
-        row.shareAmount,
+        summary.totalNetSales,
+        summary.bonusPool,
+        summary.totalPortions,
+        summary.perPortionValue,
         processId,
       ]
     );
-  }
 
-  return summary;
+    await conn.query(
+      `DELETE FROM globalbonus_membertab
+       WHERE period_scope = 'annual' AND period_year = ? AND period_month = 0`,
+      [summary.year]
+    );
+
+    for (const row of summary.recipients) {
+      await conn.query(
+        `INSERT INTO globalbonus_membertab
+          (uid, period_scope, period_month, period_year, member_type, portions, share_amount, distributed_date, processid)
+         VALUES (?, 'annual', 0, ?, ?, ?, ?, NOW(), ?)`,
+        [
+          row.uid,
+          summary.year,
+          row.memberType,
+          row.portions,
+          row.shareAmount,
+          processId,
+        ]
+      );
+    }
+
+    await conn.commit();
+    return summary;
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
 }
 
 async function getPoolRecord(yearInput) {

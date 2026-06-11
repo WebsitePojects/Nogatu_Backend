@@ -330,14 +330,28 @@ router.put('/:pid/process', adminAuth, adminRights([1, 3]), async (req, res) => 
   try {
     const pid = Number(req.params.pid);
     const { uid } = req.body;
+    const numericUid = Number(uid);
 
-    if (!Number.isFinite(pid) || !Number.isFinite(Number(uid))) {
+    if (!Number.isFinite(pid) || !Number.isFinite(numericUid)) {
       return res.status(400).json({ error: 'Invalid encashment reference' });
+    }
+
+    const [ownerRows] = await pool.query(
+      'SELECT uid FROM payouthistorytab WHERE pid = ? LIMIT 1',
+      [pid]
+    );
+
+    if (ownerRows.length === 0) {
+      return res.status(404).json({ error: 'Encashment record not found' });
+    }
+
+    if (Number(ownerRows[0].uid) !== numericUid) {
+      return res.status(409).json({ error: 'Encashment record does not belong to the supplied member.' });
     }
 
     const [result] = await pool.query(
       "UPDATE payouthistorytab SET cashstatus = 1, cashtransdate = NOW() WHERE pid = ? AND uid = ? LIMIT 1",
-      [pid, Number(uid)]
+      [pid, numericUid]
     );
 
     if (result.affectedRows === 1) {

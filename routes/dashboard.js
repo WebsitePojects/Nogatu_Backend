@@ -92,8 +92,27 @@ router.get('/', memberAuth, async (req, res) => {
     const ttlincome6     = Number(income.ttlincome6     || 0);
     const ttlcashbalance = Number(income.ttlcashbalance || 0);
 
-    // Match production: active cash summary includes income1,2,3,5 only.
-    const totalCashIncome = ttlincome1 + ttlincome2 + ttlincome3 + ttlincome5;
+    // Total all-time credited income across every income stream.
+    // ttlincome1=Direct Referral, ttlincome2=Pairing/SMB, ttlincome3=Leadership,
+    // ttlincome4=Unilevel, ttlincome5=HiFive, ttlincome6=Ranking Bonus.
+    // Global Bonus is tracked separately in globalbonus_membertab and added below.
+    const totalCashIncome = ttlincome1 + ttlincome2 + ttlincome3 + ttlincome4 + ttlincome5 + ttlincome6;
+
+    // Global Bonus all-time distributed total (own table, not in payouttotaltab)
+    let globalBonusTotal = 0;
+    let globalBonusEligible = false;
+    try {
+      const [gbRows] = await pool.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN distributed_date IS NOT NULL THEN share_amount ELSE 0 END), 0) AS total,
+           COALESCE(MAX(portions), 0) AS max_portions
+         FROM globalbonus_membertab
+         WHERE uid = ?`,
+        [uid]
+      );
+      globalBonusTotal = Number(gbRows[0]?.total || 0);
+      globalBonusEligible = Number(gbRows[0]?.max_portions || 0) > 0;
+    } catch (_) { /* table may not exist yet */ }
 
     // 2. Get maintenance status (current month repurchases)
     const { start, end } = currentMonthRange();
@@ -146,13 +165,15 @@ router.get('/', memberAuth, async (req, res) => {
     const pairingBalance = Math.abs(leftPoints - rightPoints);
 
     res.json({
-      totalCashIncome,
+      totalCashIncome: totalCashIncome + globalBonusTotal,
       directReferral: ttlincome1,
       salesVolume: ttlincome2,
       uniLevel: ttlincome4,
       leadershipBonus: ttlincome3,
       hiFiveBonus: ttlincome5,
       rankingBonus: ttlincome6,
+      globalBonus: globalBonusTotal,
+      globalBonusEligible,
       cashBalance: ttlcashbalance,
       maintenanceStatus,
       maintenancePoints,

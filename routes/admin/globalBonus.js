@@ -16,13 +16,36 @@ const {
   unfreezeGlobalBonusMember,
 } = require('../../services/globalBonus');
 
+function parseClosedYearInput(rawYear) {
+  if (rawYear == null || String(rawYear).trim() === '') {
+    return undefined;
+  }
+
+  const yearText = String(rawYear).trim();
+  if (!/^\d{4}$/.test(yearText)) {
+    const error = new Error('Year must be a 4-digit closed year.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const year = Number(yearText);
+  const currentYear = new Date().getFullYear();
+  if (year > currentYear - 1) {
+    const error = new Error('Year must be a 4-digit closed year.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return year;
+}
+
 /**
  * GET /api/admin/global-bonus?year=YYYY&page=1&perPage=30
  * Returns preview + distributed records for selected annual period.
  */
 router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const year = req.query.year;
+    const year = parseClosedYearInput(req.query.year);
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 30));
 
@@ -30,7 +53,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     res.json(report);
   } catch (err) {
     console.error('[Admin Global Bonus] Report error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -40,12 +63,12 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.get('/preview', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const year = req.query.year;
+    const year = parseClosedYearInput(req.query.year);
     const preview = await calculateGlobalBonus(year);
     res.json(preview);
   } catch (err) {
     console.error('[Admin Global Bonus] Preview error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -69,13 +92,13 @@ router.get('/latest', adminAuth, adminRights([1, 3]), async (req, res) => {
  */
 router.get('/search', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const year = req.query.year;
+    const year = parseClosedYearInput(req.query.year);
     const query = req.query.q;
     const members = await searchGlobalBonusMembers(query, year);
     res.json({ members });
   } catch (err) {
     console.error('[Admin Global Bonus] Search error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -86,7 +109,8 @@ router.get('/search', adminAuth, adminRights([1, 3]), async (req, res) => {
 router.post('/members/add', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const processId = req.session.adminid || 'admin';
-    const summary = await addGlobalBonusMember(req.body?.year, req.body, processId);
+    const year = parseClosedYearInput(req.body?.year);
+    const summary = await addGlobalBonusMember(year, req.body, processId);
     res.json({
       success: true,
       message: 'Global bonus member added successfully.',
@@ -94,7 +118,7 @@ router.post('/members/add', adminAuth, adminRights([1, 3]), async (req, res) => 
     });
   } catch (err) {
     console.error('[Admin Global Bonus] Add member error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -104,7 +128,8 @@ router.post('/members/add', adminAuth, adminRights([1, 3]), async (req, res) => 
 router.post('/members/:uid/remove', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const processId = req.session.adminid || 'admin';
-    const summary = await removeGlobalBonusMember(req.body?.year, req.params.uid, processId);
+    const year = parseClosedYearInput(req.body?.year);
+    const summary = await removeGlobalBonusMember(year, req.params.uid, processId);
     res.json({
       success: true,
       message: 'Global bonus member removed successfully.',
@@ -112,7 +137,7 @@ router.post('/members/:uid/remove', adminAuth, adminRights([1, 3]), async (req, 
     });
   } catch (err) {
     console.error('[Admin Global Bonus] Remove member error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -122,7 +147,8 @@ router.post('/members/:uid/remove', adminAuth, adminRights([1, 3]), async (req, 
 router.post('/members/:uid/freeze', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const processId = req.session.adminid || 'admin';
-    const summary = await freezeGlobalBonusMember(req.body?.year, req.params.uid, processId);
+    const year = parseClosedYearInput(req.body?.year);
+    const summary = await freezeGlobalBonusMember(year, req.params.uid, processId);
     res.json({
       success: true,
       message: 'Global bonus member frozen successfully.',
@@ -130,7 +156,7 @@ router.post('/members/:uid/freeze', adminAuth, adminRights([1, 3]), async (req, 
     });
   } catch (err) {
     console.error('[Admin Global Bonus] Freeze member error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -140,7 +166,8 @@ router.post('/members/:uid/freeze', adminAuth, adminRights([1, 3]), async (req, 
 router.post('/members/:uid/unfreeze', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const processId = req.session.adminid || 'admin';
-    const summary = await unfreezeGlobalBonusMember(req.body?.year, req.params.uid, processId);
+    const year = parseClosedYearInput(req.body?.year);
+    const summary = await unfreezeGlobalBonusMember(year, req.params.uid, processId);
     res.json({
       success: true,
       message: 'Global bonus member reactivated successfully.',
@@ -148,7 +175,7 @@ router.post('/members/:uid/unfreeze', adminAuth, adminRights([1, 3]), async (req
     });
   } catch (err) {
     console.error('[Admin Global Bonus] Unfreeze member error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 
@@ -159,7 +186,7 @@ router.post('/members/:uid/unfreeze', adminAuth, adminRights([1, 3]), async (req
  */
 router.post('/distribute', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const year = req.body?.year;
+    const year = parseClosedYearInput(req.body?.year);
     const processId = req.session.adminid || 'admin';
 
     const summary = await distributeGlobalBonus(year, processId);
@@ -171,7 +198,7 @@ router.post('/distribute', adminAuth, adminRights([1, 3]), async (req, res) => {
     });
   } catch (err) {
     console.error('[Admin Global Bonus] Distribute error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    res.status(err.statusCode || 500).json({ error: err.message || 'Internal server error' });
   }
 });
 

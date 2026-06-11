@@ -5,10 +5,12 @@
 const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
+const { pool } = require('../config/database');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
 const { insertEncashment, getEncashmentPreview } = require('../services/income/insertIncome');
 const { getMemberGlobalBonus } = require('../services/globalBonus');
-const { assertTinPresentForEncashment } = require('../services/memberTinPolicy');
+// TIN gate removed per business decision 2026-06-11 — encashment allowed without TIN
+// const { assertTinPresentForEncashment } = require('../services/memberTinPolicy');
 const { getProjectedCurrentMonthUnilevel, checkLastMaintenance } = require('../services/income/unilevel');
 
 /**
@@ -27,15 +29,27 @@ router.get('/', memberAuth, async (req, res) => {
       checkLastMaintenance(uid),
       getProjectedCurrentMonthUnilevel(uid),
     ]);
-    const globalBonus = await getMemberGlobalBonus(uid).catch(() => ({
-      eligible: false,
-      visibilityState: 'locked',
-      interactive: false,
-      fullVisibility: false,
-      lockedReason: 'Global bonus status is unavailable right now.',
-      labels: [],
-      portions: 0,
-    }));
+    const [globalBonus, globalBonusDistributed] = await Promise.all([
+      getMemberGlobalBonus(uid).catch(() => ({
+        eligible: false,
+        visibilityState: 'locked',
+        interactive: false,
+        fullVisibility: false,
+        lockedReason: 'Global bonus status is unavailable right now.',
+        labels: [],
+        portions: 0,
+      })),
+      (async () => {
+        try {
+          const [rows] = await pool.query(
+            `SELECT COALESCE(SUM(CASE WHEN distributed_date IS NOT NULL THEN share_amount ELSE 0 END), 0) AS total
+             FROM globalbonus_membertab WHERE uid = ?`,
+            [uid]
+          );
+          return Number(rows[0]?.total || 0);
+        } catch (_) { return 0; }
+      })(),
+    ]);
 
     res.json({
       directReferral: Number(updated.ttlincome1 || 0),
@@ -44,6 +58,7 @@ router.get('/', memberAuth, async (req, res) => {
       unilevel:       Number(updated.ttlincome4 || 0),
       hifive:         Number(updated.ttlincome5 || 0),
       rankingBonus:   Number(updated.ttlincome6 || 0),
+      globalBonus:    globalBonusDistributed,
       cashBalance:    Number(updated.ttlcashbalance || 0),
       globalBonusStatus: {
         eligible: Boolean(globalBonus.eligible),
@@ -56,7 +71,8 @@ router.get('/', memberAuth, async (req, res) => {
       },
       totalIncome:    Number(updated.ttlincome1 || 0) + Number(updated.ttlincome2 || 0) +
                       Number(updated.ttlincome3 || 0) + Number(updated.ttlincome4 || 0) +
-                      Number(updated.ttlincome5 || 0) + Number(updated.ttlincome6 || 0),
+                      Number(updated.ttlincome5 || 0) + Number(updated.ttlincome6 || 0) +
+                      globalBonusDistributed,
       unilevelMaintenance: {
         maintenanceMet,
         projectedUnilevel: Number(projectedUnilevel || 0),
@@ -85,7 +101,7 @@ router.post('/preview-encash', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
 
-    await assertTinPresentForEncashment(uid);
+    // TIN gate removed — encashment allowed without TIN
 
     const preview = await getEncashmentPreview(uid, amount);
     if (!preview.payout.ok) {
@@ -106,13 +122,13 @@ router.post('/preview-encash', memberAuth, async (req, res) => {
 
     res.json({ success: true, preview });
   } catch (err) {
-    console.error('[Wallet] Encashment preview error:', err);
-    if (err.message === 'Invalid encashment amount') {
-      return res.status(400).json({ error: err.message });
-    }
     if (err.statusCode) {
       return res.status(err.statusCode).json({ error: err.message, code: err.code });
     }
+    if (err.message === 'Invalid encashment amount') {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('[Wallet] Encashment preview error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -130,7 +146,7 @@ router.post('/encash', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Please enter a valid amount greater than zero' });
     }
 
-    await assertTinPresentForEncashment(uid);
+    // TIN gate removed — encashment allowed without TIN
 
     const result = await insertEncashment(uid, amount, null, {
       req,

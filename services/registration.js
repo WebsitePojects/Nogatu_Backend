@@ -474,7 +474,7 @@ async function registerMember({
     if (normalizedTin && !isValidTin(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
-    if (!isValidEmail(normalizedEmail)) {
+    if (normalizedEmail && !isValidEmail(normalizedEmail)) {
       throw new Error('A valid email address is required.');
     }
 
@@ -531,11 +531,13 @@ async function registerMember({
     );
     if (existingUser.length > 0) throw createUsernameTakenError(normalizedUsername);
 
-    const [existingEmail] = await conn.query(
-      'SELECT uid FROM memberstab WHERE email = ? LIMIT 1',
-      [normalizedEmail]
-    );
-    if (existingEmail.length > 0) throw new Error('Email address is already being used by another account');
+    if (normalizedEmail) {
+      const [existingEmail] = await conn.query(
+        'SELECT uid FROM memberstab WHERE email = ? LIMIT 1',
+        [normalizedEmail]
+      );
+      if (existingEmail.length > 0) throw new Error('Email address is already being used by another account');
+    }
 
     const [placementCheck] = await conn.query(
       'SELECT uid FROM usertab WHERE refid = ? AND position = ?',
@@ -569,7 +571,7 @@ async function registerMember({
     await conn.query(
       `INSERT INTO memberstab (id, uid, public_id, referral_slug, username, password, firstname, lastname, middlename, tin, email, address, contactnos, dob)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [newCountId, newUid, memberPublicId, memberReferralSlug, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin || null, normalizedEmail.slice(0, 180), normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
+      [newCountId, newUid, memberPublicId, memberReferralSlug, normalizedUsername, hashedPassword, firstname, lastname, middlename, normalizedTin || null, normalizedEmail ? normalizedEmail.slice(0, 180) : null, normalizedAddress || null, normalizedContactNo || null, normalizedDob || null]
     );
 
     await conn.query(

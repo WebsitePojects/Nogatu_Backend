@@ -216,24 +216,27 @@ router.get('/lookup-account', adminAuth, adminRights([1, 2, 3]), async (req, res
  * Release codes for distribution
  */
 router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  let conn;
   try {
     const { codes: selectedCodes } = req.body;
     let released = 0;
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
 
     for (const code of selectedCodes) {
-      const [codeRows] = await pool.query(
+      const [codeRows] = await conn.query(
         'SELECT id, uid FROM codestab WHERE code = ? AND codestatus = 0 LIMIT 1',
         [code]
       );
       if (codeRows.length === 0) continue;
 
-      const [result] = await pool.query(
+      const [result] = await conn.query(
         "UPDATE codestab SET releasedate = 1, codestatus = 1 WHERE code = ? AND codestatus = 0 LIMIT 1",
         [code]
       );
       if (result.affectedRows === 1) {
         released++;
-        await appendActivationCodeUsage(pool, {
+        await appendActivationCodeUsage(conn, {
           code,
           codeRowId: codeRows[0].id,
           eventType: 'release',
@@ -244,10 +247,14 @@ router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
       }
     }
 
+    await conn.commit();
     res.json({ success: true, released });
   } catch (err) {
+    if (conn) await conn.rollback();
     console.error('[Admin Codes] Release error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
@@ -318,10 +325,14 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
 });
 
 router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  let conn;
   try {
     const { targetUsername, codes: selectedCodes } = req.body;
     const targetSanitized = sanitizeAlphaNum(targetUsername);
-    const [targetRows] = await pool.query(
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const [targetRows] = await conn.query(
       'SELECT uid, username, firstname, lastname FROM memberstab WHERE username = ?',
       [targetSanitized]
     );
@@ -335,7 +346,7 @@ router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, 
     let transferred = 0;
 
     for (const code of selectedCodes || []) {
-      const [codeRows] = await pool.query(
+      const [codeRows] = await conn.query(
         'SELECT * FROM codestab WHERE code = ? AND codestatus <= 1 LIMIT 1',
         [code]
       );
@@ -343,13 +354,13 @@ router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, 
 
       const codeRow = codeRows[0];
       if (Number(codeRow.codestatus || 0) === 0) {
-        const [releaseResult] = await pool.query(
+        const [releaseResult] = await conn.query(
           "UPDATE codestab SET releasedate = 1, codestatus = 1 WHERE code = ? AND codestatus = 0 LIMIT 1",
           [code]
         );
         if (releaseResult.affectedRows === 1) {
           released += 1;
-          await appendActivationCodeUsage(pool, {
+          await appendActivationCodeUsage(conn, {
             code,
             codeRowId: codeRow.id,
             eventType: 'release',
@@ -360,20 +371,20 @@ router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, 
         }
       }
 
-      await pool.query(
+      await conn.query(
         'UPDATE codestab SET uid = ? WHERE code = ? AND codestatus = 1 LIMIT 1',
         [targetUid, code]
       );
 
       const history = `(${req.session.adminid}).${targetSanitized}`;
-      await pool.query(
+      await conn.query(
         `INSERT INTO codehistorytab (id, code, dategen, history, datetransfer, processid)
          VALUES (?, ?, ?, ?, NOW(), NULL)
          ON DUPLICATE KEY UPDATE history = CONCAT(history, ' -> ', ?), datetransfer = NOW()`,
         [codeRow.id, code, codeRow.dategen, history, history]
       );
 
-      await appendActivationCodeUsage(pool, {
+      await appendActivationCodeUsage(conn, {
         code,
         codeRowId: codeRow.id,
         eventType: 'admin_transfer',
@@ -390,10 +401,14 @@ router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, 
       transferred += 1;
     }
 
+    await conn.commit();
     res.json({ success: true, released, transferred });
   } catch (err) {
+    if (conn) await conn.rollback();
     console.error('[Admin Codes] Release+Transfer error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 

@@ -35,6 +35,58 @@ function pickPairingRowsForTransaction(rows = [], targetAmount = 0, transdate = 
   });
 }
 
+// Direct lookup via income_eventstab → pairing_ledgerstab → binary_point_eventstab.
+// Returns one row per pair event linked to a specific income record; never reuses
+// the same pair across different transactions. Falls back to null on missing tables.
+async function getPairingTraceForTransactionDirect(uid, transdate, targetAmount) {
+  try {
+    const windowStart = new Date(new Date(transdate).getTime() - 8 * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 19).replace('T', ' ');
+    const windowEnd = String(transdate).slice(0, 19).replace('T', ' ');
+
+    const [rows] = await pool.query(
+      `SELECT ie.gross_amount AS creditedIncome,
+              ie.credited_at AS pairedAt,
+              pl.pair_points AS pairPoints,
+              m_l.username AS leftUsername,
+              TRIM(CONCAT(COALESCE(m_l.firstname,''),' ',COALESCE(m_l.lastname,''))) AS leftFullName,
+              m_r.username AS rightUsername,
+              TRIM(CONCAT(COALESCE(m_r.firstname,''),' ',COALESCE(m_r.lastname,''))) AS rightFullName
+         FROM income_eventstab ie
+         LEFT JOIN pairing_ledgerstab pl ON pl.ledger_uid = ie.source_ref_uid
+         LEFT JOIN binary_point_eventstab bpe_l ON bpe_l.event_uid = pl.left_event_uid
+         LEFT JOIN binary_point_eventstab bpe_r ON bpe_r.event_uid = pl.right_event_uid
+         LEFT JOIN memberstab m_l ON m_l.uid = bpe_l.source_member_uid
+         LEFT JOIN memberstab m_r ON m_r.uid = bpe_r.source_member_uid
+        WHERE ie.beneficiary_uid = ?
+          AND ie.income_type = 'pairing_bonus'
+          AND ie.status = 'credited'
+          AND ie.credited_at >= ?
+          AND ie.credited_at <= ?
+        ORDER BY ie.credited_at ASC`,
+      [uid, windowStart, windowEnd]
+    );
+
+    // Normalize to the same shape buildPairingHistoryRows produces so the frontend needs no changes.
+    return rows.map((row) => ({
+      creditedIncome: Number(row.creditedIncome || 0),
+      pairPoints: Number(row.pairPoints || 0),
+      pairedAt: row.pairedAt,
+      left: {
+        username: row.leftUsername || null,
+        fullName: row.leftFullName || row.leftUsername || 'Unknown',
+      },
+      right: {
+        username: row.rightUsername || null,
+        fullName: row.rightFullName || row.rightUsername || 'Unknown',
+      },
+    }));
+  } catch (err) {
+    if (err.code === 'ER_NO_SUCH_TABLE') return null;
+    throw err;
+  }
+}
+
 async function resolveDirectReferralSourcesForTransaction(uid, tx) {
   const amount = normalizeAmount(tx?.directReferral);
   if (amount <= 0 || !tx) {
@@ -349,8 +401,18 @@ router.get('/:pid', memberAuth, async (req, res) => {
     const row = rows[0];
     const effectiveAccount = await getEffectiveAccountState(uid);
     const hasPairingIncome = Number(row.income2 || 0) > 0;
+
+    // Try direct income_eventstab → pairing_ledgerstab link first (exact, non-overlapping).
+    // Fall back to the legacy heuristic only when the ledger tables don't exist yet.
+    let directPairingRows = null;
+    if (hasPairingIncome) {
+      directPairingRows = await getPairingTraceForTransactionDirect(
+        uid, row.transdate, Number(row.income2 || 0)
+      );
+    }
+
     const [pairingTrace, hiFiveTrace, directReferralTrace] = await Promise.all([
-      hasPairingIncome
+      hasPairingIncome && directPairingRows === null
         ? getPairingTrace(uid, Number(req.session.currentaccttype || req.session.accttype || 0), { limit: 40 }).catch(() => ({ rows: [] }))
         : Promise.resolve({ rows: [] }),
       resolveHiFiveSourcesForTransaction(uid, {
@@ -364,7 +426,9 @@ router.get('/:pid', memberAuth, async (req, res) => {
       }),
     ]);
 
-    const exactPairingRows = pickPairingRowsForTransaction(pairingTrace.rows || [], row.income2, row.transdate);
+    const exactPairingRows = directPairingRows !== null
+      ? directPairingRows
+      : pickPairingRowsForTransaction(pairingTrace.rows || [], row.income2, row.transdate);
 
     res.json({
       transaction: {

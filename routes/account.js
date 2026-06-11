@@ -118,16 +118,18 @@ router.put('/', memberAuth, async (req, res) => {
     let normalizedTin = null;
     const normalizedEmail = normalizeEmail(email);
 
-    if (!isValidEmail(normalizedEmail)) {
-      return res.status(400).json({ error: 'A valid email address is required for password reset.' });
+    if (normalizedEmail && !isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'The email address format is invalid.' });
     }
 
-    const [emailRows] = await pool.query(
-      'SELECT uid FROM memberstab WHERE email = ? AND uid <> ? LIMIT 1',
-      [normalizedEmail, uid]
-    );
-    if (emailRows.length > 0) {
-      return res.status(400).json({ error: 'That email address is already being used by another account.' });
+    if (normalizedEmail) {
+      const [emailRows] = await pool.query(
+        'SELECT uid FROM memberstab WHERE email = ? AND uid <> ? LIMIT 1',
+        [normalizedEmail, uid]
+      );
+      if (emailRows.length > 0) {
+        return res.status(400).json({ error: 'That email address is already being used by another account.' });
+      }
     }
 
     if (hasTinField) {
@@ -146,7 +148,7 @@ router.put('/', memberAuth, async (req, res) => {
       'contactnos = ?',
       'email = ?',
     ];
-    const values = [address, payoutdetails, normalizedPayoutOption, contactnos, normalizedEmail];
+    const values = [address, payoutdetails, normalizedPayoutOption, contactnos, normalizedEmail || null];
 
     if (password && password.trim()) {
       const hashedPassword = await bcrypt.hash(password, 12);

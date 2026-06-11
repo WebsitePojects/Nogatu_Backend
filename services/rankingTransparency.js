@@ -62,8 +62,8 @@ async function getRankingExplanation(uid) {
     }));
 
     return {
-      source: 'repurchasetab + binary_tree_closuretab',
-      basisLabel: progress.basisLabel || 'Repurchase points',
+      source: 'repurchasetab + sponsor_tree (drefid)',
+      basisLabel: progress.basisLabel || 'Repurchase points (sponsor tree)',
       grossRankablePoints,
       consumedPoints,
       remainingRankablePoints,
@@ -111,7 +111,7 @@ async function getRankingExplanation(uid) {
         consumedAt: row.consumed_at,
         explanation: row.explanation,
       })),
-      explanation: 'Ranking bonus now reads repurchase points from your own account plus your full binary downline. When a rank is awarded, only the exact points used for that rank are consumed and stored in this ledger.',
+      explanation: 'Ranking bonus uses repurchase points from your SPONSOR tree (drefid chain) only — binary spillover does not count. The race is bottom-up: deepest nodes qualify first. When a rank is awarded, the consumed events are zeroed globally so ancestors cannot reuse those same points.',
       asOf: new Date().toISOString(),
     };
   } catch (error) {

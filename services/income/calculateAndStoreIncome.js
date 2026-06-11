@@ -43,7 +43,7 @@ async function calculateAndStoreIncome(uid, accttype) {
     }
 
     // Read current stored totals after lock acquisition.
-    const [totals] = await pool.query(
+    const [totals] = await lockConn.query(
       'SELECT * FROM payouttotaltab WHERE uid = ?',
       [uid]
     );
@@ -106,16 +106,16 @@ async function calculateAndStoreIncome(uid, accttype) {
         pairproduct: 0,
         beginningbalance: beginningBalance,
         endingbalance: endingBalance,
-      });
+      }, lockConn);
     }
 
     // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
     if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
-      await savePairingReport(uid, pairingResult.dailyReports);
+      await savePairingReport(uid, pairingResult.dailyReports, lockConn);
     }
 
     // ── Return fresh totals after update ─────────────────────────────
-    const [updated] = await pool.query(
+    const [updated] = await lockConn.query(
       'SELECT * FROM payouttotaltab WHERE uid = ?',
       [uid]
     );

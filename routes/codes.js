@@ -10,6 +10,7 @@ const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES, CODE_PREFIXES 
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
 const { listMemberActivationHistory } = require('../services/codeHistory');
+const { refreshMemberRankSnapshot } = require('../services/ranking');
 
 /**
  * GET /api/codes?page=1
@@ -309,6 +310,13 @@ router.post('/upgrade', memberAuth, async (req, res) => {
 
     await conn.commit();
 
+    // Rebuild ranking snapshot in background — do not block the response
+    setImmediate(() => {
+      refreshMemberRankSnapshot(uid).catch(err =>
+        console.error('[Ranking] post-upgrade rebuild failed:', err)
+      );
+    });
+
     // Update session
     req.session.currentaccttype = codeData.producttype;
     req.session.caccttype = ACCOUNT_TYPES[codeData.producttype] || 'Unknown';
@@ -400,6 +408,13 @@ router.post('/maintenance', memberAuth, async (req, res) => {
     });
 
     await conn.commit();
+
+    // Rebuild ranking snapshot in background — do not block the response
+    setImmediate(() => {
+      refreshMemberRankSnapshot(uid).catch(err =>
+        console.error('[Ranking] post-maintenance rebuild failed:', err)
+      );
+    });
 
     res.json({ success: true, producttype: codeData.producttype });
   } catch (err) {

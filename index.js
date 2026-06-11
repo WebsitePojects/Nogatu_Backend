@@ -10,6 +10,10 @@ function resolveEnvFile() {
     return '.env.prod';
   }
 
+  if (process.env.NODE_ENV === 'staging') {
+    return '.env.staging';
+  }
+
   // Support both naming styles used in this repo history
   const candidates = ['.env.development', '.env.dev'];
   for (const file of candidates) {
@@ -123,6 +127,7 @@ app.use(cors({
     if (isAllowedOrigin(origin)) {
       return callback(null, true);
     }
+    console.warn('[CORS] Rejected origin:', origin);
     return callback(new Error('Origin not allowed by CORS'));
   },
   credentials: true,
@@ -383,6 +388,8 @@ async function start() {
     console.log(`[Server] NOGATU Alliance running on http://localhost:${PORT}`);
     console.log(`[Server] API available at http://localhost:${PORT}/api`);
     console.log(`[Server] Mode: ${process.env.NODE_ENV || 'development'}`);
+    // Signal PM2 that the process is ready (used by wait_ready in ecosystem.config.js)
+    if (process.send) process.send('ready');
   });
 
   server.on('error', (error) => {

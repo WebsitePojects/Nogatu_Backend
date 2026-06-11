@@ -370,8 +370,8 @@ router.put('/:uid/status', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     if (nextStatus !== 'active') {
       await conn.query(
-        'DELETE FROM app_sessions WHERE data LIKE ?',
-        [`%"uid":${uid}%`]
+        "DELETE FROM app_sessions WHERE JSON_EXTRACT(data, '$.uid') = ?",
+        [uid]
       ).catch(() => {});
     }
 

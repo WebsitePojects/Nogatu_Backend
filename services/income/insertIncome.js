@@ -47,7 +47,7 @@ function getNextPayoutDate(baseDate = new Date()) {
  *   { dref, paircash, leadership, unilevel, hifive, beginningbalance, endingbalance }
  *   income6 is reserved for Ranking Bonus fulfillment and is not written by the shared income calculator.
  */
-async function insertIncome(uid, income) {
+async function insertIncome(uid, income, conn = pool) {
   const {
     dref = 0,
     paircash = 0,
@@ -63,7 +63,7 @@ async function insertIncome(uid, income) {
   const now = nowMySQL();
 
   // Insert into payouthistorytab (transaction history)
-  await pool.query(
+  await conn.query(
     `INSERT INTO payouthistorytab
      (pid, uid, mainid, beginningbalance, endingbalance, cashbalance,
       income1, income2, income3, income4, income5, income6,
@@ -80,7 +80,7 @@ async function insertIncome(uid, income) {
   );
 
   // Upsert into payouttotaltab (cumulative totals)
-  await pool.query(
+  await conn.query(
     `INSERT INTO payouttotaltab
      (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
       ttlcashbalance, ttlpointsbalance, transdate)

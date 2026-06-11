@@ -196,12 +196,12 @@ router.get('/', memberAuth, async (req, res) => {
     const safeHistoryPage = Math.min(historyTotalPages, Math.max(1, historyPage));
     const historyOffset = (safeHistoryPage - 1) * historyPerPage;
     const historyRows = historyRowsAll.slice(historyOffset, historyOffset + historyPerPage);
+    // totalPointsLeft/Right come from getPairingCounts — full recursive usertab
+    // traversal of all eligible PD/fully-paid-CD accounts. This is the authoritative
+    // source and matches what the dashboard displays. Do NOT override with the
+    // new ledger's availableLeftPoints which is only correct after full backfill.
     const displayCounts = {
       ...counts,
-      totalPointsLeft: Number(balances.availableLeftPoints || 0),
-      totalPointsRight: Number(balances.availableRightPoints || 0),
-      rawTotalPointsLeft: Number(balances.totalLeftPoints || 0),
-      rawTotalPointsRight: Number(balances.totalRightPoints || 0),
       pairedPointsConsumed: Number(balances.pairedPoints || 0),
       strongLegPoints: Number(balances.strongLegPoints || 0),
       weakLegPoints: Number(balances.weakLegPoints || 0),

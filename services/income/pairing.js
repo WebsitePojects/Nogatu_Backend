@@ -98,7 +98,7 @@ async function getNumLevels(
   totals,
   pairingDepthLimit
 ) {
-  if (pairingDepthLimit && level > pairingDepthLimit) {
+  if (pairingDepthLimit != null && level > pairingDepthLimit) {
     return;
   }
 
@@ -360,12 +360,12 @@ async function getPairingReport(uid) {
 /**
  * Insert/update pairing report records per day
  */
-async function savePairingReport(uid, reports) {
+async function savePairingReport(uid, reports, conn = pool) {
   if (!Array.isArray(reports) || reports.length === 0) return;
 
   for (const report of reports) {
     const transDate = String(report.transdate).slice(0, 10);
-    const [existing] = await pool.query(
+    const [existing] = await conn.query(
       `SELECT id FROM pairingstab
         WHERE uid = ? AND DATE_FORMAT(transdate, '%Y-%m-%d') = ?
         LIMIT 1`,
@@ -373,7 +373,7 @@ async function savePairingReport(uid, reports) {
     );
 
     if (existing.length > 0) {
-      await pool.query(
+      await conn.query(
         `UPDATE pairingstab
             SET transdate = ?,
                 totalleft = ?,
@@ -406,7 +406,7 @@ async function savePairingReport(uid, reports) {
     }
 
     try {
-      await pool.query(
+      await conn.query(
         `INSERT INTO pairingstab
          (uid, transdate, totalleft, totalpointsleft, totalright, totalpointsright,
           weeknumber, \`left\`, \`right\`, totalpoints, totalbpay)
@@ -428,7 +428,7 @@ async function savePairingReport(uid, reports) {
       );
     } catch (err) {
       if (err && err.code === 'ER_DUP_ENTRY') {
-        await pool.query(
+        await conn.query(
           `UPDATE pairingstab
               SET transdate = ?,
                   totalleft = ?,
