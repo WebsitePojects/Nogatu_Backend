@@ -84,9 +84,14 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     if (search) {
       const searchPattern = `%${search}%`;
-      countQuery += ` AND (m.firstname LIKE ? OR m.lastname LIKE ?)`;
-      listQuery += ` AND (m.firstname LIKE ? OR m.lastname LIKE ?)`;
-      params.push(searchPattern, searchPattern);
+      const nameClause = ` AND (
+        m.firstname LIKE ? OR m.lastname LIKE ? OR m.username LIKE ?
+        OR CONCAT(m.firstname, ' ', m.lastname) LIKE ?
+        OR CONCAT(m.lastname, ' ', m.firstname) LIKE ?
+      )`;
+      countQuery += nameClause;
+      listQuery += nameClause;
+      params.push(searchPattern, searchPattern, searchPattern, searchPattern, searchPattern);
     }
 
     listQuery += ` ORDER BY u.datereg DESC LIMIT ?, ?`;

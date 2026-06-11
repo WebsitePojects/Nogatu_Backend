@@ -28,7 +28,7 @@ router.get('/package-claims', adminAuth, adminRights([1, 3]), async (req, res) =
 router.put('/package-claims/:qualificationUid/approve', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const result = await approvePackageClaim(req.params.qualificationUid, {
-      adminUid: req.session.adminid,
+      adminUid: req.session.adminNumericId || null,
       adminNotes: req.body?.adminNotes,
       req,
     });
@@ -46,7 +46,7 @@ router.put('/package-claims/:qualificationUid/approve', adminAuth, adminRights([
 router.put('/package-claims/:qualificationUid/reject', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const result = await rejectPackageClaim(req.params.qualificationUid, {
-      adminUid: req.session.adminid,
+      adminUid: req.session.adminNumericId || null,
       adminNotes: req.body?.adminNotes,
       req,
     });

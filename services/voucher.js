@@ -539,7 +539,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
         [availmentId, Number(transactionResult.insertId || 0)]
       );
 
-      const voucherReferenceCode = `VCHR-${resolvedVoucherId}-${Date.now()}`;
+      const voucherReferenceCode = `VC${Date.now().toString(36).toUpperCase().slice(-10)}`;
       const repurchasePoints = getVoucherRepurchasePoints();
       await conn.query(
         `INSERT INTO repurchasetab (id, uid, producttype, code, transtype, codeid, incentivepoints1, transdate)
