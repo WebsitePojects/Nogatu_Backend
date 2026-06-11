@@ -7,7 +7,7 @@
 const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { sanitizeAlphaNum, getOffsetTimestamp, ACCOUNT_TYPES, CODE_PREFIXES, PRODUCT_TYPES } = require('../utils/helpers');
-const { normalizeTin, isValidTin } = require('../utils/tin');
+const { normalizeTin, isValidTin, isZeroTin } = require('../utils/tin');
 const { issueVoucher } = require('./voucher');
 const { createPublicId, createReferralSlug, createProcessKey } = require('../utils/security');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
@@ -471,7 +471,7 @@ async function registerMember({
     if (!normalizedAddress) {
       throw new Error('Address is required.');
     }
-    if (normalizedTin && !isValidTin(normalizedTin)) {
+    if (normalizedTin && !isZeroTin(normalizedTin) && !isValidTin(normalizedTin)) {
       throw new Error('Invalid TIN format');
     }
     if (normalizedEmail && !isValidEmail(normalizedEmail)) {

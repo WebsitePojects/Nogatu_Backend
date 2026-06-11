@@ -424,7 +424,21 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
   }
 
   const sourceBackfill = await backfillHistoricalBinaryPointEvents(ownerUid, conn);
-  const events = await loadOwnerBinaryPointEvents(ownerUid, conn);
+  const allEvents = await loadOwnerBinaryPointEvents(ownerUid, conn);
+
+  // Re-check current eligibility for every unique source member.
+  // binary_point_eventstab may contain stale entries for members whose
+  // account state changed after their initial backfill (e.g. registered as PD,
+  // then moved to CD, or vice-versa). Only PD and fully-paid CD may be source
+  // nodes; FS and unpaid CD events must not trigger a pairing credit.
+  const uniqueSourceUids = [...new Set(allEvents.map((e) => e.sourceMemberUid))];
+  const eligibilityMap = new Map();
+  for (const uid of uniqueSourceUids) {
+    const effectiveRow = await getEffectiveAccountState(uid, null, conn);
+    eligibilityMap.set(uid, Boolean(effectiveRow && countsForPairingSource(effectiveRow)));
+  }
+  const events = allEvents.filter((e) => eligibilityMap.get(e.sourceMemberUid) === true);
+
   const leftEvents = events.filter((row) => row.ownerLeg === 'left');
   const rightEvents = events.filter((row) => row.ownerLeg === 'right');
   const eligibility = await getBinaryPairingEligibility(ownerUid, conn);

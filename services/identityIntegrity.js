@@ -1,5 +1,6 @@
 const { pool } = require('../config/database');
 const { normalizeEmail } = require('../utils/email');
+const { isZeroTin } = require('../utils/tin');
 
 const KNOWN_SUFFIXES = [
   'jr', 'jr.', 'sr', 'sr.',
@@ -149,7 +150,9 @@ function isCloseNameMatch(inputIdentity, existingIdentity) {
 function matchedSignalsForCandidate(input, candidate) {
   const matched = [];
 
-  if (normalizeTinValue(input.tin) && normalizeTinValue(input.tin) === normalizeTinValue(candidate.tin)) {
+  const inputTinVal = normalizeTinValue(input.tin);
+  const candidateTinVal = normalizeTinValue(candidate.tin);
+  if (inputTinVal && !isZeroTin(inputTinVal) && candidateTinVal && !isZeroTin(candidateTinVal) && inputTinVal === candidateTinVal) {
     matched.push('tin');
   }
   if (normalizeDob(input.dob) && normalizeDob(input.dob) === normalizeDob(candidate.dob)) {
@@ -196,7 +199,7 @@ async function evaluateDuplicateIdentity(input, conn = pool) {
     const existingNameKey = [existingFirst, existingLast].filter(Boolean).join('|');
     const matchedSignals = [];
 
-    if (normalizedTin && existingTin && normalizedTin === existingTin) {
+    if (normalizedTin && !isZeroTin(normalizedTin) && existingTin && !isZeroTin(existingTin) && normalizedTin === existingTin) {
       matchedSignals.push('tin');
     }
 

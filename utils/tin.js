@@ -28,12 +28,18 @@ function isValidTin(value) {
   return digitCount >= MIN_TIN_DIGITS && digitCount <= MAX_TIN_DIGITS && TIN_REGEX.test(tin);
 }
 
+function isZeroTin(value) {
+  const digits = extractTinDigits(value);
+  return digits.length === MAX_TIN_DIGITS && /^0+$/.test(digits);
+}
+
 module.exports = {
   extractTinDigits,
   formatTin,
   normalizeTin,
   resolveTin,
   isValidTin,
+  isZeroTin,
   MIN_TIN_DIGITS,
   MAX_TIN_DIGITS,
 };
