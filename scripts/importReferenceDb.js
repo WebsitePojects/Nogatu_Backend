@@ -2,10 +2,14 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const mysql = require('mysql2/promise');
-const { loadBackendEnv, getDbConfig } = require('./env');
+const { loadBackendEnv, getDbConfig, assertNotProductionDatabase } = require('./env');
 
 loadBackendEnv();
 const db = getDbConfig();
+
+// Block destructive operation on production/remote databases before doing anything else.
+assertNotProductionDatabase(db, 'import-reference-db');
+
 const dumpPath = path.resolve(__dirname, '..', '..', 'reference_system', 'nogatualliance_sysdb.sql');
 
 if (!fs.existsSync(dumpPath)) {

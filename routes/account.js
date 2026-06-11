@@ -58,7 +58,7 @@ router.get('/', memberAuth, async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT u.uid, u.accttype, u.currentaccttype, u.codeid, u.datereg,
-              m.uid as mUid, m.username, m.password, m.firstname, m.lastname,
+              m.uid as mUid, m.username, m.firstname, m.lastname,
               m.middlename, m.address, m.contactnos, m.payoutid, m.payoutdetails,
               m.email, m.fbaccount, m.gender, m.dob, ${tinSelect}
        FROM usertab u, memberstab m

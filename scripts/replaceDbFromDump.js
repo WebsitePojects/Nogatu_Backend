@@ -2,16 +2,19 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const mysql = require('mysql2/promise');
-const { loadBackendEnv, getDbConfig } = require('./env');
+const { loadBackendEnv, getDbConfig, assertNotProductionDatabase } = require('./env');
 
 function parseArgs(argv) {
-  const args = { yes: false, dump: '' };
+  const args = { yes: false, dump: '', confirmDbName: '' };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === '--yes') {
       args.yes = true;
     } else if (token === '--dump') {
       args.dump = argv[index + 1] || '';
+      index += 1;
+    } else if (token === '--confirm-db-name') {
+      args.confirmDbName = argv[index + 1] || '';
       index += 1;
     }
   }
@@ -118,7 +121,9 @@ async function importDump({ dbConfig, dumpPath }) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.dump) {
-    throw new Error('Usage: node scripts/replaceDbFromDump.js --dump /absolute/path/to/latest.sql --yes');
+    throw new Error(
+      'Usage: node scripts/replaceDbFromDump.js --dump /absolute/path/to/latest.sql --yes --confirm-db-name <database>'
+    );
   }
   if (!args.yes) {
     throw new Error('Refusing destructive DB replace without --yes');
@@ -126,6 +131,25 @@ async function main() {
 
   const envFile = loadBackendEnv();
   const dbConfig = getDbConfig();
+
+  // Block destructive operation on production/remote databases before doing anything else.
+  assertNotProductionDatabase(dbConfig, 'replace-db');
+
+  // Require the caller to re-type the database name to prevent fat-finger mistakes.
+  if (!args.confirmDbName) {
+    console.error('\n[replace-db] REFUSED — --confirm-db-name is required.');
+    console.error(`[replace-db] This will DROP DATABASE \`${dbConfig.database}\` and recreate it from the dump.`);
+    console.error(`[replace-db] Pass --confirm-db-name ${dbConfig.database} to confirm.\n`);
+    process.exit(2);
+  }
+  if (args.confirmDbName !== dbConfig.database) {
+    console.error(`\n[replace-db] REFUSED — name mismatch.`);
+    console.error(`  Configured DB : ${dbConfig.database}`);
+    console.error(`  You confirmed : ${args.confirmDbName}`);
+    console.error('[replace-db] These must match exactly.\n');
+    process.exit(2);
+  }
+
   const dumpPath = path.resolve(args.dump);
 
   if (!fs.existsSync(dumpPath)) {
