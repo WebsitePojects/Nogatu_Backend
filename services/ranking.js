@@ -83,7 +83,12 @@ const RANK_CASH_INCENTIVES = FULL_RANK_DEFINITIONS.reduce((map, row) => {
 // Logging
 // ---------------------------------------------------------------------------
 
+// Per-member rebuild logs are extremely verbose (3 lines × every member in a
+// recomputed subtree). Off by default so prod logs/disk aren't flooded; enable
+// only for debugging with RANK_DEBUG=1.
+const RANK_DEBUG = process.env.RANK_DEBUG === '1' || process.env.RANK_DEBUG === 'true';
 function rankLog(event, data = {}) {
+  if (!RANK_DEBUG) return;
   console.log(`[Ranking] ${event}`, JSON.stringify(data));
 }
 
@@ -483,7 +488,7 @@ async function insertAchievementAward(memberUid, award, definitionByRank, grossR
     // Zero-out rule: once consumed here, the event is invisible to ancestor queries.
     if (toNumber(row.sourceEventId) > 0) {
       try {
-        await conn.query(
+        const [gcResult] = await conn.query(
           `INSERT IGNORE INTO rank_global_consumptiontab
              (repurchase_id, source_member_uid, consuming_member_uid, consuming_rank_uid, points_consumed)
            VALUES (?, ?, ?, ?, ?)`,
@@ -495,6 +500,19 @@ async function insertAchievementAward(memberUid, award, definitionByRank, grossR
             toNumber(row.pointsConsumed),
           ]
         );
+        // Phase-1 SHADOW: propagate this DEDUCTION up the source's sponsor chain so
+        // the incremental aggregate stays correct (consumption drains uplines too).
+        // GUARD: only when a NEW row was actually inserted (affectedRows === 1).
+        // INSERT IGNORE skips duplicates on re-run; without this guard a rebuild
+        // would double-deduct and silently drain uplines.
+        if (gcResult.affectedRows === 1) {
+          try {
+            // eslint-disable-next-line global-require
+            await require('./rankPoints').applyConsumptionDelta(conn, toNumber(row.sourceMemberUid), toNumber(row.pointsConsumed));
+          } catch (shadowErr) {
+            console.error('[RankPoints] shadow consumption propagate failed:', shadowErr.message);
+          }
+        }
       } catch (gcErr) {
         if (gcErr.code !== 'ER_NO_SUCH_TABLE') throw gcErr;
         // V023 not yet applied — global consumption not tracked; log a warning.

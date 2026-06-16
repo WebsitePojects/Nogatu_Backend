@@ -14,6 +14,7 @@ const {
 } = require('../services/income/unilevel');
 const { getLeadershipTraceability } = require('../services/income/leadership');
 const { getPairingCounts } = require('../services/network');
+const { getMemberGlobalBonus } = require('../services/globalBonus');
 const {
   getEffectiveAccountState,
   getAccountEntryAuditInfo,
@@ -111,7 +112,11 @@ router.get('/', memberAuth, async (req, res) => {
         [uid]
       );
       globalBonusTotal = Number(gbRows[0]?.total || 0);
-      globalBonusEligible = Number(gbRows[0]?.max_portions || 0) > 0;
+      // Eligibility must reflect the member's CURRENT qualification (Diamond /
+      // Ambassador / Stockist), not only past distributions. A freshly upgraded
+      // Diamond is eligible immediately, even before any distribution run.
+      const gbStatus = await getMemberGlobalBonus(uid);
+      globalBonusEligible = Boolean(gbStatus?.eligible);
     } catch (_) { /* table may not exist yet */ }
 
     // 2. Get maintenance status (current month repurchases)
@@ -163,6 +168,12 @@ router.get('/', memberAuth, async (req, res) => {
     const leftPoints = Math.round(pairingCounts.totalPointsLeft / BP_PESO);
     const rightPoints = Math.round(pairingCounts.totalPointsRight / BP_PESO);
     const pairingBalance = Math.abs(leftPoints - rightPoints);
+    // Remaining (unmatched surplus) PV per leg: after matching min(L,R), the weaker
+    // leg drops to 0 and the stronger leg keeps the surplus waiting for the other
+    // side to catch up. 1 PV = 250 binary points = PHP 250. Display-only; no money write.
+    const matchedPv = Math.min(leftPoints, rightPoints);
+    const leftRemaining = Math.max(0, leftPoints - matchedPv);
+    const rightRemaining = Math.max(0, rightPoints - matchedPv);
 
     res.json({
       totalCashIncome: totalCashIncome + globalBonusTotal,
@@ -188,8 +199,10 @@ router.get('/', memberAuth, async (req, res) => {
       directReferrals: drefByType,
       leftAccounts,
       leftPoints,
+      leftRemaining,
       rightAccounts,
       rightPoints,
+      rightRemaining,
       pairingBalance,
       accountType: req.session.caccttype,
     });

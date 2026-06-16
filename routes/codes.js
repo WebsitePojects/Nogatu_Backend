@@ -11,6 +11,7 @@ const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
 const { listMemberActivationHistory } = require('../services/codeHistory');
 const { refreshMemberRankSnapshot } = require('../services/ranking');
+const { applyRepurchaseDelta } = require('../services/rankPoints');
 
 /**
  * GET /api/codes?page=1
@@ -413,6 +414,11 @@ router.post('/maintenance', memberAuth, async (req, res) => {
     setImmediate(() => {
       refreshMemberRankSnapshot(uid).catch(err =>
         console.error('[Ranking] post-maintenance rebuild failed:', err)
+      );
+      // Phase-1 SHADOW: incrementally propagate this repurchase up the sponsor
+      // chain (O(depth)). Does NOT drive the live leaderboard yet — reconciled first.
+      applyRepurchaseDelta(null, uid, Number(codeData.unilevelpoints || 0)).catch(err =>
+        console.error('[RankPoints] shadow propagate failed:', err.message)
       );
     });
 

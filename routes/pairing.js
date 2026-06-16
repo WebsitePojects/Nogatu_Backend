@@ -119,6 +119,10 @@ router.get('/', memberAuth, async (req, res) => {
     const historyPerPage = Math.min(100, Math.max(10, Number(req.query.historyPerPage || req.query.perPage) || 50));
     const tracePage = Math.max(1, Number(req.query.tracePage) || 1);
     const tracePerPage = Math.min(100, Math.max(10, Number(req.query.tracePerPage) || 50));
+    // History table standard: search (date or source username), sort (date|amount), dir.
+    const historySearch = String(req.query.historySearch || '').trim().toLowerCase().slice(0, 40);
+    const historySort = String(req.query.historySort || 'date').toLowerCase() === 'amount' ? 'amount' : 'date';
+    const historyDir = String(req.query.historyDir || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
 
     const [counts, trace, walletRows, binaryEligibility] = await Promise.all([
       getPairingCounts(uid),
@@ -191,11 +195,28 @@ router.get('/', memberAuth, async (req, res) => {
       }
     }
 
-    const historyTotal = Number(historyRowsAll.length || 0);
+    // Search: match the formatted date or either source username.
+    let historyFiltered = historyRowsAll;
+    if (historySearch) {
+      historyFiltered = historyRowsAll.filter((r) => {
+        const hay = `${String(r.pairedAt || '')} ${String(r.left?.username || '')} ${String(r.right?.username || '')}`.toLowerCase();
+        return hay.includes(historySearch);
+      });
+    }
+    // Sort by date or credited amount.
+    const dirMul = historyDir === 'asc' ? 1 : -1;
+    historyFiltered = [...historyFiltered].sort((a, b) => {
+      if (historySort === 'amount') {
+        return (Number(a.creditedIncome || 0) - Number(b.creditedIncome || 0)) * dirMul;
+      }
+      return (new Date(a.pairedAt || 0) - new Date(b.pairedAt || 0)) * dirMul;
+    });
+
+    const historyTotal = Number(historyFiltered.length || 0);
     const historyTotalPages = Math.max(1, Math.ceil(historyTotal / historyPerPage));
     const safeHistoryPage = Math.min(historyTotalPages, Math.max(1, historyPage));
     const historyOffset = (safeHistoryPage - 1) * historyPerPage;
-    const historyRows = historyRowsAll.slice(historyOffset, historyOffset + historyPerPage);
+    const historyRows = historyFiltered.slice(historyOffset, historyOffset + historyPerPage);
     // totalPointsLeft/Right come from getPairingCounts — full recursive usertab
     // traversal of all eligible PD/fully-paid-CD accounts. This is the authoritative
     // source and matches what the dashboard displays. Do NOT override with the

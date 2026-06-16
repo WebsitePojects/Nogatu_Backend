@@ -97,6 +97,16 @@ async function assertSchemaRequirements(requirements, featureLabel, conn = pool)
   return snapshot;
 }
 
+// Memoizes a successful schema check for the lifetime of the process so we do
+// not run two information_schema scans on every request. A failed check is not
+// cached, so endpoints recover automatically once migrations are applied.
+const _readyCache = new Set();
+async function assertSchemaReadyOnce(cacheKey, requirements, featureLabel, conn = pool) {
+  if (_readyCache.has(cacheKey)) return;
+  await assertSchemaRequirements(requirements, featureLabel, conn);
+  _readyCache.add(cacheKey);
+}
+
 function mergeRequirements(...sets) {
   return sets.reduce((merged, current) => {
     const normalized = normalizeRequirementSet(current);
@@ -301,7 +311,19 @@ const SCHEMA_REQUIREMENTS = {
     tables: ['password_reset_tokenstab'],
   },
   SUPPORT: {
-    tables: ['support_ticketstab'],
+    tables: ['support_ticketstab', 'support_ticket_repliestab'],
+    columns: {
+      support_ticketstab: {
+        last_reply_at: {},
+        last_reply_role: { typeIncludes: 'varchar(16)' },
+        member_unread: {},
+        admin_unread: {},
+      },
+      support_ticket_repliestab: {
+        attachment_url: { typeIncludes: 'varchar(500)' },
+        attachment_type: { typeIncludes: 'varchar(16)' },
+      },
+    },
   },
   HIFIVE: {
     tables: ['hifive_qualificationstab'],
@@ -342,6 +364,7 @@ SCHEMA_REQUIREMENTS.READINESS = mergeRequirements(
 module.exports = {
   SCHEMA_REQUIREMENTS,
   assertSchemaRequirements,
+  assertSchemaReadyOnce,
   createSchemaNotReadyError,
   getSchemaSnapshot,
   listMissingSchemaRequirements,

@@ -5,7 +5,7 @@
  * Handles binary tree traversal, genealogy building, and network validation
  */
 const { pool } = require('../config/database');
-const { getAccountTypeName } = require('../utils/helpers');
+const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
 const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo, countsForPairingSource } = require('./accountState');
 const { getPackageBinaryValue } = require('./packagePolicy');
 
@@ -314,11 +314,145 @@ async function _collectDescendantPairingCounts(uid, rootLeg, result) {
   }
 }
 
+/**
+ * Build the unilevel / sponsor tree (drefid) for display.
+ * Level 0 = the root member (you); each member's direct referrals are the next
+ * level down, n-ary (unlimited children per node), up to `maxLevel` levels.
+ *
+ * A node budget caps total rendered nodes so a leader with a very wide downline
+ * cannot generate a runaway payload. Truncated branches keep their childCount
+ * and are flagged with `truncated` so the UI can show "more below".
+ */
+async function getUnilevelTree(rootUid, maxLevel = 3, maxNodes = 600) {
+  const budget = { count: 0, max: Math.max(1, Number(maxNodes) || 600) };
+  const tree = await _buildUnilevelNode(rootUid, 0, maxLevel, budget);
+  await attachUnilevelMaintenancePoints(tree);
+  return tree;
+}
+
+/**
+ * Attach each node's CURRENT-MONTH product maintenance/repurchase points
+ * (producttype >= 100) in a single batched query, so the unilevel tree can show
+ * a relevant metric instead of binary PV. Defaults every node to 0.
+ */
+async function attachUnilevelMaintenancePoints(rootNode) {
+  if (!rootNode) return;
+  const nodes = [];
+  (function collect(node) {
+    if (!node) return;
+    nodes.push(node);
+    for (const child of (node.children || [])) collect(child);
+  })(rootNode);
+
+  for (const node of nodes) node.maintenancePoints = 0;
+
+  const uids = Array.from(new Set(nodes.map((n) => Number(n.uid)).filter(Boolean)));
+  if (uids.length === 0) return;
+
+  const { start, end } = currentMonthRange();
+  const placeholders = uids.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT uid, COALESCE(SUM(incentivepoints1), 0) AS pts
+       FROM repurchasetab
+      WHERE uid IN (${placeholders})
+        AND producttype >= 100
+        AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+        AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
+      GROUP BY uid`,
+    [...uids, start, end]
+  );
+  const ptsByUid = new Map(rows.map((r) => [Number(r.uid), Number(r.pts || 0)]));
+  for (const node of nodes) {
+    node.maintenancePoints = ptsByUid.get(Number(node.uid)) || 0;
+  }
+}
+
+async function _buildUnilevelNode(uid, level, maxLevel, budget) {
+  const [rows] = await pool.query(
+    `SELECT m.uid, m.firstname, m.lastname, m.username,
+            u.uid as uUid, u.refid, u.drefid, u.currentaccttype,
+            u.codeid, u.datereg, u.public_uid, u.binarypoints
+     FROM memberstab m, usertab u
+     WHERE m.uid = u.uid AND u.uid = ?`,
+    [uid]
+  );
+  if (rows.length === 0) return null;
+
+  const row = rows[0];
+  budget.count += 1;
+
+  const node = {
+    uid: row.uid,
+    publicUid: row.public_uid || null,
+    username: row.username,
+    firstname: row.firstname,
+    lastname: row.lastname,
+    fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
+    accttype: row.currentaccttype,
+    accttypeName: getAccountTypeName(row.currentaccttype),
+    codeid: row.codeid,
+    datereg: row.datereg,
+    level,
+    binaryPoints: resolveGenealogyPoints(row.currentaccttype, row.binarypoints),
+    accountStateLabel: getAccountStateLabel(await getEffectiveAccountState(uid, row)),
+    children: [],
+    childCount: 0,
+    truncated: false,
+  };
+
+  // Direct referrals via the sponsor tree (drefid).
+  const [kids] = await pool.query(
+    'SELECT uid FROM usertab WHERE drefid = ? ORDER BY id ASC',
+    [uid]
+  );
+  node.childCount = kids.length;
+  node.hasMore = kids.length > 0;
+
+  if (level >= maxLevel || kids.length === 0) {
+    return node;
+  }
+
+  for (const kid of kids) {
+    if (budget.count >= budget.max) {
+      node.truncated = true;
+      break;
+    }
+    const child = await _buildUnilevelNode(kid.uid, level + 1, maxLevel, budget);
+    if (child) node.children.push(child);
+  }
+
+  return node;
+}
+
+/**
+ * Check whether targetUid is the requesting member or sits within their
+ * sponsor-tree (unilevel) downline, by walking drefid ancestors upward.
+ */
+async function isInSponsorNetwork(rootUid, targetUid) {
+  const root = Number(rootUid);
+  let current = Number(targetUid);
+  if (root === current) return true;
+
+  for (let guard = 0; guard < 60 && current > 0; guard += 1) {
+    const [rows] = await pool.query(
+      'SELECT drefid FROM usertab WHERE uid = ? LIMIT 1',
+      [current]
+    );
+    const parent = Number(rows[0]?.drefid || 0);
+    if (!parent) return false;
+    if (parent === root) return true;
+    current = parent;
+  }
+  return false;
+}
+
 module.exports = {
   getNetworkList,
   getNetworkMembersDetailed,
   getGenealogyTree,
+  getUnilevelTree,
   isInNetwork,
+  isInSponsorNetwork,
   getDirectReferrals,
   getPairingCounts,
   resolveGenealogyPoints,

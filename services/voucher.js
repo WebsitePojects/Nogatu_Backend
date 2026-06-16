@@ -68,25 +68,8 @@ const PACKAGE_AMOUNTS = {
 const VOUCHER_PRODUCT_BY_CODE = Object.fromEntries(
   Object.entries(VOUCHER_PRODUCT_CATALOG).map(([voucherKey, product]) => [product.code, { ...product, voucherKey }])
 );
-const VOUCHER_MEMBER_DISCOUNT_RATE = 0.3;
-const VOUCHER_MEMBER_DISCOUNT_PERCENT = Math.round(VOUCHER_MEMBER_DISCOUNT_RATE * 100);
-
 function roundCurrency(value) {
   return Math.round(Number(value || 0) * 100) / 100;
-}
-
-function computeVoucherMemberPricing(price) {
-  const originalPrice = roundCurrency(price);
-  const discountValue = roundCurrency(originalPrice * VOUCHER_MEMBER_DISCOUNT_RATE);
-  const memberPrice = roundCurrency(originalPrice - discountValue);
-
-  return {
-    originalPrice,
-    discountRate: VOUCHER_MEMBER_DISCOUNT_RATE,
-    discountPercent: VOUCHER_MEMBER_DISCOUNT_PERCENT,
-    discountValue,
-    memberPrice,
-  };
 }
 
 function toIsoStringOrNull(value) {
@@ -114,7 +97,6 @@ function normalizeVoucherAvailmentItems(rawItems = []) {
 
   for (const rawItem of Array.isArray(rawItems) ? rawItems : []) {
     const selectedProduct = normalizeVoucherProductSelection(rawItem || {});
-    const productPricing = selectedProduct ? computeVoucherMemberPricing(selectedProduct.price) : null;
     const description = selectedProduct
       ? selectedProduct.name
       : String(rawItem?.description || rawItem?.label || rawItem?.item || '').trim();
@@ -123,7 +105,7 @@ function normalizeVoucherAvailmentItems(rawItems = []) {
       ? (
           Number.isFinite(manualAmount) && manualAmount > 0
             ? manualAmount
-            : productPricing.memberPrice
+            : roundCurrency(selectedProduct.price)
         )
       : manualAmount;
     if (!description || !Number.isFinite(amount) || amount <= 0) {
@@ -137,9 +119,6 @@ function normalizeVoucherAvailmentItems(rawItems = []) {
       ...(selectedProduct ? {
         productCode: Number(selectedProduct.code),
         productKey: String(selectedProduct.voucherKey || rawItem?.productKey || '').trim(),
-        originalPrice: productPricing.originalPrice,
-        discountValue: productPricing.discountValue,
-        discountPercent: productPricing.discountPercent,
       } : {}),
     });
   }
@@ -509,7 +488,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     const [transactionResult] = await conn.query(
       `INSERT INTO voucher_transactionstab
         (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, external_reference)
-       VALUES (?, ?, ?, ?, ?, NOW(), 'voucher_product_request', ?)`,
+       VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), 'voucher_product_request', ?)`,
       [memberUid, resolvedVoucherId, cashPaid, voucherDeduction, cashPaid + voucherDeduction, requestReference]
     );
 
@@ -517,7 +496,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       const [availmentResult] = await conn.query(
         `INSERT INTO voucher_availmentstab
           (voucher_id, uid, er_number, availment_date, total_amount, transaction_id, request_source, claim_status)
-         VALUES (?, ?, ?, NOW(), ?, ?, 'member', 'requested')`,
+         VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, ?, 'member', 'requested')`,
         [
           resolvedVoucherId,
           memberUid,
@@ -892,16 +871,19 @@ async function createManualVoucherAvailment({
     await replaceVoucherAvailmentItems(conn, availmentId, normalized.items);
 
     const [transactionResult] = await conn.query(
+      // transaction_date = server NOW() so the transaction-history ordering is
+      // consistent with income rows (which use CURRENT_TIMESTAMP). The admin-supplied
+      // availment date is preserved separately in voucher_availmentstab.availment_date.
+      // Mixing a JS Date here with NOW() elsewhere caused wrong ordering / timezone drift.
       `INSERT INTO voucher_transactionstab
         (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, availment_id, external_reference)
-       VALUES (?, ?, ?, ?, ?, ?, 'manual_availment', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), 'manual_availment', ?, ?)`,
       [
         Number(voucher.uid || 0),
         safeVoucherId,
         walletUpdate.cashPaid,
         walletUpdate.voucherUsed,
         walletUpdate.totalValue,
-        safeAvailmentDate,
         availmentId,
         safeErNumber,
       ]
@@ -1188,16 +1170,17 @@ async function updateManualVoucherAvailment({
       );
     } else {
       const [transactionResult] = await conn.query(
+        // transaction_date = server NOW() for consistent transaction-history ordering
+        // (availment date is preserved in voucher_availmentstab.availment_date).
         `INSERT INTO voucher_transactionstab
           (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, availment_id, external_reference)
-         VALUES (?, ?, ?, ?, ?, ?, 'manual_availment', ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), 'manual_availment', ?, ?)`,
         [
           Number(voucher.uid || 0),
           Number(existingAvailment.voucher_id || 0),
           walletUpdate.cashPaid,
           walletUpdate.voucherUsed,
           walletUpdate.totalValue,
-          safeAvailmentDate,
           safeAvailmentId,
           safeErNumber,
         ]
@@ -1575,7 +1558,6 @@ module.exports = {
   normalizeVoucherAvailmentItems,
   computeVoucherAvailmentBalanceUpdate,
   computeVoucherManualAvailmentWalletUpdate,
-  computeVoucherMemberPricing,
   resolveVoucherAvailmentClaimUpdate,
   resolveInitialVoucherAvailmentClaimState,
   getVoucherAvailments,
@@ -1584,8 +1566,6 @@ module.exports = {
   markVoucherAvailmentClaimed,
   updateManualVoucherAvailment,
   VOUCHER_PRODUCT_CATALOG,
-  VOUCHER_MEMBER_DISCOUNT_RATE,
-  VOUCHER_MEMBER_DISCOUNT_PERCENT,
   UNUSED_VOUCHER_EXPIRY_MONTHS,
   USED_VOUCHER_EXPIRY_DAYS,
   PACKAGE_AMOUNTS,

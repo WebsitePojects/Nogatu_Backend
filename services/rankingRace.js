@@ -10,6 +10,12 @@
  */
 const { pool } = require('../config/database');
 
+// TEMPORARY LOCK (2026-06-16): advancement is held at Supervisor 1 (rank 1).
+// Supervisor 2 and above are NOT awarded until the structural "leg" rule (BUG-2 —
+// binary legs vs unilevel direct-lines) is decided and reconciled. This is the SAFE
+// direction (it only blocks promotions, never grants one). Raise/remove to re-enable.
+const MAX_AWARDABLE_RANK = 1;
+
 function toNumber(value) {
   return Number(value || 0);
 }
@@ -61,7 +67,7 @@ const SPONSOR_TREE_SQL = `
       r.transdate AS source_event_ts,
       r.processid AS source_process_id
     FROM repurchasetab r
-    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth > 0
+    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth >= 0
     LEFT JOIN gc_totals gc ON gc.repurchase_id = r.id
     WHERE COALESCE(r.incentivepoints1, 0) > 0
       AND GREATEST(0,
@@ -94,7 +100,7 @@ const SPONSOR_TREE_SQL_NO_GC = `
       r.transdate AS source_event_ts,
       r.processid AS source_process_id
     FROM repurchasetab r
-    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth > 0
+    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth >= 0
     WHERE COALESCE(r.incentivepoints1, 0) > 0
     ORDER BY r.transdate ASC, r.id ASC, r.uid ASC
 `;
@@ -215,6 +221,8 @@ function computeRankAwardsFromEvents({
 
   for (const definition of orderedDefinitions) {
     const rankNo = toNumber(definition.rank);
+    // LOCK: do not award Supervisor 2+ until the BUG-2 leg rule is decided.
+    if (rankNo > MAX_AWARDABLE_RANK) break;
     if (rankNo <= 0 || rankNo <= currentRank) continue;
 
     const counts = subtreeQualifiedRankCounts[rankNo] || {};

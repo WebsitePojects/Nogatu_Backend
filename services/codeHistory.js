@@ -137,11 +137,15 @@ async function listMemberActivationHistory(uid, page = 1, perPage = 20, conn = p
   const offset = (currentPage - 1) * size;
 
   if (await tableExists('activation_code_usagetab', conn)) {
+    // Privacy: a member must only see events where THEY received, used, or
+    // registered/upgraded a code — NOT events where their code was transferred
+    // OUT to another member (that would leak the recipient's username). So we
+    // deliberately exclude `from_uid` from the member-facing filter.
     const [countRows] = await conn.query(
       `SELECT COUNT(*) AS total
        FROM activation_code_usagetab
-       WHERE from_uid = ? OR to_uid = ? OR actor_uid = ? OR registration_uid = ? OR upgrade_uid = ?`,
-      [uid, uid, uid, uid, uid]
+       WHERE to_uid = ? OR actor_uid = ? OR registration_uid = ? OR upgrade_uid = ?`,
+      [uid, uid, uid, uid]
     );
 
     const [rows] = await conn.query(
@@ -162,10 +166,10 @@ async function listMemberActivationHistory(uid, page = 1, perPage = 20, conn = p
        LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
        LEFT JOIN codestab c ON c.code = a.code
        LEFT JOIN accesstab ga ON ga.username = c.processid
-       WHERE a.from_uid = ? OR a.to_uid = ? OR a.actor_uid = ? OR a.registration_uid = ? OR a.upgrade_uid = ?
+       WHERE a.to_uid = ? OR a.actor_uid = ? OR a.registration_uid = ? OR a.upgrade_uid = ?
        ORDER BY a.created_at DESC, a.id DESC
        LIMIT ?, ?`,
-      [uid, uid, uid, uid, uid, offset, size]
+      [uid, uid, uid, uid, offset, size]
     );
 
     return {

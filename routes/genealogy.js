@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { getGenealogyTree, isInNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
+const { getGenealogyTree, getUnilevelTree, isInNetwork, isInSponsorNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
 const { getEffectiveAccountState, getAccountStateLabel } = require('../services/accountState');
 
 function packageColor(accttype) {
@@ -132,6 +132,36 @@ router.get('/expand/:publicUid', memberAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('[Genealogy] Expand error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/genealogy/unilevel/tree?root=<uid>&depth=<n>
+ * Unilevel / sponsor tree (drefid). Level 0 = the member, up to 10 levels down.
+ */
+router.get('/unilevel/tree', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    let targetUid = await resolvePublicOrInternalUid(req.query.root || req.query.id, uid);
+    const requestedDepth = Math.min(10, Math.max(1, Number(req.query.depth) || 3));
+
+    // Members may only view their own sponsor downline (or themselves).
+    if (targetUid !== uid) {
+      const inNetwork = await isInSponsorNetwork(uid, targetUid);
+      if (!inNetwork) targetUid = uid;
+    }
+
+    const tree = await getUnilevelTree(targetUid, requestedDepth);
+
+    res.json({
+      tree,
+      rootUid: targetUid,
+      sessionUid: uid,
+      depth: requestedDepth,
+    });
+  } catch (err) {
+    console.error('[Genealogy] Unilevel tree error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

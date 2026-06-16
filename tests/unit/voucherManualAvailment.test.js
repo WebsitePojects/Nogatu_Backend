@@ -5,9 +5,7 @@ const path = require('node:path');
 const repoRoot = path.resolve(__dirname, '..', '..');
 
 const {
-  VOUCHER_MEMBER_DISCOUNT_PERCENT,
   USED_VOUCHER_EXPIRY_DAYS,
-  computeVoucherMemberPricing,
   normalizeVoucherAvailmentItems,
   computeVoucherAvailmentBalanceUpdate,
   computeVoucherManualAvailmentWalletUpdate,
@@ -98,24 +96,19 @@ test('manual voucher availment totals all ER items from valid lines only', () =>
   assert.equal(normalized.totalAmount, 7000.5);
 });
 
-test('manual voucher availment product dropdown defaults to discounted member price but allows manual override', () => {
+test('manual voucher availment product dropdown defaults to the raw product price but allows manual override', () => {
   const normalized = normalizeVoucherAvailmentItems([
     { productCode: 102 },
     { productKey: 'cm', amount: '400' },
   ]);
-  const glcPricing = computeVoucherMemberPricing(500);
-  const cmPricing = computeVoucherMemberPricing(495);
 
   assert.deepEqual(normalized.items, [
     {
       lineNo: 1,
       description: 'Vitamin C with Collagen & Glutathione',
-      amount: glcPricing.memberPrice,
+      amount: 500,
       productCode: 102,
       productKey: 'glc',
-      originalPrice: glcPricing.originalPrice,
-      discountValue: glcPricing.discountValue,
-      discountPercent: VOUCHER_MEMBER_DISCOUNT_PERCENT,
     },
     {
       lineNo: 2,
@@ -123,12 +116,9 @@ test('manual voucher availment product dropdown defaults to discounted member pr
       amount: 400,
       productCode: 103,
       productKey: 'cm',
-      originalPrice: cmPricing.originalPrice,
-      discountValue: cmPricing.discountValue,
-      discountPercent: VOUCHER_MEMBER_DISCOUNT_PERCENT,
     },
   ]);
-  assert.equal(normalized.totalAmount, glcPricing.memberPrice + 400);
+  assert.equal(normalized.totalAmount, 900);
 });
 
 test('manual voucher availment starts used-expiry countdown on first use', () => {

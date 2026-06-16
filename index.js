@@ -316,6 +316,7 @@ app.use('/api/admin/messages', require('./routes/admin/messages'));
 app.use('/api/admin/cd-accounts', require('./routes/admin/cdAccounts'));
 app.use('/api/admin/finance', require('./routes/admin/finance'));
 app.use('/api/admin/applications', require('./routes/admin/applications'));
+app.use('/api/admin/support', require('./routes/admin/support'));
 
 app.get('/health', (_req, res) => {
   res.json({
@@ -388,6 +389,9 @@ async function start() {
     console.log(`[Server] NOGATU Alliance running on http://localhost:${PORT}`);
     console.log(`[Server] API available at http://localhost:${PORT}/api`);
     console.log(`[Server] Mode: ${process.env.NODE_ENV || 'development'}`);
+    // Start the background job worker (durable job_queuetab poller: support orphan
+    // upload cleanup, etc.). Safe to no-op if Cloudinary is unconfigured.
+    try { require('./services/jobWorker').startWorker(); } catch (e) { console.error('[Server] jobWorker start failed:', e.message); }
     // Signal PM2 that the process is ready (used by wait_ready in ecosystem.config.js)
     if (process.send) process.send('ready');
   });

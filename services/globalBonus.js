@@ -141,20 +141,23 @@ function getPortionDetails(userRow, rankLevel) {
   const labels = [];
   let portions = 0;
 
-  if (Number(userRow.currentaccttype) === 60) {
+  const stockist = getStockistPortion(userRow.stockistid);
+
+  // Stockists are now required to already hold a Diamond package, so the Diamond
+  // portion is absorbed into the stockist tier — counted once, never stacked.
+  // A Diamond who is NOT a stockist still earns the standalone Diamond portion.
+  if (stockist.points > 0) {
+    portions += stockist.points;
+    labels.push(stockist.label);
+  } else if (Number(userRow.currentaccttype) === 60) {
     portions += 1;
     labels.push('Diamond');
   }
 
+  // Ambassador rank remains an independent qualifier on top.
   if (Number(rankLevel || 0) >= 10) {
     portions += 1;
     labels.push('Ambassador');
-  }
-
-  const stockist = getStockistPortion(userRow.stockistid);
-  if (stockist.points > 0) {
-    portions += stockist.points;
-    labels.push(stockist.label);
   }
 
   return {
@@ -912,4 +915,5 @@ module.exports = {
   assertClosedDistributionYear,
   getLastClosedYear,
   buildGlobalBonusVisibility,
+  getPortionDetails,
 };

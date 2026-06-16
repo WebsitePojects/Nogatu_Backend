@@ -36,14 +36,13 @@ function pickPairingRowsForTransaction(rows = [], targetAmount = 0, transdate = 
 }
 
 // Direct lookup via income_eventstab → pairing_ledgerstab → binary_point_eventstab.
-// Returns one row per pair event linked to a specific income record; never reuses
-// the same pair across different transactions. Falls back to null on missing tables.
+// Returns pair events credited around this transaction's timestamp; the caller then
+// narrows them to the exact subset that sums to this payout's pairing amount so the
+// trace shows only the pairs that actually made up THIS transaction. The window is
+// computed in SQL (DATE_* intervals) against the raw transdate so a minute-truncated
+// payout timestamp does not exclude an event credited a few seconds into that minute.
 async function getPairingTraceForTransactionDirect(uid, transdate, targetAmount) {
   try {
-    const windowStart = new Date(new Date(transdate).getTime() - 8 * 24 * 60 * 60 * 1000)
-      .toISOString().slice(0, 19).replace('T', ' ');
-    const windowEnd = String(transdate).slice(0, 19).replace('T', ' ');
-
     const [rows] = await pool.query(
       `SELECT ie.gross_amount AS creditedIncome,
               ie.credited_at AS pairedAt,
@@ -61,10 +60,10 @@ async function getPairingTraceForTransactionDirect(uid, transdate, targetAmount)
         WHERE ie.beneficiary_uid = ?
           AND ie.income_type = 'pairing_bonus'
           AND ie.status = 'credited'
-          AND ie.credited_at >= ?
-          AND ie.credited_at <= ?
-        ORDER BY ie.credited_at ASC`,
-      [uid, windowStart, windowEnd]
+          AND ie.credited_at >= DATE_SUB(?, INTERVAL 8 DAY)
+          AND ie.credited_at <= DATE_ADD(?, INTERVAL 5 MINUTE)
+        ORDER BY ie.credited_at DESC`,
+      [uid, transdate, transdate]
     );
 
     // Normalize to the same shape buildPairingHistoryRows produces so the frontend needs no changes.
@@ -124,7 +123,15 @@ async function resolveDirectReferralSourcesForTransaction(uid, tx) {
     });
   }
 
-  const picked = pickRowsByExactAmount(rows, amount, tx.transdate, {
+  // Add a 5-min buffer to the cutoff so a referral whose datereg lands a few
+  // seconds into the payout minute isn't excluded by minute-truncation (which
+  // would wrongly fall back to an earlier referral, e.g. root02 instead of root03).
+  const drCutoff = (() => {
+    const base = new Date(tx.transdate);
+    if (Number.isNaN(base.getTime())) return tx.transdate;
+    return new Date(base.getTime() + 5 * 60 * 1000);
+  })();
+  const picked = pickRowsByExactAmount(rows, amount, drCutoff, {
     amountKey: 'amount',
     dateKey: 'transdate',
     maxCandidates: 20,
@@ -202,85 +209,68 @@ router.get('/', memberAuth, async (req, res) => {
   try {
     const uid = req.session.uid;
     const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = 30;
+    // Responsive page size: frontend sends 50 (mobile) or 100 (desktop). Clamp.
+    const perPage = Math.min(100, Math.max(10, Number(req.query.perPage) || 30));
     const offset = (page - 1) * perPage;
+
+    // Filters: type (all|income|encashment|voucher), search (date substring),
+    // sort (date|amount), dir (asc|desc). Default: newest first.
+    const typeMap = { income: 1, encashment: 10, voucher: 11 };
+    const typeFilter = typeMap[String(req.query.type || '').toLowerCase()] || null;
+    const search = String(req.query.search || '').trim().slice(0, 40);
+    const sortCol = String(req.query.sort || 'date').toLowerCase() === 'amount' ? 't.sort_amount' : 't.sort_date';
+    const dir = String(req.query.dir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
     await ensureVoucherTxTable();
 
-    const [[incomeCountRows], [voucherCountRows]] = await Promise.all([
-      pool.query('SELECT COUNT(*) as total FROM payouthistorytab WHERE uid = ?', [uid]),
-      pool.query('SELECT COUNT(*) as total FROM voucher_transactionstab WHERE uid = ?', [uid]),
+    // Shared UNION sub-select (income + voucher) with sort_amount for sorting.
+    const unionSql = `(
+      SELECT CAST(p.pid AS CHAR) AS pid, p.uid,
+             p.beginningbalance, p.endingbalance,
+             p.income1, p.income2, p.income3, p.income4, p.income5, p.income6,
+             p.encashment1, p.tax_1 AS tax, p.encashmentfee AS fee, p.cddeduction, p.cashstatus,
+             DATE_FORMAT(p.cashtransdate, '%Y-%m-%d %H:%i') AS cashtransdate,
+             DATE_FORMAT(p.transdate, '%Y-%m-%d %H:%i') AS transdate,
+             p.transactiontype, p.processid,
+             0 AS cash_paid, 0 AS voucher_used, 0 AS total_value, 0 AS voucher_id,
+             COALESCE(p.transdate, p.cashtransdate) AS sort_date, p.pid AS sort_id,
+             (COALESCE(p.income1,0)+COALESCE(p.income2,0)+COALESCE(p.income3,0)+COALESCE(p.income4,0)
+              +COALESCE(p.income5,0)+COALESCE(p.income6,0)+COALESCE(p.encashment1,0)) AS sort_amount
+      FROM payouthistorytab p WHERE p.uid = ?
+      UNION ALL
+      SELECT CONCAT('V-', vt.id) AS pid, vt.uid,
+             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+             DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS cashtransdate,
+             DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS transdate,
+             11 AS transactiontype, NULL AS processid,
+             vt.cash_paid, vt.voucher_used, vt.total_value, vt.voucher_id,
+             vt.transaction_date AS sort_date, vt.id AS sort_id,
+             vt.total_value AS sort_amount
+      FROM voucher_transactionstab vt WHERE vt.uid = ?
+    ) t`;
+
+    const whereParts = [];
+    const whereParams = [];
+    if (typeFilter !== null) { whereParts.push('t.transactiontype = ?'); whereParams.push(typeFilter); }
+    if (search) { whereParts.push('t.transdate LIKE ?'); whereParams.push(`%${search}%`); }
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    const [[countRows], [rows]] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS total FROM ${unionSql} ${whereSql}`, [uid, uid, ...whereParams]),
+      pool.query(
+        `SELECT t.pid, t.uid, t.beginningbalance, t.endingbalance,
+                t.income1, t.income2, t.income3, t.income4, t.income5, t.income6,
+                t.encashment1, t.tax, t.fee, t.cddeduction,
+                t.cashstatus, t.cashtransdate, t.transdate,
+                t.transactiontype, t.processid,
+                t.cash_paid, t.voucher_used, t.total_value, t.voucher_id
+         FROM ${unionSql} ${whereSql}
+         ORDER BY ${sortCol} ${dir}, t.sort_id ${dir}
+         LIMIT ?, ?`,
+        [uid, uid, ...whereParams, offset, perPage]
+      ),
     ]);
-
-    const totalIncomeRows = Number(incomeCountRows[0]?.total || 0);
-    const totalVoucherRows = Number(voucherCountRows[0]?.total || 0);
-    const total = totalIncomeRows + totalVoucherRows;
-
-    const [rows] = await pool.query(
-      `SELECT t.pid, t.uid, t.beginningbalance, t.endingbalance,
-              t.income1, t.income2, t.income3, t.income4, t.income5, t.income6,
-              t.encashment1, t.tax, t.fee, t.cddeduction,
-              t.cashstatus, t.cashtransdate, t.transdate,
-              t.transactiontype, t.processid,
-              t.cash_paid, t.voucher_used, t.total_value, t.voucher_id
-       FROM (
-         SELECT CAST(p.pid AS CHAR) AS pid,
-                p.uid,
-                p.beginningbalance,
-                p.endingbalance,
-                p.income1, p.income2, p.income3, p.income4, p.income5, p.income6,
-                p.encashment1,
-                p.tax_1 AS tax,
-                p.encashmentfee AS fee,
-                p.cddeduction,
-                p.cashstatus,
-                DATE_FORMAT(p.cashtransdate, '%Y-%m-%d %H:%i') AS cashtransdate,
-                DATE_FORMAT(p.transdate, '%Y-%m-%d %H:%i') AS transdate,
-                p.transactiontype,
-                p.processid,
-                0 AS cash_paid,
-                0 AS voucher_used,
-                0 AS total_value,
-                0 AS voucher_id,
-                COALESCE(p.transdate, p.cashtransdate) AS sort_date,
-                p.pid AS sort_id
-         FROM payouthistorytab p
-         WHERE p.uid = ?
-
-         UNION ALL
-
-         SELECT CONCAT('V-', vt.id) AS pid,
-                vt.uid,
-                0 AS beginningbalance,
-                0 AS endingbalance,
-                0 AS income1,
-                0 AS income2,
-                0 AS income3,
-                0 AS income4,
-                0 AS income5,
-                0 AS income6,
-                0 AS encashment1,
-                0 AS tax,
-                0 AS fee,
-                0 AS cddeduction,
-                0 AS cashstatus,
-                DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS cashtransdate,
-                DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS transdate,
-                11 AS transactiontype,
-                NULL AS processid,
-                vt.cash_paid,
-                vt.voucher_used,
-                vt.total_value,
-                vt.voucher_id,
-                vt.transaction_date AS sort_date,
-                vt.id AS sort_id
-         FROM voucher_transactionstab vt
-         WHERE vt.uid = ?
-       ) t
-       ORDER BY t.sort_date DESC, t.sort_id DESC
-       LIMIT ?, ?`,
-      [uid, uid, offset, perPage]
-    );
+    const total = Number(countRows[0]?.total || 0);
 
     const transactions = rows.map(r => ({
       pid: r.pid,
@@ -319,6 +309,7 @@ router.get('/', memberAuth, async (req, res) => {
       transactions,
       total,
       page,
+      perPage,
       totalPages: Math.max(1, Math.ceil(total / perPage)),
     });
   } catch (err) {
@@ -338,9 +329,10 @@ router.get('/:pid', memberAuth, async (req, res) => {
       `SELECT t.pid, t.uid, t.beginningbalance, t.endingbalance,
               t.income1, t.income2, t.income3, t.income4, t.income5, t.income6,
               t.encashment1, t.tax, t.fee, t.cddeduction,
-              t.cashstatus, t.cashtransdate, t.transdate,
+              t.cashstatus, t.cashtransdate, t.transdate, t.transdate_full,
               t.transactiontype, t.processid,
-              t.cash_paid, t.voucher_used, t.total_value, t.voucher_id
+              t.cash_paid, t.voucher_used, t.total_value, t.voucher_id,
+              t.availment_id, t.source_type
        FROM (
          SELECT CAST(p.pid AS CHAR) AS pid,
                 p.uid,
@@ -354,12 +346,15 @@ router.get('/:pid', memberAuth, async (req, res) => {
                 p.cashstatus,
                 DATE_FORMAT(p.cashtransdate, '%Y-%m-%d %H:%i') AS cashtransdate,
                 DATE_FORMAT(p.transdate, '%Y-%m-%d %H:%i') AS transdate,
+                p.transdate AS transdate_full,
                 p.transactiontype,
                 p.processid,
                 0 AS cash_paid,
                 0 AS voucher_used,
                 0 AS total_value,
-                0 AS voucher_id
+                0 AS voucher_id,
+                NULL AS availment_id,
+                NULL AS source_type
          FROM payouthistorytab p
          WHERE p.uid = ?
          UNION ALL
@@ -380,12 +375,15 @@ router.get('/:pid', memberAuth, async (req, res) => {
                 0 AS cashstatus,
                 DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS cashtransdate,
                 DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS transdate,
+                vt.transaction_date AS transdate_full,
                 11 AS transactiontype,
                 NULL AS processid,
                 vt.cash_paid,
                 vt.voucher_used,
                 vt.total_value,
-                vt.voucher_id
+                vt.voucher_id,
+                vt.availment_id,
+                vt.source_type
          FROM voucher_transactionstab vt
          WHERE vt.uid = ?
        ) t
@@ -402,12 +400,62 @@ router.get('/:pid', memberAuth, async (req, res) => {
     const effectiveAccount = await getEffectiveAccountState(uid);
     const hasPairingIncome = Number(row.income2 || 0) > 0;
 
+    // Voucher product detail: voucher_transactionstab.availment_id -> voucher_availmentstab.id
+    // -> voucher_availment_itemstab. Shows what was bought, per-line amounts, who/when, and
+    // whether the availment was a cashier (manual) or member-side request.
+    let voucherDetail = null;
+    if (Number(row.transactiontype || 0) === 11 && row.availment_id != null) {
+      try {
+        const [avRows] = await pool.query(
+          `SELECT a.id AS availment_id, a.er_number, a.request_source, a.claim_status,
+                  a.total_amount, a.created_by_admin, a.claimed_by_admin,
+                  DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date
+             FROM voucher_availmentstab a
+            WHERE a.id = ? AND a.uid = ? LIMIT 1`,
+          [row.availment_id, uid]
+        );
+        const av = avRows[0];
+        if (av) {
+          const [items] = await pool.query(
+            `SELECT line_no, item_label, amount, product_code, product_key
+               FROM voucher_availment_itemstab
+              WHERE availment_id = ? ORDER BY line_no ASC, id ASC`,
+            [av.availment_id]
+          );
+          const isCashier = String(row.source_type || av.request_source) === 'manual_availment'
+            || String(av.request_source) === 'cashier';
+          voucherDetail = {
+            source: isCashier ? 'Cashier (manual transaction)' : 'Member-side request',
+            requestSource: av.request_source,
+            sourceType: row.source_type || null,
+            erNumber: av.er_number || null,
+            claimStatus: av.claim_status || null,
+            availmentDate: av.availment_date,
+            processedByAdmin: av.created_by_admin || av.claimed_by_admin || null,
+            items: items.map((i) => ({
+              lineNo: Number(i.line_no || 0),
+              label: i.item_label,
+              amount: Number(i.amount || 0),
+              productCode: i.product_code != null ? Number(i.product_code) : null,
+              productKey: i.product_key || null,
+            })),
+            itemsTotal: items.reduce((sum, i) => sum + Number(i.amount || 0), 0),
+          };
+        }
+      } catch (vErr) {
+        console.error('[Transactions] voucher detail error:', vErr.message);
+      }
+    }
+
     // Try direct income_eventstab → pairing_ledgerstab link first (exact, non-overlapping).
     // Fall back to the legacy heuristic only when the ledger tables don't exist yet.
+    // Use the full-precision transdate (with seconds) so a pair credited a few seconds
+    // into the payout minute is not lost to truncation.
+    const pairingCutoffBase = row.transdate_full || row.transdate;
     let directPairingRows = null;
     if (hasPairingIncome) {
       directPairingRows = await getPairingTraceForTransactionDirect(
-        uid, row.transdate, Number(row.income2 || 0)
+        uid, pairingCutoffBase, Number(row.income2 || 0)
       );
     }
 
@@ -422,12 +470,26 @@ router.get('/:pid', memberAuth, async (req, res) => {
       }),
       resolveDirectReferralSourcesForTransaction(uid, {
         directReferral: row.income1,
-        transdate: row.transdate,
+        transdate: row.transdate_full || row.transdate,
       }),
     ]);
 
+    // Narrow the direct ledger rows to the exact subset that sums to THIS payout's
+    // pairing amount, preferring the events closest to the payout timestamp. Without
+    // this, every pair event in the lookback window would be shown even though this
+    // single transaction only credited one (or a few) of them.
+    const pairingCutoff = (() => {
+      const base = new Date(pairingCutoffBase);
+      if (Number.isNaN(base.getTime())) return row.transdate;
+      return new Date(base.getTime() + 5 * 60 * 1000);
+    })();
     const exactPairingRows = directPairingRows !== null
-      ? directPairingRows
+      ? pickRowsByExactAmount(directPairingRows, Number(row.income2 || 0), pairingCutoff, {
+          amountKey: 'creditedIncome',
+          dateKey: 'pairedAt',
+          maxCandidates: 24,
+          maxRows: 8,
+        })
       : pickPairingRowsForTransaction(pairingTrace.rows || [], row.income2, row.transdate);
 
     res.json({
@@ -464,6 +526,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
         transdate: row.transdate,
         cashtransdate: row.cashtransdate,
       },
+      voucherDetail,
       account: {
         uid,
         entryState: getAccountStateLabel(effectiveAccount),
