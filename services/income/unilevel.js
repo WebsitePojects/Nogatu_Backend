@@ -99,19 +99,37 @@ function addUnilevelPointsToLevelBucket(totals, level, points) {
   }
 }
 
+// Unilevel rate schedule by EFFECTIVE level (after rollup compression).
+const UNILEVEL_RATES = [0.05, 0.03, 0.03, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01];
+// Scan deeper than the package reach so qualifying levels at depth 11/12/13… can
+// still compress up into effective levels 1/2/3…
+const MAX_UNILEVEL_SCAN_DEPTH = 30;
+
 /**
- * Recursively calculate unilevel income.
- *
- * Approved new-system behavior is level-by-level:
- * a downline member's product points count only for that member's actual level,
- * within the package reach limit.
- *
- * @param {number} parent - Parent UID
- * @param {number} level - Current level (1-10)
- * @param {{ totals: { lev1: number, lev23: number, lev45: number, lev610: number } }} state
+ * ROLLUP COMPRESSION (approved comp-plan rule, 2026-06-17):
+ * Empty levels (no downline repurchase points) are skipped. The qualifying actual
+ * levels, in depth order, collapse into effective levels 1,2,3,… up to the package
+ * reach — so level 1 (5%) is always filled first even if the nearest contributors
+ * sit at depth 11. Returns Map<actualLevel, { effectiveLevel, rate }>.
+ */
+function compressQualifyingLevels(qualifyingActualLevelsSorted, maxReach) {
+  const cap = Math.max(0, Math.min(10, Number(maxReach || 0)));
+  const map = new Map();
+  qualifyingActualLevelsSorted.forEach((actualLevel, idx) => {
+    const effectiveLevel = idx + 1;
+    if (effectiveLevel > cap) return;
+    map.set(Number(actualLevel), { effectiveLevel, rate: UNILEVEL_RATES[effectiveLevel - 1] || 0 });
+  });
+  return map;
+}
+
+/**
+ * Recursively collect downline product points per ACTUAL level (depth). Compression
+ * is applied afterward in calculateUnilevelForWindow. Scans to MAX_UNILEVEL_SCAN_DEPTH
+ * so deep-but-qualifying levels are not missed.
  */
 async function calculateUnilevel(parent, level, state, getPointsForUid) {
-  if (level > 10 || level > Number(state.maxReach || 10)) return;
+  if (level > MAX_UNILEVEL_SCAN_DEPTH) return;
 
   const [rows] = await pool.query(
     'SELECT uid FROM usertab WHERE drefid = ?',
@@ -119,11 +137,10 @@ async function calculateUnilevel(parent, level, state, getPointsForUid) {
   );
 
   for (const row of rows) {
-    if (level >= 1 && level <= 10) {
-      const uidPurchases = await getPointsForUid(row.uid);
-      addUnilevelPointsToLevelBucket(state.totals, level, uidPurchases);
+    const uidPurchases = Number(await getPointsForUid(row.uid) || 0);
+    if (uidPurchases > 0) {
+      state.pointsByLevel[level] = (state.pointsByLevel[level] || 0) + uidPurchases;
     }
-
     await calculateUnilevel(row.uid, level + 1, state, getPointsForUid);
   }
 }
@@ -156,7 +173,7 @@ async function calculateUnilevelForWindow(uid, options = {}) {
 
   const state = {
     maxReach: Number(packagePolicy.unilevelReach || 0) || 0,
-    totals: { lev1: 0, lev23: 0, lev45: 0, lev610: 0 },
+    pointsByLevel: {},
   };
 
   if (state.maxReach <= 0) {
@@ -165,12 +182,18 @@ async function calculateUnilevelForWindow(uid, options = {}) {
 
   await calculateUnilevel(uid, 1, state, (memberUid) => getTotalPointsForRange(memberUid, start, end));
 
-  const unilevel1 = state.totals.lev1 * 0.05;
-  const unilevel23 = state.totals.lev23 * 0.03;
-  const unilevel45 = state.totals.lev45 * 0.02;
-  const unilevel610 = state.totals.lev610 * 0.01;
+  // Rollup compression: pay only the first `maxReach` QUALIFYING levels, at the
+  // effective-level rates (5/3/3/2/2/1/1/1/1/1%).
+  const qualifying = Object.keys(state.pointsByLevel)
+    .map(Number)
+    .filter((lvl) => state.pointsByLevel[lvl] > 0)
+    .sort((a, b) => a - b);
+  const compMap = compressQualifyingLevels(qualifying, state.maxReach);
 
-  const total = unilevel1 + unilevel23 + unilevel45 + unilevel610;
+  let total = 0;
+  for (const [actualLevel, { rate }] of compMap) {
+    total += Number(state.pointsByLevel[actualLevel] || 0) * rate;
+  }
 
   if (preventDuplicateCredit && total > 0) {
     await updateIncomeTransDate(uid, 4);
@@ -238,7 +261,8 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
   let parents = [Number(uid)];
   const rows = [];
 
-  for (let level = 1; level <= maxReach && parents.length > 0; level += 1) {
+  // Scan deep (collect by ACTUAL level); compression is applied after the scan.
+  for (let level = 1; level <= MAX_UNILEVEL_SCAN_DEPTH && parents.length > 0; level += 1) {
     const parentPlaceholders = buildInClause(parents);
     const [children] = await pool.query(
       `SELECT u.uid, u.drefid, u.currentaccttype,
@@ -274,7 +298,6 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
       [...childUids, start, end]
     );
 
-    const rate = getUnilevelRateForLevel(level);
     for (const pointRow of pointRows) {
       const source = childByUid.get(Number(pointRow.uid)) || {};
       const points = Number(pointRow.product_points || 0);
@@ -282,14 +305,12 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
         uid: Number(pointRow.uid || 0),
         username: source.username || null,
         fullname: `${source.firstname || ''} ${source.lastname || ''}`.trim() || source.username || 'Not available',
-        level,
+        actualLevel: level,
+        level, // effective level filled in after compression
         producttype: Number(pointRow.producttype || 0),
         productName: PRODUCT_TYPES[Number(pointRow.producttype || 0)] || `Product ${pointRow.producttype}`,
         productPoints: points,
         purchaseCount: Number(pointRow.purchase_count || 0),
-        ratePercent: rate * 100,
-        amount: points * rate,
-        projectedAmount: points * rate,
         transdate: pointRow.last_transdate,
         rowType: 'downline_product_points',
       });
@@ -298,11 +319,31 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
     parents = childUids;
   }
 
-  const totalPoints = rows.reduce((sum, row) => sum + Number(row.productPoints || 0), 0);
-  const projectedAmount = rows.reduce((sum, row) => sum + Number(row.projectedAmount || row.amount || 0), 0);
+  // Rollup compression: collapse qualifying actual levels into effective levels
+  // 1..maxReach with the effective-level rates; rows beyond reach earn nothing and
+  // are dropped from the income breakdown.
+  const qualifying = [...new Set(rows.map((r) => r.actualLevel))].sort((a, b) => a - b);
+  const compMap = compressQualifyingLevels(qualifying, maxReach);
+  const finalRows = [];
+  for (const r of rows) {
+    const comp = compMap.get(r.actualLevel);
+    if (!comp) continue;
+    const rate = comp.rate;
+    finalRows.push({
+      ...r,
+      level: comp.effectiveLevel,
+      ratePercent: rate * 100,
+      amount: r.productPoints * rate,
+      projectedAmount: r.productPoints * rate,
+    });
+  }
+  finalRows.sort((a, b) => a.level - b.level || b.productPoints - a.productPoints);
+
+  const totalPoints = finalRows.reduce((sum, row) => sum + Number(row.productPoints || 0), 0);
+  const projectedAmount = finalRows.reduce((sum, row) => sum + Number(row.projectedAmount || row.amount || 0), 0);
 
   return {
-    rows,
+    rows: finalRows,
     totalPoints,
     projectedAmount,
     maxReach,
