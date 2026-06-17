@@ -446,11 +446,92 @@ async function isInSponsorNetwork(rootUid, targetUid) {
   return false;
 }
 
+/**
+ * Lightweight account-state label from codeid/cdstatus WITHOUT a per-node async
+ * lookup — fast enough to apply to every node of a 100k-row flat tree. (The full
+ * effective post-upgrade state is heavier and only needed on single-account views.)
+ */
+function lightAccountStateLabel(codeid, cdstatus) {
+  const c = Number(codeid);
+  if (c === 2) return 'FS';
+  if (c === 3) return Number(cdstatus) === 2 ? 'CD - Paid' : 'CD';
+  return 'PD';
+}
+
+/**
+ * Flat adjacency list of the ENTIRE subtree under rootUid (root → deepest), built
+ * with ONE recursive CTE (no per-node queries) so it scales to 100k+ rows. The
+ * client rebuilds + virtualizes the tree from this. Phase A of the infinite-tree
+ * plan (documentations/ULTRACODE_TREE_AND_TALLY_PLAN.md).
+ *
+ *   treeType       'unilevel' (drefid, n-ary) | 'binary' (refid + position)
+ *   ownPoints      node's current-period maintenance/repurchase points (producttype>=100)
+ *   pointsToUpline what this node feeds upward — unilevel: ownPoints; binary: binary points
+ */
+async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
+  const root = Number(rootUid);
+  if (!root) return [];
+  const isBinary = treeType === 'binary';
+  const edge = isBinary ? 'u.refid' : 'u.drefid';
+  const { start, end } = currentMonthRange();
+  const depthCap = Math.min(120, Math.max(1, Number(maxDepth) || 100));
+
+  const [rows] = await pool.query(
+    `WITH RECURSIVE subtree AS (
+       SELECT u.uid, u.refid, u.drefid, u.position, u.currentaccttype, u.codeid,
+              u.cdstatus, u.binarypoints, u.public_uid, 0 AS depth
+       FROM usertab u WHERE u.uid = ?
+       UNION ALL
+       SELECT u.uid, u.refid, u.drefid, u.position, u.currentaccttype, u.codeid,
+              u.cdstatus, u.binarypoints, u.public_uid, s.depth + 1
+       FROM usertab u
+       JOIN subtree s ON ${edge} = s.uid AND u.uid <> s.uid
+       WHERE s.depth < ?
+     )
+     SELECT s.uid, s.refid, s.drefid, s.position, s.currentaccttype, s.codeid,
+            s.cdstatus, s.binarypoints, s.public_uid, s.depth,
+            m.username, m.firstname, m.lastname,
+            COALESCE(mp.pts, 0) AS ownPoints
+     FROM subtree s
+     JOIN memberstab m ON m.uid = s.uid
+     LEFT JOIN (
+       SELECT uid, COALESCE(SUM(incentivepoints1),0) AS pts
+       FROM repurchasetab
+       WHERE producttype >= 100
+         AND DATE_FORMAT(transdate,'%Y-%m-%d') >= ?
+         AND DATE_FORMAT(transdate,'%Y-%m-%d') <= ?
+       GROUP BY uid
+     ) mp ON mp.uid = s.uid
+     ORDER BY s.depth ASC, s.uid ASC`,
+    [root, depthCap, start, end]
+  );
+
+  return rows.map((r) => {
+    const ownPoints = Number(r.ownPoints || 0);
+    const parentUid = isBinary ? Number(r.refid) : Number(r.drefid);
+    return {
+      uid: Number(r.uid),
+      publicUid: r.public_uid || null,
+      parentUid: Number(r.uid) === root ? null : parentUid,
+      position: isBinary ? (Number(r.position) === 1 ? 'left' : Number(r.position) === 2 ? 'right' : null) : null,
+      depth: Number(r.depth),
+      username: r.username,
+      fullname: `${r.firstname || ''} ${r.lastname || ''}`.trim(),
+      accttype: Number(r.currentaccttype),
+      accttypeName: getAccountTypeName(r.currentaccttype),
+      accountState: lightAccountStateLabel(r.codeid, r.cdstatus),
+      ownPoints,
+      pointsToUpline: isBinary ? resolveGenealogyPoints(r.currentaccttype, r.binarypoints) : ownPoints,
+    };
+  });
+}
+
 module.exports = {
   getNetworkList,
   getNetworkMembersDetailed,
   getGenealogyTree,
   getUnilevelTree,
+  getSubtreeFlat,
   isInNetwork,
   isInSponsorNetwork,
   getDirectReferrals,

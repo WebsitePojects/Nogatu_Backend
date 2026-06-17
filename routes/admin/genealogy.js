@@ -6,7 +6,13 @@ const express = require('express');
 const router = express.Router();
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { pool } = require('../../config/database');
-const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree } = require('../../services/network');
+const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree, getSubtreeFlat } = require('../../services/network');
+
+function treeVersion(nodes) {
+  let sum = 0;
+  for (const n of nodes) sum += Number(n.ownPoints || 0);
+  return `${nodes.length}-${sum}`;
+}
 
 function packageColor(accttype) {
   const key = Number(accttype || 0);
@@ -103,6 +109,35 @@ router.get('/unilevel/tree', adminAuth, adminRights([1, 3]), async (req, res) =>
     res.json({ tree, rootUid, depth: requestedDepth });
   } catch (error) {
     console.error('[Admin Genealogy] Unilevel tree error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/genealogy/{unilevel,binary}/flat?username=<name>
+ * Entire subtree of ANY account as a flat adjacency list (root → deepest) for the
+ * infinite-tree client. Admin loads on search only (no preload).
+ */
+router.get('/unilevel/flat', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const rootUid = await resolveRootUid(req.query.root || req.query.id, req.query.username);
+    if (!rootUid) return res.status(400).json({ error: 'Username, account ID, public UID, or referral slug required' });
+    const nodes = await getSubtreeFlat(rootUid, 'unilevel');
+    res.json({ rootUid, treeType: 'unilevel', count: nodes.length, version: treeVersion(nodes), nodes });
+  } catch (error) {
+    console.error('[Admin Genealogy] Unilevel flat error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/binary/flat', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const rootUid = await resolveRootUid(req.query.root || req.query.id, req.query.username);
+    if (!rootUid) return res.status(400).json({ error: 'Username, account ID, public UID, or referral slug required' });
+    const nodes = await getSubtreeFlat(rootUid, 'binary');
+    res.json({ rootUid, treeType: 'binary', count: nodes.length, version: treeVersion(nodes), nodes });
+  } catch (error) {
+    console.error('[Admin Genealogy] Binary flat error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

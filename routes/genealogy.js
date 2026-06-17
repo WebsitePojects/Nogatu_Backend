@@ -6,7 +6,15 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { getGenealogyTree, getUnilevelTree, isInNetwork, isInSponsorNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
+const { getGenealogyTree, getUnilevelTree, getSubtreeFlat, isInNetwork, isInSponsorNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
+
+// Cheap content hash so the client can skip a re-render when the background
+// (stale-while-revalidate) refetch returns an identical tree.
+function treeVersion(nodes) {
+  let sum = 0;
+  for (const n of nodes) sum += Number(n.ownPoints || 0);
+  return `${nodes.length}-${sum}`;
+}
 const { getEffectiveAccountState, getAccountStateLabel } = require('../services/accountState');
 
 function packageColor(accttype) {
@@ -162,6 +170,33 @@ router.get('/unilevel/tree', memberAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('[Genealogy] Unilevel tree error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/genealogy/unilevel/flat  and  /api/genealogy/binary/flat
+ * Entire self-rooted subtree as a flat adjacency list (root → deepest), for the
+ * infinite-tree client (virtualized render + IndexedDB cache). Self-rooted only.
+ */
+router.get('/unilevel/flat', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    const nodes = await getSubtreeFlat(uid, 'unilevel');
+    res.json({ rootUid: uid, treeType: 'unilevel', count: nodes.length, version: treeVersion(nodes), nodes });
+  } catch (err) {
+    console.error('[Genealogy] Unilevel flat error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/binary/flat', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    const nodes = await getSubtreeFlat(uid, 'binary');
+    res.json({ rootUid: uid, treeType: 'binary', count: nodes.length, version: treeVersion(nodes), nodes });
+  } catch (err) {
+    console.error('[Genealogy] Binary flat error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
