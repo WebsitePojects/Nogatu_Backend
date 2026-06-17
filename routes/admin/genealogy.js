@@ -6,13 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { pool } = require('../../config/database');
-const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree, getSubtreeFlat } = require('../../services/network');
-
-function treeVersion(nodes) {
-  let sum = 0;
-  for (const n of nodes) sum += Number(n.ownPoints || 0);
-  return `${nodes.length}-${sum}`;
-}
+const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree, getSubtreeFlat, flatTreeVersion: treeVersion } = require('../../services/network');
 
 function packageColor(accttype) {
   const key = Number(accttype || 0);

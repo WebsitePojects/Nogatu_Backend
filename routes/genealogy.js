@@ -6,15 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { pool } = require('../config/database');
-const { getGenealogyTree, getUnilevelTree, getSubtreeFlat, isInNetwork, isInSponsorNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
-
-// Cheap content hash so the client can skip a re-render when the background
-// (stale-while-revalidate) refetch returns an identical tree.
-function treeVersion(nodes) {
-  let sum = 0;
-  for (const n of nodes) sum += Number(n.ownPoints || 0);
-  return `${nodes.length}-${sum}`;
-}
+const { getGenealogyTree, getUnilevelTree, getSubtreeFlat, flatTreeVersion: treeVersion, isInNetwork, isInSponsorNetwork, getNetworkList, getNetworkMembersDetailed, resolveGenealogyPoints } = require('../services/network');
 const { getEffectiveAccountState, getAccountStateLabel } = require('../services/accountState');
 
 function packageColor(accttype) {

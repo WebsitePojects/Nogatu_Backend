@@ -473,7 +473,6 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
   if (!root) return [];
   const isBinary = treeType === 'binary';
   const edge = isBinary ? 'u.refid' : 'u.drefid';
-  const { start, end } = currentMonthRange();
   const depthCap = Math.min(120, Math.max(1, Number(maxDepth) || 100));
 
   const [rows] = await pool.query(
@@ -490,25 +489,48 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
      )
      SELECT s.uid, s.refid, s.drefid, s.position, s.currentaccttype, s.codeid,
             s.cdstatus, s.binarypoints, s.public_uid, s.depth,
-            m.username, m.firstname, m.lastname,
-            COALESCE(mp.pts, 0) AS ownPoints
+            m.username, m.firstname, m.lastname
      FROM subtree s
      JOIN memberstab m ON m.uid = s.uid
-     LEFT JOIN (
-       SELECT uid, COALESCE(SUM(incentivepoints1),0) AS pts
-       FROM repurchasetab
-       WHERE producttype >= 100
-         AND DATE_FORMAT(transdate,'%Y-%m-%d') >= ?
-         AND DATE_FORMAT(transdate,'%Y-%m-%d') <= ?
-       GROUP BY uid
-     ) mp ON mp.uid = s.uid
      ORDER BY s.depth ASC, s.uid ASC`,
-    [root, depthCap, start, end]
+    [root, depthCap]
   );
+  if (rows.length === 0) return [];
+
+  // Current-month maintenance points — scoped to THIS subtree's uids only (not the
+  // whole repurchasetab) and with a SARGable date range so idx(uid,transdate) is
+  // usable. Chunked IN keeps the placeholder/packet size bounded on huge trees.
+  const { start, end } = currentMonthRange();
+  const ptsByUid = new Map();
+  const allUids = rows.map((r) => Number(r.uid));
+  const CHUNK = 5000;
+  for (let i = 0; i < allUids.length; i += CHUNK) {
+    const slice = allUids.slice(i, i + CHUNK);
+    const ph = slice.map(() => '?').join(',');
+    // eslint-disable-next-line no-await-in-loop
+    const [mp] = await pool.query(
+      `SELECT uid, COALESCE(SUM(incentivepoints1),0) AS pts
+         FROM repurchasetab
+        WHERE uid IN (${ph})
+          AND producttype >= 100
+          AND transdate >= ? AND transdate < DATE_ADD(?, INTERVAL 1 DAY)
+        GROUP BY uid`,
+      [...slice, start, end]
+    );
+    for (const r of mp) ptsByUid.set(Number(r.uid), Number(r.pts || 0));
+  }
 
   return rows.map((r) => {
-    const ownPoints = Number(r.ownPoints || 0);
+    const ownPoints = ptsByUid.get(Number(r.uid)) || 0;
     const parentUid = isBinary ? Number(r.refid) : Number(r.drefid);
+    const codeid = Number(r.codeid);
+    const cdstatus = Number(r.cdstatus);
+    // Binary source eligibility: only PD and fully-paid CD feed binary points upward;
+    // FS / unpaid-CD are invisible source nodes (confirmed business rule). Showing
+    // their package value as "pts to upline" would mis-attribute point sources.
+    // NOTE: raw codeid/cdstatus here; effective post-upgrade state (upgradetab) is a
+    // documented follow-up (ULTRACODE plan H1).
+    const binaryContributes = codeid === 1 || (codeid === 3 && cdstatus === 2);
     return {
       uid: Number(r.uid),
       publicUid: r.public_uid || null,
@@ -521,11 +543,29 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
       fullname: `${r.firstname || ''} ${r.lastname || ''}`.trim(),
       accttype: Number(r.currentaccttype),
       accttypeName: getAccountTypeName(r.currentaccttype),
-      accountStateLabel: lightAccountStateLabel(r.codeid, r.cdstatus),
+      accountStateLabel: lightAccountStateLabel(codeid, cdstatus),
       ownPoints,
-      pointsToUpline: isBinary ? resolveGenealogyPoints(r.currentaccttype, r.binarypoints) : ownPoints,
+      pointsToUpline: isBinary
+        ? (binaryContributes ? resolveGenealogyPoints(r.currentaccttype, r.binarypoints) : 0)
+        : ownPoints,
     };
   });
+}
+
+/**
+ * Structural content hash for a flat tree payload — used by the client's
+ * stale-while-revalidate cache to decide whether to swap. Folds each node's
+ * identity, parent, position, package, state and points-to-upline into an FNV-1a
+ * rolling hash, so a re-placement / upgrade / attribution change invalidates the
+ * cache even when the node count and summed maintenance points are unchanged.
+ */
+function flatTreeVersion(nodes) {
+  let h = 0x811c9dc5;
+  for (const n of nodes) {
+    const s = `${n.uid}:${n.parentUid}:${n.position || ''}:${n.accttype}:${n.accountStateLabel}:${n.pointsToUpline}`;
+    for (let i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  }
+  return `${nodes.length}-${(h >>> 0).toString(36)}`;
 }
 
 module.exports = {
@@ -534,6 +574,7 @@ module.exports = {
   getGenealogyTree,
   getUnilevelTree,
   getSubtreeFlat,
+  flatTreeVersion,
   isInNetwork,
   isInSponsorNetwork,
   getDirectReferrals,
