@@ -1484,6 +1484,7 @@ module.exports = {
   getRankCashIncentive,
   processIncentive,
   refreshMemberRankSnapshot,
+  refreshRankingForest,
   rebuildRankSnapshot,
   shouldRefreshRankState,
   buildSnapshotFromStoredRow,
