@@ -34,6 +34,15 @@ async function del(sql, params) {
     const ph = ids.map(() => '?').join(',');
     console.log(`[restore] ${ids.length} flagged account(s): ${ids.join(', ')}`);
 
+    // Safety: destructive deletes. Dry-run by default; require an explicit --confirm
+    // so this can never run unattended or by a fat-finger against the wrong DB.
+    if (!process.argv.includes('--confirm')) {
+      const [gcCount] = await pool.query(`SELECT COUNT(*) AS n FROM rank_global_consumptiontab WHERE consuming_member_uid IN (${ph})`, ids).catch(() => [[{ n: '?' }]]);
+      console.log(`[restore] DRY RUN — would release ${gcCount?.[0]?.n} global-consumption row(s) (+ ledger + achievements) for the above account(s) and rebuild rankings.`);
+      console.log('[restore] Re-run with  --confirm  to actually delete + rebuild. (Verify the DB line above first.)');
+      return;
+    }
+
     const gc = await del(`DELETE FROM rank_global_consumptiontab WHERE consuming_member_uid IN (${ph})`, ids);
     const pc = await del(`DELETE FROM rank_point_consumptiontab  WHERE consuming_member_uid IN (${ph})`, ids);
     const ach = await del(`DELETE FROM rank_achievementstab      WHERE member_uid          IN (${ph})`, ids);
