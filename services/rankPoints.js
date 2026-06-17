@@ -11,6 +11,9 @@
  */
 const { pool } = require('../config/database');
 
+// Ancestors only (d > 0) — a member's OWN repurchase does NOT count toward their
+// own ranking points (confirmed rule 2026-06-16: "you cannot contribute to your
+// own computed repurchase points"); it only rolls UP to their uplines.
 const ANCESTOR_CHAIN_SQL = `
   WITH RECURSIVE chain AS (
     SELECT uid, drefid, 0 AS d FROM usertab WHERE uid = ?
@@ -19,7 +22,7 @@ const ANCESTOR_CHAIN_SQL = `
     FROM usertab p JOIN chain c ON p.uid = c.drefid AND p.uid <> c.uid
     WHERE c.d < 30
   )
-  SELECT uid FROM chain
+  SELECT uid FROM chain WHERE d > 0
 `;
 
 /**

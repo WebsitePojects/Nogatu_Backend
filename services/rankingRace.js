@@ -67,7 +67,7 @@ const SPONSOR_TREE_SQL = `
       r.transdate AS source_event_ts,
       r.processid AS source_process_id
     FROM repurchasetab r
-    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth >= 0
+    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth > 0
     LEFT JOIN gc_totals gc ON gc.repurchase_id = r.id
     WHERE COALESCE(r.incentivepoints1, 0) > 0
       AND GREATEST(0,
@@ -100,7 +100,7 @@ const SPONSOR_TREE_SQL_NO_GC = `
       r.transdate AS source_event_ts,
       r.processid AS source_process_id
     FROM repurchasetab r
-    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth >= 0
+    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth > 0
     WHERE COALESCE(r.incentivepoints1, 0) > 0
     ORDER BY r.transdate ASC, r.id ASC, r.uid ASC
 `;
