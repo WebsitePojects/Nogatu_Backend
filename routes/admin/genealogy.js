@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { pool } = require('../../config/database');
-const { getGenealogyTree, getNetworkMembersDetailed } = require('../../services/network');
+const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree } = require('../../services/network');
 
 function packageColor(accttype) {
   const key = Number(accttype || 0);
@@ -81,6 +81,28 @@ router.get('/tree', adminAuth, adminRights([1, 3]), async (req, res) => {
     res.json({ tree, rootUid, depth: requestedDepth });
   } catch (error) {
     console.error('[Admin Genealogy] Tree error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/genealogy/unilevel/tree?username=<name>&depth=<n>
+ * Unilevel / sponsor tree (drefid) for ANY account — full admin visibility, no
+ * network restriction. Used to inspect company/main accounts' sponsor downline
+ * (e.g. to decide which accounts to exclude from rank promotion).
+ */
+router.get('/unilevel/tree', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const rootUid = await resolveRootUid(req.query.root || req.query.id, req.query.username);
+    if (!rootUid) {
+      return res.status(400).json({ error: 'Account ID, public UID, referral slug, or username required' });
+    }
+
+    const requestedDepth = Math.min(20, Math.max(1, Number(req.query.depth) || 5));
+    const tree = await getUnilevelTree(rootUid, requestedDepth);
+    res.json({ tree, rootUid, depth: requestedDepth });
+  } catch (error) {
+    console.error('[Admin Genealogy] Unilevel tree error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
