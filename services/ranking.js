@@ -20,6 +20,7 @@ const {
   computeRankAwardsFromEvents,
   summarizeAchievementStatus,
 } = require('./rankingRace');
+const { loadExcludedSet } = require('./rankExclusions');
 
 const RANKING_BASIS_LABEL = 'Repurchase points (sponsor tree)';
 const RACE_BASIS_MODE = 'sponsor-tree-repurchase';
@@ -734,6 +735,10 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
     const definitions = ctx.definitions || await getRankDefinitions(conn);
     ctx.definitions = definitions;
 
+    // Flagged (company/system) accounts must never rank → never consume network
+    // repurchase points. Load the excluded set once per rebuild (shared via ctx).
+    if (!ctx.excludedSet) ctx.excludedSet = await loadExcludedSet(conn);
+
     const [memberRows] = await conn.query(
       'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
       [memberUid]
@@ -778,6 +783,12 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
       grossRankablePoints:       eventPool.grossRankablePoints,
       consumedPoints:            eventPool.existingConsumedPoints,
     });
+
+    // GUARD: a flagged account never achieves a rank, so it never writes a
+    // consumption row — its downline's repurchase points stay available to real
+    // members. Zero the awards before the insert loop below.
+    const rankExcluded = ctx.excludedSet.has(memberUid);
+    if (rankExcluded) raceState.awards = [];
 
     if (raceState.awards.length > 0) {
       rankLog('rank.new.awards', {
