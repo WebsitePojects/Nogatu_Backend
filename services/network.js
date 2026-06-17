@@ -516,10 +516,12 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
       position: isBinary ? (Number(r.position) === 1 ? 'left' : Number(r.position) === 2 ? 'right' : null) : null,
       depth: Number(r.depth),
       username: r.username,
+      firstname: r.firstname || '',
+      lastname: r.lastname || '',
       fullname: `${r.firstname || ''} ${r.lastname || ''}`.trim(),
       accttype: Number(r.currentaccttype),
       accttypeName: getAccountTypeName(r.currentaccttype),
-      accountState: lightAccountStateLabel(r.codeid, r.cdstatus),
+      accountStateLabel: lightAccountStateLabel(r.codeid, r.cdstatus),
       ownPoints,
       pointsToUpline: isBinary ? resolveGenealogyPoints(r.currentaccttype, r.binarypoints) : ownPoints,
     };
