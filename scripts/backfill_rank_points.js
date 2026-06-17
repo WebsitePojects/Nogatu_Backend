@@ -10,12 +10,18 @@
  * STALE engine snapshots, which are expected to differ — those are the bug the
  * incremental path fixes) before the live leaderboard is ever switched to it.
  */
-require('./env');
+// Load .env.dev/.env.prod into process.env BEFORE requiring config/database
+// (the pool is built at require-time from process.env). `require('./env')` alone
+// does NOT load it — you must CALL loadBackendEnv().
+const { loadBackendEnv, getDbConfig } = require('./env');
+const envFile = loadBackendEnv();
 const { backfillAll, reconcile } = require('../services/rankPoints');
 const { pool } = require('../config/database');
 
 (async () => {
   try {
+    const db = getDbConfig();
+    console.log(`[backfill] env=${envFile}  DB=${db.user}@${db.host}/${db.database}`);
     const reconcileOnly = process.argv.includes('--reconcile');
     if (!reconcileOnly) {
       console.log('[backfill] rebuilding member_rank_pointstab …');
