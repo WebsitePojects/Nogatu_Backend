@@ -123,10 +123,12 @@ router.get('/', memberAuth, async (req, res) => {
     const historySearch = String(req.query.historySearch || '').trim().toLowerCase().slice(0, 40);
     const historySort = String(req.query.historySort || 'date').toLowerCase() === 'amount' ? 'amount' : 'date';
     const historyDir = String(req.query.historyDir || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
+    // Event Trace has its OWN independent search (separate from History's).
+    const traceSearch = String(req.query.traceSearch || '').trim().toLowerCase().slice(0, 40);
 
     const [counts, trace, walletRows, binaryEligibility] = await Promise.all([
       getPairingCounts(uid),
-      getPairingTrace(uid, accttype, { page: tracePage, perPage: tracePerPage })
+      getPairingTrace(uid, accttype, { page: tracePage, perPage: tracePerPage, traceSearch })
         .catch((error) => {
           if (error.code === 'ER_NO_SUCH_TABLE') {
             return {
@@ -203,13 +205,21 @@ router.get('/', memberAuth, async (req, res) => {
         return hay.includes(historySearch);
       });
     }
-    // Sort by date or credited amount.
+    // Sort by date or credited amount, with matchSeq as the deterministic
+    // tiebreaker. Many pairs share the same paired_at (a late-joining strong-leg
+    // source "forms" all its pairs at once), so without matchSeq the sort is
+    // unstable and the rows — and their decrementing "source remaining" — jumble.
+    // matchSeq is the true chronological order each pair was consumed.
     const dirMul = historyDir === 'asc' ? 1 : -1;
     historyFiltered = [...historyFiltered].sort((a, b) => {
       if (historySort === 'amount') {
-        return (Number(a.creditedIncome || 0) - Number(b.creditedIncome || 0)) * dirMul;
+        const d = Number(a.creditedIncome || 0) - Number(b.creditedIncome || 0);
+        if (d !== 0) return d * dirMul;
+        return (Number(a.matchSeq || 0) - Number(b.matchSeq || 0)) * dirMul;
       }
-      return (new Date(a.pairedAt || 0) - new Date(b.pairedAt || 0)) * dirMul;
+      const d = new Date(a.pairedAt || 0) - new Date(b.pairedAt || 0);
+      if (d !== 0) return d * dirMul;
+      return (Number(a.matchSeq || 0) - Number(b.matchSeq || 0)) * dirMul;
     });
 
     const historyTotal = Number(historyFiltered.length || 0);
