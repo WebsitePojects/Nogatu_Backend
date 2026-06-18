@@ -67,9 +67,17 @@ async function main() {
     );
     console.log(`[seed] direct-child rows added: ${directRes.affectedRows}`);
 
-    // 3) deepen one level at a time, extending only the current frontier
-    //    (WHERE c.depth = d), until a level adds nothing.
-    let depth = 1;
+    // 3) deepen via repeated FULL transitive-closure passes until convergence.
+    //    Each pass extends every non-self row by one level: if (A,X,d) exists and
+    //    X -> Y (refid), add (A,Y,d+1). INSERT IGNORE skips the rows already
+    //    present, so a pass only materialises the next missing layer everywhere
+    //    (middle gaps from broken chains AND deep tails are both repaired,
+    //    top-down). We loop until a pass adds 0 rows = the closure is complete.
+    //    (V008's bug was running a FIXED 10 passes instead of looping to 0.)
+    //    The self-join reads a consistent snapshot per statement, so each pass
+    //    adds exactly one layer — classic semi-naive closure, guaranteed to
+    //    converge in (max tree depth) passes.
+    let pass = 0;
     let added = 0;
     let totalDeepened = 0;
     do {
@@ -80,21 +88,21 @@ async function main() {
          INNER JOIN usertab child
                  ON child.refid = c.descendant_uid
                 AND child.uid <> c.descendant_uid
-         WHERE c.depth = ? AND c.leg <> 'self'`,
-        [depth]
+         WHERE c.leg <> 'self' AND c.depth < ?`,
+        [MAX_DEPTH]
       );
       added = res.affectedRows;
       totalDeepened += added;
-      if (added > 0) console.log(`[deepen] depth ${depth} -> ${depth + 1}: +${added} rows`);
-      depth += 1;
-    } while (added > 0 && depth < MAX_DEPTH);
+      pass += 1;
+      console.log(`[deepen] pass ${pass}: +${added} rows`);
+    } while (added > 0 && pass < MAX_DEPTH);
 
-    if (depth >= MAX_DEPTH) {
-      console.warn(`[warn] hit MAX_DEPTH=${MAX_DEPTH} without converging — inspect for a refid cycle.`);
+    if (pass >= MAX_DEPTH) {
+      console.warn(`[warn] hit MAX_DEPTH=${MAX_DEPTH} passes without converging — inspect for a refid cycle.`);
     }
 
     const [[after]] = await conn.query('SELECT COUNT(*) AS n FROM binary_tree_closuretab');
-    console.log(`[done] closure rows after = ${after.n} (+${after.n - before.n}); deepened levels reached depth ${depth - 1}`);
+    console.log(`[done] closure rows after = ${after.n} (+${after.n - before.n}); +${totalDeepened} deepened over ${pass} passes`);
 
     // 4) verification probe — Elmer (uid 6122895) should now resolve ~2105.
     const [[chk]] = await conn.query(
