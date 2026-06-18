@@ -1298,8 +1298,14 @@ async function getAllRankings(page = 1, perPage = 30) {
   }
 
   hydrated.sort((a, b) => {
-    if (toNumber(b.remainingRankablePoints) !== toNumber(a.remainingRankablePoints))
-      return toNumber(b.remainingRankablePoints) - toNumber(a.remainingRankablePoints);
+    // Highest rank first, then biggest TOTAL accumulated (consumed + remaining) —
+    // ranking up consumes points to ~0 remaining, so total keeps the highest-rank
+    // biggest-network member at the top instead of burying it. Mirrors the SQL.
+    const rankDiff = toNumber(b.currentRank) - toNumber(a.currentRank);
+    if (rankDiff !== 0) return rankDiff;
+    const totalA = toNumber(a.consumedPoints) + toNumber(a.remainingRankablePoints);
+    const totalB = toNumber(b.consumedPoints) + toNumber(b.remainingRankablePoints);
+    if (totalB !== totalA) return totalB - totalA;
     const dateA = String(a.qualifiedDate || '9999-12-31 23:59:59');
     const dateB = String(b.qualifiedDate || '9999-12-31 23:59:59');
     const dateCompare = dateA.localeCompare(dateB);
