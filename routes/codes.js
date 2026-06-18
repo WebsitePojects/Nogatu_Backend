@@ -6,12 +6,13 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
-const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES, CODE_PREFIXES } = require('../utils/helpers');
+const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES, CODE_PREFIXES, currentMonthRange } = require('../utils/helpers');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
 const { listMemberActivationHistory } = require('../services/codeHistory');
 const { refreshMemberRankSnapshot } = require('../services/ranking');
 const { applyRepurchaseDelta } = require('../services/rankPoints');
+const { getTotalPointsForRange } = require('../services/income/unilevel');
 
 /**
  * GET /api/codes?page=1
@@ -360,6 +361,26 @@ router.post('/maintenance', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid maintenance transaction type' });
     }
 
+    // Maintenance bucket split: transType 1 -> 'unilevel' (counts toward the monthly
+    // 200 unilevel maintenance + unilevel income); transType 2 -> 'hifive' (counts only
+    // toward the 5-directs-same-product free claim, never toward unilevel).
+    const maintenanceBucket = transType === 2 ? 'hifive' : 'unilevel';
+
+    // Gate: Hi-Five only unlocks AFTER the member reaches 200 unilevel maintenance points
+    // THIS month. Until then only unilevel maintenance is allowed (enforced server-side so
+    // the threshold can't be bypassed by sending transType=2 directly).
+    if (transType === 2) {
+      const { start, end } = currentMonthRange();
+      const unilevelPts = await getTotalPointsForRange(uid, start, end, 'unilevel');
+      if (unilevelPts < 200) {
+        return res.status(400).json({
+          error: 'Hi-Five unlocks after you reach 200 unilevel maintenance points this month.',
+          code: 'HIFIVE_LOCKED',
+          unilevelPoints: unilevelPts,
+        });
+      }
+    }
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
@@ -386,12 +407,12 @@ router.post('/maintenance', memberAuth, async (req, res) => {
       return res.status(400).json({ error: 'Maintenance code is no longer available' });
     }
 
-    // Insert repurchase record
+    // Insert repurchase record (tagged to the chosen maintenance bucket).
     await conn.query(
-      `INSERT INTO repurchasetab (id, uid, producttype, code, transtype, codeid,
+      `INSERT INTO repurchasetab (id, uid, producttype, maintenance_bucket, code, transtype, codeid,
        incentivepoints1, transdate)
-       VALUES (NULL, ?, ?, ?, ?, ?, ?, NOW())`,
-      [uid, codeData.producttype, code, transType, codeData.codetype, codeData.unilevelpoints]
+       VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+      [uid, codeData.producttype, maintenanceBucket, code, transType, codeData.codetype, codeData.unilevelpoints]
     );
 
     await appendActivationCodeUsage(conn, {
