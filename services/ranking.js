@@ -835,12 +835,18 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
     // gross so GROSS = rawDownline - others_consumed and REMAINING = GROSS - own.
     // Award gating is untouched — it uses the event pool, not these display figures.
     const { displayGross, displayRemaining } = computeDisplayBasis(raceState);
+    // An excluded account never actually consumes — its awards were zeroed above and no
+    // global consumption row is written. Its HYPOTHETICAL consumedPoints must not linger
+    // in the snapshot (it would understate REMAINING and show as reconciliation drift).
+    // Present a full, un-consumed pool: consumed = 0, remaining = gross.
+    const snapshotConsumed  = rankExcluded ? 0 : raceState.consumedPoints;
+    const snapshotRemaining = rankExcluded ? displayGross : displayRemaining;
 
     const snapshotPayload = {
       currentRank,
       grossRankablePoints:      displayGross,
-      consumedPoints:           raceState.consumedPoints,
-      remainingRankablePoints:  displayRemaining,
+      consumedPoints:           snapshotConsumed,
+      remainingRankablePoints:  snapshotRemaining,
       basisLabel:               RANKING_BASIS_LABEL,
       raceBasisMode:            RACE_BASIS_MODE,
       binaryPoints:             pairing.binaryPoints,
@@ -872,8 +878,8 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
       currentRankLabel:         currentRank > 0 ? (RANK_REQUIREMENTS[currentRank]?.label || `Rank ${currentRank}`) : 'Unranked',
       currentRankColor:         rankColor(currentRank),
       grossRankablePoints:      displayGross,
-      consumedPoints:           raceState.consumedPoints,
-      remainingRankablePoints:  displayRemaining,
+      consumedPoints:           snapshotConsumed,
+      remainingRankablePoints:  snapshotRemaining,
       basisPoints:              displayGross,
       basisLabel:               RANKING_BASIS_LABEL,
       raceBasisMode:            RACE_BASIS_MODE,
