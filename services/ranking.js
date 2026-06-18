@@ -1186,6 +1186,7 @@ async function getAllRankings(page = 1, perPage = 30) {
      LEFT JOIN rankingstab r ON r.uid = u.uid
      WHERE u.uid = u.mainid ${exclusionSql}
      ORDER BY
+       GREATEST(COALESCE(r.highest_rank_no,0), COALESCE(r.current_rank,0), COALESCE(r.rank_level,0)) DESC,
        COALESCE(r.remaining_rankable_points, 0) DESC,
        COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') ASC,
        u.uid ASC
