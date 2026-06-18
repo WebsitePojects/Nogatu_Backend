@@ -191,4 +191,94 @@ router.get('/movements', memberAuth, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/leaderboard/bloodline?page&perPage
+ * The member's repurchase-point contributors: every DOWNLINE member (self excluded)
+ * whose repurchases roll up into this member's ranking points, grouped by member with
+ * gross / consumed / net points + a grand tally. Proves the leaderboard figure comes
+ * from real, eligible bloodline — and is exportable.
+ */
+router.get('/bloodline', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = Math.min(200, Math.max(10, Number(req.query.perPage) || 50));
+    const offset = (page - 1) * perPage;
+
+    const subCte = `
+      WITH RECURSIVE sub AS (
+        SELECT uid, 0 AS d FROM usertab WHERE uid = ?
+        UNION ALL
+        SELECT u.uid, sub.d + 1 FROM usertab u JOIN sub ON u.drefid = sub.uid AND u.uid <> sub.uid WHERE sub.d < 30
+      ),
+      gc AS (SELECT repurchase_id, SUM(points_consumed) AS c FROM rank_global_consumptiontab GROUP BY repurchase_id)`;
+
+    const [totalRows] = await pool.query(
+      `${subCte}
+       SELECT COUNT(DISTINCT r.uid) AS contributors,
+              COALESCE(SUM(r.incentivepoints1),0) AS gross,
+              COALESCE(SUM(GREATEST(0, r.incentivepoints1 - COALESCE(gc.c,0))),0) AS net
+       FROM repurchasetab r
+       JOIN sub ON sub.uid = r.uid AND sub.d > 0
+       LEFT JOIN gc ON gc.repurchase_id = r.id
+       WHERE r.incentivepoints1 > 0`,
+      [uid]
+    );
+    const t = totalRows[0] || { contributors: 0, gross: 0, net: 0 };
+
+    const [countRows] = await pool.query(
+      `${subCte}
+       SELECT COUNT(*) AS total FROM (
+         SELECT r.uid FROM repurchasetab r JOIN sub ON sub.uid = r.uid AND sub.d > 0
+         WHERE r.incentivepoints1 > 0 GROUP BY r.uid
+       ) x`,
+      [uid]
+    );
+    const total = Number(countRows[0]?.total || 0);
+
+    const [rows] = await pool.query(
+      `${subCte}
+       SELECT r.uid AS sourceUid, m.username, m.firstname, m.lastname,
+              MIN(sub.d) AS level, COUNT(*) AS events,
+              COALESCE(SUM(r.incentivepoints1),0) AS gross,
+              COALESCE(SUM(GREATEST(0, r.incentivepoints1 - COALESCE(gc.c,0))),0) AS net
+       FROM repurchasetab r
+       JOIN sub ON sub.uid = r.uid AND sub.d > 0
+       JOIN memberstab m ON m.uid = r.uid
+       LEFT JOIN gc ON gc.repurchase_id = r.id
+       WHERE r.incentivepoints1 > 0
+       GROUP BY r.uid, m.username, m.firstname, m.lastname
+       ORDER BY gross DESC, sourceUid ASC
+       LIMIT ?, ?`,
+      [uid, offset, perPage]
+    );
+
+    res.json({
+      totals: {
+        contributors: Number(t.contributors || 0),
+        gross: Number(t.gross || 0),
+        net: Number(t.net || 0),
+        consumed: Math.max(0, Number(t.gross || 0) - Number(t.net || 0)),
+      },
+      contributors: rows.map((r) => ({
+        uid: Number(r.sourceUid),
+        username: r.username,
+        fullname: `${r.firstname || ''} ${r.lastname || ''}`.trim() || r.username,
+        level: Number(r.level),
+        events: Number(r.events),
+        gross: Number(r.gross),
+        net: Number(r.net),
+        consumed: Math.max(0, Number(r.gross) - Number(r.net)),
+      })),
+      page,
+      perPage,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / perPage)),
+    });
+  } catch (err) {
+    console.error('[Leaderboard] bloodline error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;

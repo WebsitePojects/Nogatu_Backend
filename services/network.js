@@ -520,7 +520,28 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
     for (const r of mp) ptsByUid.set(Number(r.uid), Number(r.pts || 0));
   }
 
-  return rows.map((r) => {
+  // All-time GROSS repurchase points per node (no date filter) — the basis for the
+  // cumulative "passable points to upline" rollup. Matches the /bloodline gross
+  // definition (SUM of repurchasetab.incentivepoints1, producttype>=100).
+  const grossByUid = new Map();
+  if (!isBinary) {
+    for (let i = 0; i < allUids.length; i += CHUNK) {
+      const slice = allUids.slice(i, i + CHUNK);
+      const ph = slice.map(() => '?').join(',');
+      // eslint-disable-next-line no-await-in-loop
+      const [gr] = await pool.query(
+        `SELECT uid, COALESCE(SUM(incentivepoints1),0) AS pts
+           FROM repurchasetab
+          WHERE uid IN (${ph})
+            AND producttype >= 100
+          GROUP BY uid`,
+        slice
+      );
+      for (const r of gr) grossByUid.set(Number(r.uid), Number(r.pts || 0));
+    }
+  }
+
+  const nodes = rows.map((r) => {
     const ownPoints = ptsByUid.get(Number(r.uid)) || 0;
     const parentUid = isBinary ? Number(r.refid) : Number(r.drefid);
     const codeid = Number(r.codeid);
@@ -545,11 +566,29 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
       accttypeName: getAccountTypeName(r.currentaccttype),
       accountStateLabel: lightAccountStateLabel(codeid, cdstatus),
       ownPoints,
+      ownGrossPoints: grossByUid.get(Number(r.uid)) || 0,
       pointsToUpline: isBinary
         ? (binaryContributes ? resolveGenealogyPoints(r.currentaccttype, r.binarypoints) : 0)
         : ownPoints,
     };
   });
+
+  // Unilevel "PTS TO UPLINE" = GROSS cumulative passable repurchase points of the
+  // node's whole subtree (own all-time gross + every downline's), rolled up so an
+  // upline always shows >= any single downline, to infinity. Display-only — it
+  // only sums existing repurchasetab points and mutates no income/balance.
+  if (!isBinary) {
+    const byUid = new Map(nodes.map((n) => [n.uid, n]));
+    for (const n of nodes) n.subtreeUplinePoints = Number(n.ownGrossPoints || 0);
+    // Deepest-first so every child's full subtree total is added to its parent.
+    for (const n of [...nodes].sort((a, b) => b.depth - a.depth)) {
+      const parent = n.parentUid != null ? byUid.get(n.parentUid) : null;
+      if (parent) parent.subtreeUplinePoints += n.subtreeUplinePoints;
+    }
+    for (const n of nodes) n.pointsToUpline = n.subtreeUplinePoints;
+  }
+
+  return nodes;
 }
 
 /**

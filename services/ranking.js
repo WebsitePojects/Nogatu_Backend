@@ -20,6 +20,7 @@ const {
   computeRankAwardsFromEvents,
   summarizeAchievementStatus,
 } = require('./rankingRace');
+const { loadExcludedSet } = require('./rankExclusions');
 
 const RANKING_BASIS_LABEL = 'Repurchase points (sponsor tree)';
 const RACE_BASIS_MODE = 'sponsor-tree-repurchase';
@@ -734,6 +735,10 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
     const definitions = ctx.definitions || await getRankDefinitions(conn);
     ctx.definitions = definitions;
 
+    // Flagged (company/system) accounts must never rank → never consume network
+    // repurchase points. Load the excluded set once per rebuild (shared via ctx).
+    if (!ctx.excludedSet) ctx.excludedSet = await loadExcludedSet(conn);
+
     const [memberRows] = await conn.query(
       'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
       [memberUid]
@@ -778,6 +783,12 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
       grossRankablePoints:       eventPool.grossRankablePoints,
       consumedPoints:            eventPool.existingConsumedPoints,
     });
+
+    // GUARD: a flagged account never achieves a rank, so it never writes a
+    // consumption row — its downline's repurchase points stay available to real
+    // members. Zero the awards before the insert loop below.
+    const rankExcluded = ctx.excludedSet.has(memberUid);
+    if (rankExcluded) raceState.awards = [];
 
     if (raceState.awards.length > 0) {
       rankLog('rank.new.awards', {
@@ -1130,12 +1141,22 @@ async function getAllRankings(page = 1, perPage = 30) {
   await ensureRankingInfra();
   const definitions = await getRankDefinitions();
 
+  // Hide flagged/excluded accounts from the leaderboard entirely ("treat as if
+  // they never existed"). They also never earn or consume — the engine already
+  // zeroes their awards before any consumption (loadExcludedSet at the rebuild
+  // path). Detached accounts get hidden the same way once flagged-excluded.
+  const excludedUids = [...await loadExcludedSet()].filter((v) => v > 0);
+  const exclusionSql = excludedUids.length
+    ? `AND u.uid NOT IN (${excludedUids.map(() => '?').join(',')})`
+    : '';
+
   const currentPage = Math.max(1, Number(page) || 1);
   const size   = Math.min(100, Math.max(1, Number(perPage) || 30));
   const offset = (currentPage - 1) * size;
 
   const [countRows] = await pool.query(
-    `SELECT COUNT(*) AS total FROM usertab u WHERE u.uid = u.mainid`
+    `SELECT COUNT(*) AS total FROM usertab u WHERE u.uid = u.mainid ${exclusionSql}`,
+    excludedUids
   );
   const total = toNumber(countRows[0]?.total);
 
@@ -1163,13 +1184,14 @@ async function getAllRankings(page = 1, perPage = 30) {
      FROM usertab u
      INNER JOIN memberstab m ON m.uid = u.uid
      LEFT JOIN rankingstab r ON r.uid = u.uid
-     WHERE u.uid = u.mainid
+     WHERE u.uid = u.mainid ${exclusionSql}
      ORDER BY
-       COALESCE(r.remaining_rankable_points, 0) DESC,
+       GREATEST(COALESCE(r.highest_rank_no,0), COALESCE(r.current_rank,0), COALESCE(r.rank_level,0)) DESC,
+       (COALESCE(r.consumed_points,0) + COALESCE(r.remaining_rankable_points,0)) DESC,
        COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') ASC,
        u.uid ASC
      LIMIT ?, ?`,
-    [offset, size]
+    [...excludedUids, offset, size]
   );
 
   // Validate repurchase points via sponsor tree for each listed member.
@@ -1276,8 +1298,14 @@ async function getAllRankings(page = 1, perPage = 30) {
   }
 
   hydrated.sort((a, b) => {
-    if (toNumber(b.remainingRankablePoints) !== toNumber(a.remainingRankablePoints))
-      return toNumber(b.remainingRankablePoints) - toNumber(a.remainingRankablePoints);
+    // Highest rank first, then biggest TOTAL accumulated (consumed + remaining) —
+    // ranking up consumes points to ~0 remaining, so total keeps the highest-rank
+    // biggest-network member at the top instead of burying it. Mirrors the SQL.
+    const rankDiff = toNumber(b.currentRank) - toNumber(a.currentRank);
+    if (rankDiff !== 0) return rankDiff;
+    const totalA = toNumber(a.consumedPoints) + toNumber(a.remainingRankablePoints);
+    const totalB = toNumber(b.consumedPoints) + toNumber(b.remainingRankablePoints);
+    if (totalB !== totalA) return totalB - totalA;
     const dateA = String(a.qualifiedDate || '9999-12-31 23:59:59');
     const dateB = String(b.qualifiedDate || '9999-12-31 23:59:59');
     const dateCompare = dateA.localeCompare(dateB);

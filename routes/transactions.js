@@ -492,6 +492,22 @@ router.get('/:pid', memberAuth, async (req, res) => {
         })
       : pickPairingRowsForTransaction(pairingTrace.rows || [], row.income2, row.transdate);
 
+    // Pairing income is a cumulative Math.max delta, so an exact per-payout amount
+    // match often fails. Rather than show "no contributors", fall back to the matched
+    // -pair events closest to (and not after) this payout — the likely triggers
+    // (e.g. the member just placed in the weak leg) — clearly labelled approximate.
+    let pairingRowsOut = exactPairingRows;
+    let pairingApprox = false;
+    if (pairingRowsOut.length === 0 && Number(row.income2 || 0) > 0) {
+      const cutoffMs = new Date(pairingCutoff).getTime();
+      const pool = (directPairingRows && directPairingRows.length ? directPairingRows : (pairingTrace.rows || []));
+      const near = pool
+        .filter((r) => { const t = new Date(r.pairedAt).getTime(); return !Number.isNaN(t) && t <= cutoffMs; })
+        .sort((a, b) => new Date(b.pairedAt) - new Date(a.pairedAt))
+        .slice(0, 8);
+      if (near.length > 0) { pairingRowsOut = near; pairingApprox = true; }
+    }
+
     res.json({
       transaction: {
         pid: row.pid,
@@ -537,7 +553,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
       supporting: {
         directReferrals: directReferralTrace.rows || [],
         leadershipSources: [],
-        pairingTrace: exactPairingRows,
+        pairingTrace: pairingRowsOut,
         hiFiveSources: hiFiveTrace.claims || [],
         hiFiveSummary: hiFiveTrace.summary || null,
         unilevelSources: [],
@@ -545,7 +561,9 @@ router.get('/:pid', memberAuth, async (req, res) => {
         notes: {
           directReferrals: directReferralTrace.note,
           leadershipSources: Number(row.income3 || 0) > 0 ? 'This payout row does not store exact per-record leadership source rows yet, so unrelated names are intentionally hidden.' : null,
-          pairingTrace: Number(row.income2 || 0) > 0 && exactPairingRows.length === 0 ? 'Pairing income exists on this record, but exact contributor rows were not fully preserved in the legacy ledger for this payout.' : null,
+          pairingTrace: Number(row.income2 || 0) > 0 && pairingRowsOut.length === 0
+            ? 'Pairing income exists on this record, but exact contributor rows were not fully preserved in the legacy ledger for this payout.'
+            : (pairingApprox ? 'Approximate attribution: the matched-pair events closest to this payout (who most likely triggered this pairing).' : null),
           hiFiveSources: Number(row.income5 || 0) > 0 && (hiFiveTrace.claims || []).length === 0 ? 'Hi-Five income exists on this record, but the exact paid claim source could not be matched from the current legacy data.' : null,
           unilevelSources: Number(row.income4 || 0) > 0 ? 'This payout row does not store exact per-record unilevel contributors yet, so unrelated names are intentionally hidden.' : null,
           rankingSources: Number(row.income6 || 0) > 0 ? 'This payout row does not store exact per-record ranking contributors yet, so unrelated names are intentionally hidden.' : null,

@@ -191,6 +191,16 @@ function buildPairingLedgerEntries({ ownerUid, accttype, leftEvents = [], rightE
     if (rightEvent.remainingPoints <= 0) rightIndex += 1;
   }
 
+  // matchSeq = the true chronological order each pair was consumed. The merge
+  // loop above already pushes rows in that order (both queues are sorted by
+  // event time, then eventUid). Persisting this ordinal lets the UI show the
+  // very first pairing first and the "source remaining" columns decrement
+  // monotonically, even when many pairs share the same pairedAt timestamp
+  // (e.g. a late-joining strong-leg source matched against many earlier ones).
+  ledgerRows.forEach((row, index) => {
+    row.matchSeq = index + 1;
+  });
+
   return ledgerRows;
 }
 
@@ -500,14 +510,15 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
     await conn.query(
       `INSERT INTO pairing_ledgerstab
        (ledger_uid, owner_uid, left_event_uid, right_event_uid, pair_points, pair_cap,
-        points_used, income_event_uid, paired_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        points_used, income_event_uid, paired_at, match_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          pair_points = VALUES(pair_points),
          pair_cap = VALUES(pair_cap),
          points_used = VALUES(points_used),
          income_event_uid = COALESCE(VALUES(income_event_uid), income_event_uid),
-         paired_at = VALUES(paired_at)`,
+         paired_at = VALUES(paired_at),
+         match_seq = VALUES(match_seq)`,
       [
         row.ledgerUid,
         ownerUid,
@@ -518,6 +529,7 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
         row.creditedIncome,
         incomeEventUid,
         row.pairedAt.slice(0, 19).replace('T', ' '),
+        toNumber(row.matchSeq) || null,
       ]
     );
   }
@@ -584,7 +596,17 @@ async function getPairingTrace(ownerUid, accttype, options = {}, conn = pool) {
     };
   }
 
-  const normalizedRows = await normalizeLedgerTraceRows(syncResult.rows, syncResult.incomeEventMap, conn);
+  let normalizedRows = await normalizeLedgerTraceRows(syncResult.rows, syncResult.incomeEventMap, conn);
+  // Independent Event Trace search (date or either source username/name).
+  const traceSearch = String(options.traceSearch || '').trim().toLowerCase();
+  if (traceSearch) {
+    normalizedRows = normalizedRows.filter((r) => {
+      const hay = `${String(r.pairedAt || '')} `
+        + `${String(r.left?.username || '')} ${String(r.left?.fullName || '')} `
+        + `${String(r.right?.username || '')} ${String(r.right?.fullName || '')}`;
+      return hay.toLowerCase().includes(traceSearch);
+    });
+  }
   const paginated = paginateRows(normalizedRows, page, perPage);
 
   return {
@@ -607,12 +629,15 @@ async function normalizeLedgerTraceRows(rows = [], incomeEventMap = null, conn =
   );
 
   return [...rows]
-    .sort((a, b) => new Date(b.pairedAt) - new Date(a.pairedAt) || String(b.ledgerUid).localeCompare(String(a.ledgerUid)))
+    .sort((a, b) => new Date(b.pairedAt) - new Date(a.pairedAt)
+      || (toNumber(b.matchSeq) - toNumber(a.matchSeq))
+      || String(b.ledgerUid).localeCompare(String(a.ledgerUid)))
     .map((row) => {
       const leftMeta = sourceMetaMap.get(toNumber(row.leftSourceMemberUid)) || {};
       const rightMeta = sourceMetaMap.get(toNumber(row.rightSourceMemberUid)) || {};
       return {
         ledgerUid: row.ledgerUid,
+        matchSeq: toNumber(row.matchSeq),
         ownerUid: toNumber(row.ownerUid),
         pairPoints: toNumber(row.pairPoints),
         pairCap: toNumber(row.pairCap),
@@ -663,6 +688,7 @@ function buildPairingHistoryRows(rows = []) {
     .filter((row) => toNumber(row.creditedIncome) > 0)
     .map((row) => ({
       historyUid: row.ledgerUid,
+      matchSeq: toNumber(row.matchSeq),
       pairedAt: row.pairedAt,
       matchedPoints: toNumber(row.pairPoints),
       creditedIncome: toNumber(row.creditedIncome),

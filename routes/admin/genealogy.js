@@ -7,6 +7,8 @@ const router = express.Router();
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { pool } = require('../../config/database');
 const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree, getSubtreeFlat, flatTreeVersion: treeVersion } = require('../../services/network');
+const { setRankExclusion, loadExcludedSet, releaseConsumptionForUids } = require('../../services/rankExclusions');
+const { refreshRankingForest } = require('../../services/ranking');
 
 function packageColor(accttype) {
   const key = Number(accttype || 0);
@@ -132,6 +134,54 @@ router.get('/binary/flat', adminAuth, adminRights([1, 3]), async (req, res) => {
     res.json({ rootUid, treeType: 'binary', count: nodes.length, version: treeVersion(nodes), nodes });
   } catch (error) {
     console.error('[Admin Genealogy] Binary flat error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Rank exclusions — flag/unflag a (company/system) account so it can never rank up
+ * and consume the network's repurchase points. Managed from the Unilevel viewer.
+ */
+router.get('/rank-exclusions', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const set = await loadExcludedSet();
+    res.json({ excludedUids: Array.from(set) });
+  } catch (error) {
+    console.error('[Admin Genealogy] rank-exclusions list error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/rank-exclusion', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const uid = Number(req.body?.uid);
+    const excluded = Boolean(req.body?.excluded);
+    const reason = String(req.body?.reason || '').slice(0, 255) || null;
+    if (!uid) return res.status(400).json({ error: 'uid required' });
+    await setRankExclusion(uid, excluded, Number(req.session.adminid) || null, reason);
+
+    let released = null;
+    if (excluded) {
+      // Atomically give the network back whatever points this account already
+      // consumed (delete its consumption + achievements), then recompute the
+      // forest in the background so the freed points re-settle the race without
+      // blocking the click.
+      released = await releaseConsumptionForUids([uid]);
+      setImmediate(() => {
+        refreshRankingForest().catch((e) => console.error('[rank-exclusion] forest rebuild failed:', e));
+      });
+    }
+
+    res.json({
+      uid,
+      excluded,
+      released,
+      note: excluded
+        ? `Flagged + released its consumed points back to the network (${released.global} consumption row(s), ${released.achievements} rank(s) reversed). Rankings are recomputing now.`
+        : 'Unflagged. This account is eligible to rank again.',
+    });
+  } catch (error) {
+    console.error('[Admin Genealogy] rank-exclusion set error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
