@@ -9,6 +9,7 @@ const {
   getAllRankings,
   getRankProgress,
 } = require('../services/ranking');
+const { loadExcludedSet } = require('../services/rankExclusions');
 
 /**
  * GET /api/leaderboard?page=1&perPage=25
@@ -27,29 +28,39 @@ router.get('/', memberAuth, async (req, res) => {
 
     const userRemaining = Number(userProgress.remainingRankablePoints || 0);
     const userGross = Number(userProgress.grossRankablePoints || 0);
+    const userConsumed = Number(userProgress.consumedPoints || 0);
+    const userRank = Number(userProgress.currentRank || 0);
+    const userTotal = userConsumed + userRemaining;
     const userAwardedAt = String(userProgress.qualifiedDate || '9999-12-31 23:59:59');
+
+    // The "your standing" position MUST mirror getAllRankings exactly, or the card and
+    // the list disagree (e.g. #6 card vs #3 list). That ordering is: rank DESC, then
+    // (consumed + remaining) total DESC, then award date ASC, then uid ASC. It also
+    // EXCLUDES flagged accounts — they are hidden from the list, so they must not count
+    // toward a real member's standing (counting them was inflating positions).
+    const excludedUids = [...await loadExcludedSet()].filter((v) => v > 0);
+    const exclusionSql = excludedUids.length ? `AND u.uid NOT IN (${excludedUids.map(() => '?').join(',')})` : '';
+    const RANK_EXPR = 'GREATEST(COALESCE(r.highest_rank_no,0), COALESCE(r.current_rank,0), COALESCE(r.rank_level,0))';
+    const TOTAL_EXPR = '(COALESCE(r.consumed_points,0) + COALESCE(r.remaining_rankable_points,0))';
+    const DATE_EXPR = "COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59')";
 
     const [rankRows] = await pool.query(
       `SELECT COUNT(*) AS rankPosition
        FROM rankingstab r
        INNER JOIN usertab u ON u.uid = r.uid
-       WHERE u.uid = u.mainid
+       WHERE u.uid = u.mainid ${exclusionSql}
         AND (
-           COALESCE(r.remaining_rankable_points, 0) > ?
-           OR (
-             COALESCE(r.remaining_rankable_points, 0) = ?
-             AND COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') < ?
-           )
-           OR (
-             COALESCE(r.remaining_rankable_points, 0) = ?
-             AND COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') = ?
-             AND r.uid < ?
-           )
-         )`,
+          ${RANK_EXPR} > ?
+          OR (${RANK_EXPR} = ? AND ${TOTAL_EXPR} > ?)
+          OR (${RANK_EXPR} = ? AND ${TOTAL_EXPR} = ? AND ${DATE_EXPR} < ?)
+          OR (${RANK_EXPR} = ? AND ${TOTAL_EXPR} = ? AND ${DATE_EXPR} = ? AND r.uid < ?)
+        )`,
       [
-        userRemaining,
-        userRemaining, userAwardedAt,
-        userRemaining, userAwardedAt, uid,
+        ...excludedUids,
+        userRank,
+        userRank, userTotal,
+        userRank, userTotal, userAwardedAt,
+        userRank, userTotal, userAwardedAt, uid,
       ]
     );
 
