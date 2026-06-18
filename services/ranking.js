@@ -1141,12 +1141,22 @@ async function getAllRankings(page = 1, perPage = 30) {
   await ensureRankingInfra();
   const definitions = await getRankDefinitions();
 
+  // Hide flagged/excluded accounts from the leaderboard entirely ("treat as if
+  // they never existed"). They also never earn or consume — the engine already
+  // zeroes their awards before any consumption (loadExcludedSet at the rebuild
+  // path). Detached accounts get hidden the same way once flagged-excluded.
+  const excludedUids = [...await loadExcludedSet()].filter((v) => v > 0);
+  const exclusionSql = excludedUids.length
+    ? `AND u.uid NOT IN (${excludedUids.map(() => '?').join(',')})`
+    : '';
+
   const currentPage = Math.max(1, Number(page) || 1);
   const size   = Math.min(100, Math.max(1, Number(perPage) || 30));
   const offset = (currentPage - 1) * size;
 
   const [countRows] = await pool.query(
-    `SELECT COUNT(*) AS total FROM usertab u WHERE u.uid = u.mainid`
+    `SELECT COUNT(*) AS total FROM usertab u WHERE u.uid = u.mainid ${exclusionSql}`,
+    excludedUids
   );
   const total = toNumber(countRows[0]?.total);
 
@@ -1174,13 +1184,13 @@ async function getAllRankings(page = 1, perPage = 30) {
      FROM usertab u
      INNER JOIN memberstab m ON m.uid = u.uid
      LEFT JOIN rankingstab r ON r.uid = u.uid
-     WHERE u.uid = u.mainid
+     WHERE u.uid = u.mainid ${exclusionSql}
      ORDER BY
        COALESCE(r.remaining_rankable_points, 0) DESC,
        COALESCE(r.race_last_awarded_at, r.rank_date, r.qualified_date, '9999-12-31 23:59:59') ASC,
        u.uid ASC
      LIMIT ?, ?`,
-    [offset, size]
+    [...excludedUids, offset, size]
   );
 
   // Validate repurchase points via sponsor tree for each listed member.
