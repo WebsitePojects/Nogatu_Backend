@@ -18,6 +18,7 @@ const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadi
 const {
   listRankableEventsForMember,
   computeRankAwardsFromEvents,
+  computeDisplayBasis,
   summarizeAchievementStatus,
 } = require('./rankingRace');
 const { loadExcludedSet } = require('./rankExclusions');
@@ -824,11 +825,22 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
       ? Math.max(...filteredAchievements.map((a) => toNumber(a.rank)))
       : 0;
 
+    // Display basis fix (V023 rule #3). rank_global_consumptiontab nets BOTH this
+    // member's OWN consumption and deeper members' consumption out of the event
+    // pool. Deeper-member netting is correct (prevents double-count up the chain),
+    // but the member's own consumption must not be removed from GROSS and then
+    // subtracted AGAIN as CONSUMED — that floored REMAINING to 0 for ranked members
+    // (e.g. Supervisor-1 with 13,690 verified, 10,000 consumed showing 0 instead of
+    // 3,690). Add the member's already-global own consumption back into the displayed
+    // gross so GROSS = rawDownline - others_consumed and REMAINING = GROSS - own.
+    // Award gating is untouched — it uses the event pool, not these display figures.
+    const { displayGross, displayRemaining } = computeDisplayBasis(raceState);
+
     const snapshotPayload = {
       currentRank,
-      grossRankablePoints:      raceState.grossRankablePoints,
+      grossRankablePoints:      displayGross,
       consumedPoints:           raceState.consumedPoints,
-      remainingRankablePoints:  raceState.remainingRankablePoints,
+      remainingRankablePoints:  displayRemaining,
       basisLabel:               RANKING_BASIS_LABEL,
       raceBasisMode:            RACE_BASIS_MODE,
       binaryPoints:             pairing.binaryPoints,
@@ -859,10 +871,10 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
       currentRank,
       currentRankLabel:         currentRank > 0 ? (RANK_REQUIREMENTS[currentRank]?.label || `Rank ${currentRank}`) : 'Unranked',
       currentRankColor:         rankColor(currentRank),
-      grossRankablePoints:      raceState.grossRankablePoints,
+      grossRankablePoints:      displayGross,
       consumedPoints:           raceState.consumedPoints,
-      remainingRankablePoints:  raceState.remainingRankablePoints,
-      basisPoints:              raceState.grossRankablePoints,
+      remainingRankablePoints:  displayRemaining,
+      basisPoints:              displayGross,
       basisLabel:               RANKING_BASIS_LABEL,
       raceBasisMode:            RACE_BASIS_MODE,
       rankDate:                 snapshotPayload.rankDate,

@@ -135,3 +135,44 @@ test('summarizeAchievementStatus exposes only unfulfilled ranks as admin-claimab
   assert.equal(summary.nextPendingRank.rank, 2);
   assert.equal(summary.nextPendingRank.cashIncentive, 10000);
 });
+
+test('computeDisplayBasis is exported', () => {
+  assert.equal(typeof rankingRace.computeDisplayBasis, 'function');
+});
+
+test('computeDisplayBasis: ranked member no longer shows REMAINING=0 (own consumption not double-subtracted)', () => {
+  // Jervy01 case: live downline 13,690; 10,000 consumed (all PRIOR rebuilds, so
+  // already in global → event pool gross is the net 3,690). Must surface 3,690 left.
+  const { displayGross, displayRemaining } = rankingRace.computeDisplayBasis({
+    grossRankablePoints: 3690, consumedPoints: 10000, newConsumedPoints: 0,
+  });
+  assert.equal(displayGross, 13690);
+  assert.equal(displayRemaining, 3690);
+});
+
+test('computeDisplayBasis: unconsumed member is unchanged', () => {
+  const r = rankingRace.computeDisplayBasis({ grossRankablePoints: 9460, consumedPoints: 0, newConsumedPoints: 0 });
+  assert.equal(r.displayGross, 9460);
+  assert.equal(r.displayRemaining, 9460);
+});
+
+test('computeDisplayBasis: rank achieved THIS rebuild is not added back (new consumption stays excluded)', () => {
+  // rawDownline 12,000, no prior consumption; this rebuild consumes 10,000 for the rank.
+  const r = rankingRace.computeDisplayBasis({ grossRankablePoints: 12000, consumedPoints: 10000, newConsumedPoints: 10000 });
+  assert.equal(r.displayGross, 12000);
+  assert.equal(r.displayRemaining, 2000);
+});
+
+test('computeDisplayBasis: mixed prior + new consumption stays internally consistent (GROSS - CONSUMED = REMAINING)', () => {
+  // 10,000 prior (in global, netted out of gross 3,000) + 2,000 new this rebuild.
+  const r = rankingRace.computeDisplayBasis({ grossRankablePoints: 3000, consumedPoints: 12000, newConsumedPoints: 2000 });
+  assert.equal(r.displayGross, 13000);
+  assert.equal(r.displayRemaining, 1000);
+  assert.equal(r.displayGross - 12000, r.displayRemaining);
+});
+
+test('computeDisplayBasis: coerces strings and defaults missing fields, never negative', () => {
+  assert.deepEqual(rankingRace.computeDisplayBasis({ grossRankablePoints: '3690', consumedPoints: '10000' }),
+    { displayGross: 13690, displayRemaining: 3690 });
+  assert.deepEqual(rankingRace.computeDisplayBasis({}), { displayGross: 0, displayRemaining: 0 });
+});

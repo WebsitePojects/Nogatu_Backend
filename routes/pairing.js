@@ -197,10 +197,26 @@ router.get('/', memberAuth, async (req, res) => {
       }
     }
 
-    // Search: match the formatted date or either source username.
-    let historyFiltered = historyRowsAll;
+    // One-month viewability: pairing history is browsed a single month at a time.
+    // Build the month list from all rows, default to the most recent month, and
+    // scope to it (search/sort/paginate then operate within that month only).
+    const monthOf = (r) => String(r.pairedAt || '').slice(0, 7);
+    const availableMonths = [...new Set(historyRowsAll.map(monthOf).filter((m) => /^\d{4}-\d{2}$/.test(m)))]
+      .sort().reverse();
+    const requestedMonth = String(req.query.historyMonth || '').trim();
+    // historyMonth=all bypasses the window (full history) — used by the xlsx export.
+    const wantsAll = requestedMonth.toLowerCase() === 'all';
+    const selectedMonth = wantsAll
+      ? null
+      : ((/^\d{4}-\d{2}$/.test(requestedMonth) ? requestedMonth : null) || availableMonths[0] || null);
+    const historyScoped = selectedMonth
+      ? historyRowsAll.filter((r) => monthOf(r) === selectedMonth)
+      : historyRowsAll;
+
+    // Search within the selected month: match the formatted date or either source username.
+    let historyFiltered = historyScoped;
     if (historySearch) {
-      historyFiltered = historyRowsAll.filter((r) => {
+      historyFiltered = historyScoped.filter((r) => {
         const hay = `${String(r.pairedAt || '')} ${String(r.left?.username || '')} ${String(r.right?.username || '')}`.toLowerCase();
         return hay.includes(historySearch);
       });
@@ -245,6 +261,8 @@ router.get('/', memberAuth, async (req, res) => {
         perPage: historyPerPage,
         total: historyTotal,
         totalPages: historyTotalPages,
+        month: selectedMonth,
+        availableMonths,
       },
       counts: displayCounts,
       trace,

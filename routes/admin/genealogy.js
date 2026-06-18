@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { pool } = require('../../config/database');
-const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree, getSubtreeFlat, flatTreeVersion: treeVersion } = require('../../services/network');
+const { getGenealogyTree, getNetworkMembersDetailed, getUnilevelTree, getSubtreeFlat, getUnilevelPointsHistory, flatTreeVersion: treeVersion } = require('../../services/network');
 const { setRankExclusion, loadExcludedSet, releaseConsumptionForUids } = require('../../services/rankExclusions');
 const { refreshRankingForest } = require('../../services/ranking');
 
@@ -122,6 +122,24 @@ router.get('/unilevel/flat', adminAuth, adminRights([1, 3]), async (req, res) =>
     res.json({ rootUid, treeType: 'unilevel', count: nodes.length, version: treeVersion(nodes), nodes });
   } catch (error) {
     console.error('[Admin Genealogy] Unilevel flat error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/genealogy/unilevel/points-history?username=<name>&page=&perPage=
+ * Per-entry repurchase history (producttype>=100) for the account's sponsor downline
+ * — the individual events summing into its "points passed to upline" total, plus the
+ * grand total + count. Read-only; backs the admin Unilevel Points Entry History panel.
+ */
+router.get('/unilevel/points-history', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const rootUid = await resolveRootUid(req.query.root || req.query.id, req.query.username);
+    if (!rootUid) return res.status(400).json({ error: 'Username, account ID, public UID, or referral slug required' });
+    const data = await getUnilevelPointsHistory(rootUid, { page: req.query.page, perPage: req.query.perPage });
+    res.json({ rootUid, ...data });
+  } catch (error) {
+    console.error('[Admin Genealogy] Unilevel points-history error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

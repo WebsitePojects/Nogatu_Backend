@@ -303,10 +303,31 @@ function summarizeAchievementStatus(achievements = []) {
   };
 }
 
+/**
+ * Display-only basis correction for the ranking snapshot (V023 rule #3).
+ *
+ * The rankable-event pool nets a member's OWN already-credited consumption out of
+ * GROSS (via rank_global_consumptiontab). Re-subtracting that own consumption as
+ * CONSUMED double-counts it and floors REMAINING to 0 for ranked members. Add the
+ * own PRIOR consumption back into the displayed gross so:
+ *     GROSS     = rawDownline - others_consumed
+ *     REMAINING = GROSS - own_consumed
+ * New consumption from the current rebuild (newConsumedPoints) is NOT added back —
+ * those points came from the live event pool and are correctly already excluded.
+ * Pure + award-neutral: rank awards are gated by the event pool, never by these.
+ */
+function computeDisplayBasis({ grossRankablePoints = 0, consumedPoints = 0, newConsumedPoints = 0 } = {}) {
+  const ownPriorConsumed = Math.max(0, toNumber(consumedPoints) - toNumber(newConsumedPoints));
+  const displayGross     = toNumber(grossRankablePoints) + ownPriorConsumed;
+  const displayRemaining = Math.max(0, displayGross - toNumber(consumedPoints));
+  return { displayGross, displayRemaining };
+}
+
 module.exports = {
   listRankableEventsForMember,
   sortRankableEvents,
   consumePointsForRank,
   computeRankAwardsFromEvents,
+  computeDisplayBasis,
   summarizeAchievementStatus,
 };
