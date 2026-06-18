@@ -37,7 +37,10 @@ async function main() {
   const uid = Number(process.argv[2] || 6122895);
 
   const [[u]] = await pool.query(
-    'SELECT uid, username, currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
+    `SELECT u.uid, m.username, u.currentaccttype
+       FROM usertab u
+       LEFT JOIN memberstab m ON m.uid = u.uid
+      WHERE u.uid = ? LIMIT 1`,
     [uid]
   );
   if (!u) {
