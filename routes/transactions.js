@@ -14,7 +14,49 @@ const {
   getAccountEntryAuditInfo,
 } = require('../services/accountState');
 const { getPackageClaimDetails, getPackageRewardAmounts } = require('../services/income/hifiveBonus');
+const { getUnilevelProductPointContributors } = require('../services/income/unilevel');
 const { pickRowsByExactAmount } = require('../services/transactionTrace');
+
+// First/last day of the calendar month containing dateStr (unilevel is monthly,
+// so a payout's contributors are that payout-month's downline product points).
+function monthRangeOf(dateStr) {
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const pad = (n) => String(n).padStart(2, '0');
+  const lastDay = new Date(y, m + 1, 0).getDate();
+  return { start: `${y}-${pad(m + 1)}-01`, end: `${y}-${pad(m + 1)}-${pad(lastDay)}` };
+}
+
+// Unilevel contributors for a payout: the downline product-point repurchases in
+// the payout's month, compressed to the member's package reach. Real downline data
+// (no fabrication); empty + note when legacy import lacks per-event repurchase rows.
+async function resolveUnilevelSourcesForTransaction(uid, tx) {
+  const amount = normalizeAmount(tx?.unilevel);
+  if (amount <= 0 || !tx) return { rows: [], note: null };
+  const range = monthRangeOf(tx.transdate);
+  const result = await getUnilevelProductPointContributors(
+    uid, range ? { start: range.start, end: range.end } : {}
+  ).catch(() => ({ rows: [] }));
+  const rows = (result.rows || []).map((r) => ({
+    uid: Number(r.uid || 0),
+    username: r.username || null,
+    fullname: r.fullname || r.username || `UID ${r.uid}`,
+    level: Number(r.level || 0),
+    ratePercent: Number(r.ratePercent || 0),
+    productName: r.productName || null,
+    productPoints: Number(r.productPoints || 0),
+    amount: Number(r.amount || r.projectedAmount || 0),
+    transdate: r.transdate,
+  }));
+  return {
+    rows,
+    note: rows.length === 0
+      ? 'Unilevel income exists on this record, but no qualifying downline product-point contributors were found for that month (e.g. legacy import without per-event repurchase rows).'
+      : 'Unilevel contributors are your downline product-point repurchases for this payout’s month, compressed to your package reach; each amount is that contributor’s unilevel share.',
+  };
+}
 
 function normalizeAmount(value) {
   return Number(value || 0);
@@ -459,7 +501,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
       );
     }
 
-    const [pairingTrace, hiFiveTrace, directReferralTrace] = await Promise.all([
+    const [pairingTrace, hiFiveTrace, directReferralTrace, unilevelTrace] = await Promise.all([
       hasPairingIncome && directPairingRows === null
         ? getPairingTrace(uid, Number(req.session.currentaccttype || req.session.accttype || 0), { limit: 40 }).catch(() => ({ rows: [] }))
         : Promise.resolve({ rows: [] }),
@@ -470,6 +512,10 @@ router.get('/:pid', memberAuth, async (req, res) => {
       }),
       resolveDirectReferralSourcesForTransaction(uid, {
         directReferral: row.income1,
+        transdate: row.transdate_full || row.transdate,
+      }),
+      resolveUnilevelSourcesForTransaction(uid, {
+        unilevel: row.income4,
         transdate: row.transdate_full || row.transdate,
       }),
     ]);
@@ -556,7 +602,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
         pairingTrace: pairingRowsOut,
         hiFiveSources: hiFiveTrace.claims || [],
         hiFiveSummary: hiFiveTrace.summary || null,
-        unilevelSources: [],
+        unilevelSources: unilevelTrace.rows || [],
         rankingSources: [],
         notes: {
           directReferrals: directReferralTrace.note,
@@ -565,7 +611,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
             ? 'Pairing income exists on this record, but exact contributor rows were not fully preserved in the legacy ledger for this payout.'
             : (pairingApprox ? 'Approximate attribution: the matched-pair events closest to this payout (who most likely triggered this pairing).' : null),
           hiFiveSources: Number(row.income5 || 0) > 0 && (hiFiveTrace.claims || []).length === 0 ? 'Hi-Five income exists on this record, but the exact paid claim source could not be matched from the current legacy data.' : null,
-          unilevelSources: Number(row.income4 || 0) > 0 ? 'This payout row does not store exact per-record unilevel contributors yet, so unrelated names are intentionally hidden.' : null,
+          unilevelSources: Number(row.income4 || 0) > 0 ? unilevelTrace.note : null,
           rankingSources: Number(row.income6 || 0) > 0 ? 'This payout row does not store exact per-record ranking contributors yet, so unrelated names are intentionally hidden.' : null,
         },
       },
