@@ -209,9 +209,21 @@ router.get('/', memberAuth, async (req, res) => {
     const selectedMonth = wantsAll
       ? null
       : ((/^\d{4}-\d{2}$/.test(requestedMonth) ? requestedMonth : null) || availableMonths[0] || null);
-    const historyScoped = selectedMonth
-      ? historyRowsAll.filter((r) => monthOf(r) === selectedMonth)
-      : historyRowsAll;
+    // Optional date RANGE (from/to, YYYY-MM-DD) takes precedence over the month window.
+    const fromStr = String(req.query.historyFrom || '').trim();
+    const toStr = String(req.query.historyTo || '').trim();
+    const hasRange = /^\d{4}-\d{2}-\d{2}$/.test(fromStr) || /^\d{4}-\d{2}-\d{2}$/.test(toStr);
+    const fromMs = /^\d{4}-\d{2}-\d{2}$/.test(fromStr) ? new Date(`${fromStr}T00:00:00`).getTime() : -Infinity;
+    const toMs = /^\d{4}-\d{2}-\d{2}$/.test(toStr) ? new Date(`${toStr}T23:59:59`).getTime() : Infinity;
+    const inRange = (r) => {
+      const t = new Date(r.pairedAt).getTime();
+      return !Number.isNaN(t) && t >= fromMs && t <= toMs;
+    };
+    const historyScoped = hasRange
+      ? historyRowsAll.filter(inRange)
+      : (selectedMonth
+        ? historyRowsAll.filter((r) => monthOf(r) === selectedMonth)
+        : historyRowsAll);
 
     // Search within the selected month: match the formatted date or either source username.
     let historyFiltered = historyScoped;
