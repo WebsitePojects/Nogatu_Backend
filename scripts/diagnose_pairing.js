@@ -1,20 +1,12 @@
 /**
  * diagnose_pairing.js  (READ-ONLY)
  *
- * Explains why a member's pairing shows in the report/trace but does not credit the
- * wallet. For a username it prints, side by side:
- *   - effective account state
- *   - getBinaryPairingEligibility (canEarnPairing + qualified directs per leg)  <- the CREDIT gate
- *   - getPairing totalPay / left / right points                                <- what would credit
- *   - stored ttlincome2 (already-credited lifetime pairing)
- *   - binary_tree_closuretab coverage for this owner (the gate's data source)
+ * Why a member's pairing shows N in the report/trace but credits M to the wallet.
+ * Dumps, side by side: eligibility gate, getPairing engine total + per-day reports,
+ * the per-LEG eligible source list with DEPTH (vs the package pairing depth limit),
+ * stored ttlincome2, and closure-vs-live coverage. 1 PV = 250 points = PHP 250.
  *
- * If canEarnPairing is FALSE but matches exist, the gate is the blocker. If the
- * closure has fewer descendants than the live refid subtree, the closure is stale
- * (rebuild it). No writes. Prints env=/DB= first.
- *
- * Usage: NODE_ENV=staging node scripts/diagnose_pairing.js --username t01rightsub
- *        (use the EARNER's username — the account whose wallet should receive pairing)
+ * Usage: NODE_ENV=staging node scripts/diagnose_pairing.js --username test01
  */
 const { loadBackendEnv, getDbConfig } = require('./env');
 
@@ -22,6 +14,7 @@ function arg(name) {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : null;
 }
+const pv = (pts) => `${Number(pts || 0)} (${(Number(pts || 0) / 250).toFixed(2)} PV)`;
 
 async function main() {
   const envFile = loadBackendEnv();
@@ -34,58 +27,72 @@ async function main() {
   const { pool } = require('../config/database');
   const { getPairing } = require('../services/income/pairing');
   const { getBinaryPairingEligibility } = require('../services/binaryEligibility');
-  const { getEffectiveAccountState } = require('../services/accountState');
+  const { getEffectiveAccountState, countsForPairingSource } = require('../services/accountState');
+  const { getPackagePairingDepthLimit, getPackagePairingWeeklyCap } = require('../services/packagePolicy');
 
   const [[member]] = await pool.query(
-    `SELECT u.uid, u.currentaccttype, u.codeid, u.cdstatus, u.refid, u.drefid, u.position
-       FROM usertab u INNER JOIN memberstab m ON m.uid = u.uid
-      WHERE m.username = ? AND u.uid = u.mainid LIMIT 1`,
+    `SELECT u.uid, u.currentaccttype, u.codeid, u.cdstatus FROM usertab u
+       INNER JOIN memberstab m ON m.uid = u.uid WHERE m.username = ? AND u.uid = u.mainid LIMIT 1`,
     [username]
   );
   if (!member) { console.log(`No member '${username}'`); return; }
   const uid = Number(member.uid);
-  console.log(`\nEARNER ${username} uid=${uid} pkg=${member.currentaccttype} codeid=${member.codeid} cdstatus=${member.cdstatus}`);
+  const accttype = Number(member.currentaccttype);
+  const depthLimit = getPackagePairingDepthLimit(accttype);
+  const weeklyCap = getPackagePairingWeeklyCap(accttype);
+  console.log(`\nEARNER ${username} uid=${uid} pkg=${accttype} codeid=${member.codeid} cdstatus=${member.cdstatus}`);
+  console.log(`package pairing DEPTH LIMIT = ${depthLimit == null ? 'none' : depthLimit}   weeklyCap = ${weeklyCap}`);
 
-  const eff = await getEffectiveAccountState(uid);
-  console.log(`effectiveState: codeid=${eff?.codeid} cdstatus=${eff?.cdstatus} currentaccttype=${eff?.currentaccttype}`);
-
-  // The CREDIT gate
   const elig = await getBinaryPairingEligibility(uid);
-  console.log(`\n[CREDIT GATE] canEarnPairing=${elig.canEarnPairing}  leftQualified=${elig.leftQualifiedCount}  rightQualified=${elig.rightQualifiedCount}`);
-  console.log(`  qualifiedDirects.left : ${elig.qualifyingDirects.left.map((d) => `${d.username}(${d.accountState})`).join(', ') || '(none)'}`);
-  console.log(`  qualifiedDirects.right: ${elig.qualifyingDirects.right.map((d) => `${d.username}(${d.accountState})`).join(', ') || '(none)'}`);
-  if (!elig.canEarnPairing) console.log(`  reason: ${elig.reason}`);
+  console.log(`\n[GATE] canEarnPairing=${elig.canEarnPairing} leftQualifiedDirects=${elig.leftQualifiedCount} rightQualifiedDirects=${elig.rightQualifiedCount}`);
 
-  // What WOULD credit
-  const pr = await getPairing(uid, Number(member.currentaccttype));
-  console.log(`\n[ENGINE] getPairing.totalPay=${pr.totalPay}  leftPts=${pr.leftPts}  rightPts=${pr.rightPts}  pairedPts=${pr.pairedPts}`);
+  // ── Per-leg eligible sources with DEPTH (mirror getNumLevels: leg = level-1 ancestor's position) ──
+  const legs = { left: [], right: [] };
+  async function walk(parentUid, leg, depth) {
+    const [rows] = await pool.query(
+      `SELECT u.uid, u.position, u.accttype, u.currentaccttype, u.codeid, u.cdamount, u.cdtotal, u.cdstatus,
+              u.binarypoints, u.refid, u.drefid, DATE_FORMAT(u.datereg,'%Y-%m-%d') AS datereg, m.username
+         FROM usertab u LEFT JOIN memberstab m ON m.uid = u.uid WHERE u.refid = ?`,
+      [parentUid]
+    );
+    for (const row of rows) {
+      const thisLeg = leg || (Number(row.position) === 1 ? 'left' : 'right');
+      const eff = await getEffectiveAccountState(row.uid, row);
+      const eligible = eff ? countsForPairingSource(eff) : false;
+      const withinDepth = depthLimit == null || depth <= depthLimit;
+      legs[thisLeg].push({
+        uid: Number(row.uid), username: row.username, depth, bp: Number(row.binarypoints || 0),
+        codeid: Number(row.codeid), eligible, withinDepth,
+      });
+      await walk(row.uid, thisLeg, depth + 1);
+    }
+  }
+  await walk(uid, null, 1);
+
+  for (const side of ['left', 'right']) {
+    const all = legs[side];
+    const counted = all.filter((n) => n.eligible && n.withinDepth);
+    const beyond  = all.filter((n) => n.eligible && !n.withinDepth);
+    const sumCounted = counted.reduce((s, n) => s + n.bp, 0);
+    const sumBeyond  = beyond.reduce((s, n) => s + n.bp, 0);
+    console.log(`\n[${side.toUpperCase()} LEG] eligible+within-depth points = ${pv(sumCounted)}   (eligible but BEYOND depth = ${pv(sumBeyond)})`);
+    counted.slice(0, 12).forEach((n) => console.log(`   d${n.depth} ${n.username} bp=${n.bp} codeid=${n.codeid}`));
+    if (beyond.length) beyond.slice(0, 12).forEach((n) => console.log(`   d${n.depth} ${n.username} bp=${n.bp}  <<< BEYOND DEPTH ${depthLimit} (engine ignores, trace may show)`));
+  }
+
+  // ── Engine ──
+  const pr = await getPairing(uid, accttype);
+  console.log(`\n[ENGINE] getPairing.totalPay=${pr.totalPay}  leftPts=${pv(pr.leftPts)}  rightPts=${pv(pr.rightPts)}  pairedPts=${pv(pr.pairedPts)}`);
+  if (pr.dailyReports && pr.dailyReports.length) {
+    console.log('  daily matched (date | leftRpt | rightRpt | matchedPts | cumulative):');
+    pr.dailyReports.slice(-14).forEach((d) => console.log(`   ${d.transdate} | L${d.left} | R${d.right} | +${d.totalpoints} | =${d.totalbpay}`));
+  }
 
   const [[tot]] = await pool.query('SELECT ttlincome2 FROM payouttotaltab WHERE uid = ? LIMIT 1', [uid]);
-  console.log(`[WALLET] stored ttlincome2 (lifetime pairing) = ${Number(tot?.ttlincome2 || 0)}`);
-
-  // Closure coverage vs live refid subtree
-  const [[clo]] = await pool.query(
-    `SELECT COUNT(*) AS n FROM binary_tree_closuretab WHERE ancestor_uid = ? AND depth > 0 AND leg IN ('left','right')`,
-    [uid]
-  );
-  const [[live]] = await pool.query(
-    `WITH RECURSIVE t AS (
-       SELECT uid FROM usertab WHERE refid = ?
-       UNION ALL SELECT u.uid FROM usertab u INNER JOIN t ON u.refid = t.uid
-     ) SELECT COUNT(*) AS n FROM t`,
-    [uid]
-  );
-  console.log(`\n[CLOSURE] binary descendants in closure=${clo.n}  vs live refid subtree=${live.n}  ${clo.n < live.n ? '<<< STALE CLOSURE (rebuild)' : 'ok'}`);
-
-  console.log(`\nVERDICT: ${
-    elig.canEarnPairing
-      ? (pr.totalPay > Number(tot?.ttlincome2 || 0)
-          ? 'gate OPEN + engine has new pairing -> SHOULD credit on next dashboard/ewallet load.'
-          : 'gate OPEN but totalPay <= stored ttlincome2 -> already credited (no NEW pairing).')
-      : (pr.leftPts > 0 && pr.rightPts > 0
-          ? 'gate CLOSED while matches exist -> BLOCKED. If closure is stale, rebuild; else owner has no QUALIFIED DIRECT (spillover-only does not unlock pairing).'
-          : 'gate CLOSED + no matched points on a leg yet.')
-  }`);
+  console.log(`\n[WALLET] stored ttlincome2 (lifetime pairing) = ${Number(tot?.ttlincome2 || 0)}`);
+  console.log(`\nINTERPRET: matchable = min(left eligible+within-depth, right eligible+within-depth).`);
+  console.log(`  If a big source shows "BEYOND DEPTH", the trace counts it but the engine cannot (package reach) -> trace over-shows = correct.`);
+  console.log(`  If left/right within-depth sums clearly exceed totalPay, the engine UNDER-credits -> real bug, paste this output.`);
 
   await pool.end();
 }
