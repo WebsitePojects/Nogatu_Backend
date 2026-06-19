@@ -15,6 +15,7 @@ const { evaluateDuplicateIdentity, normalizeContactNo, normalizeDob } = require(
 const { appendPlacementAudit, appendActivationCodeUsage } = require('./registrationAudit');
 const { getPlacementPolicyForSponsor } = require('./binaryPlacementPolicy');
 const { recommendPlacementForSponsor } = require('./placementRecommendation');
+const { isInNetwork } = require('./network');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 
 let memberTinColumnReady = false;
@@ -514,6 +515,30 @@ async function registerMember({
 
     if (!finalPlacementUid || ![1, 2].includes(finalPosition)) {
       throw new Error('Invalid placement selection');
+    }
+
+    // Manual placement (autoPlacement=false): the chosen placement account MUST be the
+    // sponsor or inside the sponsor's OWN binary subtree — never another member's tree.
+    // (Auto-placement is in-network by construction.) Closure check first (O(1)) with a
+    // live refid-walk fallback so a stale/absent closure can't wrongly block a valid slot.
+    // Also closes a pre-existing API hole (placementUid was always accepted in the body).
+    if (!autoPlacement) {
+      let inNetwork = Number(sponsorUid) === finalPlacementUid;
+      if (!inNetwork) {
+        try {
+          const [closureRows] = await conn.query(
+            'SELECT 1 FROM binary_tree_closuretab WHERE ancestor_uid = ? AND descendant_uid = ? LIMIT 1',
+            [Number(sponsorUid), finalPlacementUid]
+          );
+          inNetwork = closureRows.length > 0;
+        } catch (closureErr) {
+          if (closureErr.code !== 'ER_NO_SUCH_TABLE') throw closureErr;
+        }
+        if (!inNetwork) inNetwork = await isInNetwork(Number(sponsorUid), finalPlacementUid);
+      }
+      if (!inNetwork) {
+        throw new Error('Placement account must be you or someone in your own binary network.');
+      }
     }
 
     lockKeys.push(`placement:${finalPlacementUid}:${finalPosition}`);
