@@ -26,7 +26,7 @@ async function main() {
   const { getPairing } = require('../services/income/pairing');
 
   const [rows] = await pool.query(
-    `SELECT p.uid, p.ttlincome2, u.currentaccttype
+    `SELECT p.uid, p.ttlincome2, u.currentaccttype, u.codeid, u.cdstatus
        FROM payouttotaltab p
        JOIN usertab u ON u.uid = p.uid
       WHERE p.ttlincome2 > 0
@@ -34,9 +34,11 @@ async function main() {
   );
   console.log(`Accounts with stored pairing (ttlincome2 > 0): ${rows.length}\n`);
 
-  let overCount = 0;
-  let overTotal = 0;
+  const CODE = { 1: 'PD', 2: 'FS', 3: 'CD' };
+  let overCount = 0, overTotal = 0;
+  let earnerCount = 0, earnerTotal = 0; // ineligible EARNERS (FS / unpaid-CD) with stored pairing
   const samples = [];
+  const earnerSamples = [];
   let scanned = 0;
 
   for (const r of rows) {
@@ -46,8 +48,16 @@ async function main() {
     // eslint-disable-next-line no-await-in-loop
     try { res = await getPairing(Number(r.uid), Number(r.currentaccttype || 0)); }
     catch { continue; }
+    const canEarn = Boolean(res.eligibility && res.eligibility.canEarnPairing);
     const weakLeg = Number(res.pairedPts || 0); // eligible min(L,R) — the hard ceiling
-    if (stored > weakLeg + 1) {
+
+    if (!canEarn && stored > 1) {
+      // The EARNER itself is ineligible (FS / unpaid-CD) — should earn 0 pairing, so
+      // the WHOLE stored amount is wrong.
+      earnerCount += 1;
+      earnerTotal += stored;
+      earnerSamples.push({ uid: r.uid, code: CODE[r.codeid] || r.codeid, cd: r.cdstatus, stored });
+    } else if (canEarn && stored > weakLeg + 1) {
       overCount += 1;
       const over = stored - weakLeg;
       overTotal += over;
@@ -56,9 +66,15 @@ async function main() {
     if (scanned % 200 === 0) console.error(`  …scanned ${scanned}/${rows.length}`);
   }
 
-  console.log(`OVER-CREDITED (stored ttlincome2 > eligible weak-leg matched): ${overCount}`);
-  console.log(`Total over-credit:  PHP ${overTotal.toFixed(2)}   (= ${(overTotal / 250).toFixed(2)} PV)\n`);
-  console.log('--- worst offenders (up to 30) ---');
+  console.log(`A) INELIGIBLE EARNERS (FS / unpaid-CD) that still have stored pairing: ${earnerCount}`);
+  console.log(`   Their ENTIRE stored pairing is wrong:  PHP ${earnerTotal.toFixed(2)}   (= ${(earnerTotal / 250).toFixed(2)} PV)`);
+  for (const s of earnerSamples.sort((a, b) => b.stored - a.stored).slice(0, 20)) {
+    console.log(`     uid=${s.uid} ${s.code}${s.code === 'CD' ? `(cd=${s.cd})` : ''} stored=${s.stored}`);
+  }
+  console.log('');
+  console.log(`B) ELIGIBLE earners OVER-CREDITED (stored > eligible weak-leg matched): ${overCount}`);
+  console.log(`   Excess over the weak leg:  PHP ${overTotal.toFixed(2)}   (= ${(overTotal / 250).toFixed(2)} PV)\n`);
+  console.log('--- B) worst offenders (up to 30) ---');
   for (const s of samples.sort((a, b) => b.over - a.over).slice(0, 30)) {
     console.log(`  uid=${s.uid} stored=${s.stored} weakLeg(min L,R)=${s.weakLeg} OVER=${s.over}  (L=${s.leftPts} R=${s.rightPts})`);
   }

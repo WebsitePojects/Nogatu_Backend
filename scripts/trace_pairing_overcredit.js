@@ -79,8 +79,13 @@ async function main() {
   const pairedAll = Math.min(allLeft, allRight);
   const pv = (x) => (x / 250).toFixed(2);
 
-  console.log(`ROOT uid=${me.uid} @${me.username} acct=${me.currentaccttype}`);
-  console.log(`stored SMB (ttlincome2) = ${stored}  (= ${pv(stored)} PV)\n`);
+  const canEarn = Boolean(res.eligibility && res.eligibility.canEarnPairing);
+  console.log(`ROOT uid=${me.uid} @${me.username} acct=${me.currentaccttype}  canEarnPairing=${canEarn}`);
+  console.log(`stored SMB (ttlincome2) = ${stored}  (= ${pv(stored)} PV)`);
+  if (!canEarn && stored > 0) {
+    console.log(`*** THIS EARNER IS INELIGIBLE (FS / unpaid-CD) — it should hold 0 pairing; the ENTIRE ${stored} is wrong ***`);
+  }
+  console.log('');
   console.log(`ELIGIBLE legs (PD + fully-paid CD):  L=${eligL}  R=${eligR}  -> matched = ${pairedEligible}  (= ${pv(pairedEligible)} PV)`);
   console.log(`ALL legs (incl FS / unpaid-CD):      L=${allLeft}  R=${allRight}  -> matched = ${pairedAll}  (= ${pv(pairedAll)} PV)\n`);
   console.log(`OVER-CREDIT vs eligible ceiling = ${stored - pairedEligible}  (= ${pv(stored - pairedEligible)} PV)`);
