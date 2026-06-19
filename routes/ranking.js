@@ -4,9 +4,11 @@
  */
 const express = require('express');
 const router = express.Router();
+const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getRankProgress } = require('../services/ranking');
 const { getRankingExplanation } = require('../services/rankingTransparency');
+const { listRankableEventsForMember } = require('../services/rankingRace');
 
 /**
  * GET /api/ranking
@@ -28,6 +30,69 @@ router.get('/explain', memberAuth, async (req, res) => {
     res.json(explanation);
   } catch (err) {
     console.error('[Ranking] Explain error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/ranking/events?page=1&perPage=25
+ * Paginated live ledger of the VALID rankable repurchase events that make up the
+ * member's remaining rankable points — one row per repurchase event with its
+ * remaining (post-consumption) basis points, source member, sponsor depth, date.
+ * Read-only; sourced from listRankableEventsForMember (the same authoritative
+ * basis the rank engine uses), so the table always reconciles to the summary.
+ */
+router.get('/events', memberAuth, async (req, res) => {
+  try {
+    const uid = Number(req.session.uid);
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = Math.min(100, Math.max(5, Number(req.query.perPage) || 25));
+
+    const events = await listRankableEventsForMember(uid);
+    const sorted = [...events].sort((a, b) =>
+      String(b.source_event_ts || '').localeCompare(String(a.source_event_ts || ''))
+      || Number(b.repurchase_id || 0) - Number(a.repurchase_id || 0));
+
+    const total = sorted.length;
+    const totalPoints = sorted.reduce((sum, e) => sum + Number(e.points || 0), 0);
+    const offset = (page - 1) * perPage;
+    const pageRows = sorted.slice(offset, offset + perPage);
+
+    const ids = [...new Set(pageRows.map((r) => Number(r.source_member_uid)).filter(Boolean))];
+    let nameMap = {};
+    if (ids.length) {
+      const [mrows] = await pool.query(
+        `SELECT uid, username,
+                TRIM(CONCAT(COALESCE(firstname,''),' ',COALESCE(lastname,''))) AS fullname
+           FROM memberstab WHERE uid IN (${ids.map(() => '?').join(',')})`,
+        ids
+      );
+      nameMap = Object.fromEntries(mrows.map((m) => [Number(m.uid), m]));
+    }
+
+    res.json({
+      events: pageRows.map((r) => {
+        const m = nameMap[Number(r.source_member_uid)] || null;
+        return {
+          repurchaseId: Number(r.repurchase_id || 0),
+          sourceUid: Number(r.source_member_uid || 0),
+          sourceUsername: m?.username || null,
+          sourceName: (m?.fullname && m.fullname.trim()) || m?.username || `UID ${r.source_member_uid}`,
+          depth: Number(r.source_depth || 0),
+          points: Number(r.points || 0),
+          eventTs: r.source_event_ts,
+          processId: r.source_process_id || null,
+        };
+      }),
+      total,
+      totalPoints,
+      page,
+      perPage,
+      totalPages: Math.max(1, Math.ceil(total / perPage)),
+      basisLabel: 'Remaining rankable repurchase points',
+    });
+  } catch (err) {
+    console.error('[Ranking] Events error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
