@@ -41,6 +41,15 @@ function normalizeVoucherStatus(raw) {
   return ['1', '2', '3', '4'].includes(value) ? Number(value) : 'all';
 }
 
+/**
+ * Human-readable, unique, searchable voucher code derived from the immutable PK.
+ * Display/identity only — never used as a balance/amount key. Kept deterministic
+ * (VCH-<6-digit id>) so it stays collision-free without touching voucherstab.
+ */
+function formatVoucherCode(id) {
+  return `VCH-${String(Number(id) || 0).padStart(6, '0')}`;
+}
+
 function getVoucherActor(req) {
   return {
     actorAdminId: Number(req.session?.adminid || 0) || null,
@@ -80,9 +89,18 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
     }
 
     if (search) {
-      filters.push('(m.username LIKE ? OR CONCAT(v.id, \'\') LIKE ?)');
+      // Match username, the full voucher code (VCH-000123), or the bare numeric id
+      // (so both "VCH-000123", "123", and "vch-123" find the same voucher).
       const pattern = `%${search}%`;
-      params.push(pattern, pattern);
+      const digits = search.replace(/\D/g, '');
+      const ors = ['m.username LIKE ?', "CONCAT('VCH-', LPAD(v.id, 6, '0')) LIKE ?"];
+      const searchParams = [pattern, pattern];
+      if (digits) {
+        ors.push('CAST(v.id AS CHAR) LIKE ?');
+        searchParams.push(`%${digits}%`);
+      }
+      filters.push(`(${ors.join(' OR ')})`);
+      params.push(...searchParams);
     }
 
     const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
@@ -125,6 +143,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
         const expiryMode = getVoucherExpiryMode(row);
         return {
           id: Number(row.id),
+          code: formatVoucherCode(row.id),
           uid: Number(row.uid),
           username: row.username,
           fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,

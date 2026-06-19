@@ -295,9 +295,9 @@ router.post('/reset-password', async (req, res) => {
  * GET /api/auth/session
  * Check current session status
  */
-router.get('/session', (req, res) => {
+router.get('/session', async (req, res) => {
   if (req.session && req.session.uid) {
-    res.json({
+    return res.json({
       authenticated: true,
       user: {
         uid: req.session.uid,
@@ -315,9 +315,52 @@ router.get('/session', (req, res) => {
         accountStatusReason: req.session.accountStatusReason || null,
       },
     });
-  } else {
-    res.json({ authenticated: false });
   }
+
+  // Admin read-only view-as bootstrap: when a valid admin sends X-View-As-Member,
+  // return the TARGET member's identity (with a viewAs flag) so the member portal
+  // renders for the admin. Read-only — all member writes are blocked in memberAuth.
+  if (req.session && req.session.adminid) {
+    const target = Number(req.get('x-view-as-member') || 0);
+    if (Number.isInteger(target) && target > 0) {
+      try {
+        const [rows] = await pool.query(
+          `SELECT u.uid, u.public_uid, u.accttype, u.currentaccttype, u.codeid, u.cdstatus, u.position,
+                  m.username, m.firstname, m.lastname
+             FROM usertab u INNER JOIN memberstab m ON m.uid = u.uid
+            WHERE u.uid = ? AND u.uid = u.mainid LIMIT 1`,
+          [target]
+        );
+        if (rows.length) {
+          const r = rows[0];
+          const accountname = `${r.firstname || ''} ${r.lastname || ''}`.trim() || r.username;
+          return res.json({
+            authenticated: true,
+            viewAs: true,
+            user: {
+              uid: Number(r.uid),
+              publicUid: r.public_uid || null,
+              username: r.username,
+              accountname,
+              shortname: (r.firstname || r.username || '').trim(),
+              accttype: Number(r.accttype || 0),
+              currentaccttype: Number(r.currentaccttype || 0),
+              caccttype: getAccountTypeName(r.currentaccttype || r.accttype),
+              codeid: Number(r.codeid || 0),
+              cdstatus: Number(r.cdstatus || 0),
+              position: Number(r.position || 0),
+              accountStatus: 'active',
+              accountStatusReason: null,
+            },
+          });
+        }
+      } catch (error) {
+        console.error('[Auth] view-as session bootstrap error:', error);
+      }
+    }
+  }
+
+  res.json({ authenticated: false });
 });
 
 module.exports = router;

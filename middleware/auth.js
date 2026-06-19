@@ -40,7 +40,50 @@ async function enforceMemberAccountStatus(req, res) {
   }
 }
 
+/**
+ * Admin read-only "view as member": an authenticated admin may browse a member's
+ * OWN interface by sending the X-View-As-Member: <uid> header. Returns the target
+ * uid only when there is NO real member session (so a logged-in member can never be
+ * impersonated) AND a valid admin session exists. Anything else → null.
+ */
+function resolveAdminViewAs(req) {
+  if (req.session?.uid) return null;       // a real member session always wins
+  if (!req.session?.adminid) return null;  // must be an authenticated admin
+  const target = Number(req.get('x-view-as-member') || 0);
+  return Number.isInteger(target) && target > 0 ? target : null;
+}
+
 function memberAuth(req, res, next) {
+  // Defense in depth (independent of express-session save timing): a clean member
+  // session NEVER carries adminid. If both uid and adminid are present, a prior
+  // view-as override leaked onto the admin session — never honor it as a real member
+  // login (which would allow writes). Strip it so the request is re-evaluated under
+  // the GET-only view-as rules below, where writes are always blocked.
+  if (req.session && req.session.adminid && req.session.uid) {
+    req.session.uid = undefined;
+  }
+
+  // Read-only admin view-as. GET-only (read-only by construction); the uid override
+  // is request-scoped and RESTORED before express-session persists, so the admin's
+  // own session is never mutated and no member write path is ever reachable.
+  const viewAsUid = resolveAdminViewAs(req);
+  if (viewAsUid) {
+    if (req.method !== 'GET') {
+      return res.status(403).json({ error: 'Read-only admin view — changes are disabled.', code: 'VIEW_AS_READONLY' });
+    }
+    const originalUid = req.session.uid;
+    req.session.uid = viewAsUid;
+    req.isAdminViewAs = true;
+    const origEnd = res.end;
+    res.end = function restoreThenEnd(...args) {
+      // Runs BEFORE express-session's own res.end wrapper (mounted earlier), so the
+      // override is undone before the session is written back to the store.
+      try { req.session.uid = originalUid; } catch { /* session gone — ignore */ }
+      return origEnd.apply(this, args);
+    };
+    return next();
+  }
+
   if (!req.session || !req.session.uid) {
     return res.status(401).json({ error: 'Not authenticated', redirect: '/login' });
   }
