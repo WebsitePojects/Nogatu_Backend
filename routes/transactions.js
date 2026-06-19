@@ -15,6 +15,8 @@ const {
 } = require('../services/accountState');
 const { getPackageClaimDetails, getPackageRewardAmounts } = require('../services/income/hifiveBonus');
 const { getUnilevelProductPointContributors } = require('../services/income/unilevel');
+const { getLeadershipTraceability } = require('../services/income/leadership');
+const { getRankingExplanation } = require('../services/rankingTransparency');
 const { pickRowsByExactAmount } = require('../services/transactionTrace');
 
 // First/last day of the calendar month containing dateStr (unilevel is monthly,
@@ -55,6 +57,52 @@ async function resolveUnilevelSourcesForTransaction(uid, tx) {
     note: rows.length === 0
       ? 'Unilevel income exists on this record, but no qualifying downline product-point contributors were found for that month (e.g. legacy import without per-event repurchase rows).'
       : 'Unilevel contributors are your downline product-point repurchases for this payout’s month, compressed to your package reach; each amount is that contributor’s unilevel share.',
+  };
+}
+
+// Leadership contributors: your 1st–5th level downline whose pairing income drives
+// the 5/2/1/1/1% leadership bonus. Real sponsor-tree pairing data (no fabrication).
+async function resolveLeadershipSourcesForTransaction(uid, tx) {
+  const amount = normalizeAmount(tx?.leadership);
+  if (amount <= 0 || !tx) return { rows: [], note: null };
+  const trace = await getLeadershipTraceability(uid).catch(() => ({ rows: [] }));
+  const rows = (trace.rows || []).map((r) => ({
+    uid: Number(r.uid || 0),
+    username: r.username || null,
+    fullName: r.fullName || r.username || `UID ${r.uid}`,
+    level: Number(r.level || 0),
+    ratePercent: Number(r.ratePercent || 0),
+    pairingIncome: Number(r.pairingIncome || 0),
+    leadershipBonus: Number(r.leadershipBonus || 0),
+    amount: Number(r.leadershipBonus || 0),
+  }));
+  return {
+    rows,
+    note: rows.length === 0
+      ? 'Leadership income exists on this record, but no downline pairing sources were found across your 5 leadership levels (e.g. legacy import without per-event pairing totals).'
+      : 'Leadership contributors are your 1st–5th level downline whose pairing income generated this bonus; each amount is the leadership share (5/2/1/1/1%) of that member’s pairing.',
+  };
+}
+
+// Ranking-bonus sources: the downline repurchase events consumed to award your
+// rank(s), from the rank-consumption ledger. Real consumed-event data.
+async function resolveRankingSourcesForTransaction(uid, tx) {
+  const amount = normalizeAmount(tx?.rankingBonus);
+  if (amount <= 0 || !tx) return { rows: [], note: null };
+  const explanation = await getRankingExplanation(uid).catch(() => ({ consumptionEvents: [] }));
+  const rows = (explanation.consumptionEvents || []).map((e) => ({
+    uid: Number(e.sourceMemberUid || 0),
+    username: e.sourceMemberUsername || null,
+    fullName: e.sourceMemberUsername || `UID ${e.sourceMemberUid}`,
+    rankName: e.awardRankName || null,
+    pointsConsumed: Number(e.pointsConsumed || 0),
+    transdate: e.consumedAt || e.sourceEventTs,
+  }));
+  return {
+    rows,
+    note: rows.length === 0
+      ? 'Ranking bonus exists on this record, but the per-event rank-consumption ledger has no rows yet for this account.'
+      : 'Ranking sources are the downline repurchase events consumed to award your rank(s); the points shown are the basis points consumed per source.',
   };
 }
 
@@ -501,7 +549,7 @@ router.get('/:pid', memberAuth, async (req, res) => {
       );
     }
 
-    const [pairingTrace, hiFiveTrace, directReferralTrace, unilevelTrace] = await Promise.all([
+    const [pairingTrace, hiFiveTrace, directReferralTrace, unilevelTrace, leadershipTrace, rankingTrace] = await Promise.all([
       hasPairingIncome && directPairingRows === null
         ? getPairingTrace(uid, Number(req.session.currentaccttype || req.session.accttype || 0), { limit: 40 }).catch(() => ({ rows: [] }))
         : Promise.resolve({ rows: [] }),
@@ -518,6 +566,8 @@ router.get('/:pid', memberAuth, async (req, res) => {
         unilevel: row.income4,
         transdate: row.transdate_full || row.transdate,
       }),
+      resolveLeadershipSourcesForTransaction(uid, { leadership: row.income3 }),
+      resolveRankingSourcesForTransaction(uid, { rankingBonus: row.income6 }),
     ]);
 
     // Narrow the direct ledger rows to the exact subset that sums to THIS payout's
@@ -598,21 +648,21 @@ router.get('/:pid', memberAuth, async (req, res) => {
       },
       supporting: {
         directReferrals: directReferralTrace.rows || [],
-        leadershipSources: [],
+        leadershipSources: leadershipTrace.rows || [],
         pairingTrace: pairingRowsOut,
         hiFiveSources: hiFiveTrace.claims || [],
         hiFiveSummary: hiFiveTrace.summary || null,
         unilevelSources: unilevelTrace.rows || [],
-        rankingSources: [],
+        rankingSources: rankingTrace.rows || [],
         notes: {
           directReferrals: directReferralTrace.note,
-          leadershipSources: Number(row.income3 || 0) > 0 ? 'This payout row does not store exact per-record leadership source rows yet, so unrelated names are intentionally hidden.' : null,
+          leadershipSources: Number(row.income3 || 0) > 0 ? leadershipTrace.note : null,
           pairingTrace: Number(row.income2 || 0) > 0 && pairingRowsOut.length === 0
             ? 'Pairing income exists on this record, but exact contributor rows were not fully preserved in the legacy ledger for this payout.'
             : (pairingApprox ? 'Approximate attribution: the matched-pair events closest to this payout (who most likely triggered this pairing).' : null),
           hiFiveSources: Number(row.income5 || 0) > 0 && (hiFiveTrace.claims || []).length === 0 ? 'Hi-Five income exists on this record, but the exact paid claim source could not be matched from the current legacy data.' : null,
           unilevelSources: Number(row.income4 || 0) > 0 ? unilevelTrace.note : null,
-          rankingSources: Number(row.income6 || 0) > 0 ? 'This payout row does not store exact per-record ranking contributors yet, so unrelated names are intentionally hidden.' : null,
+          rankingSources: Number(row.income6 || 0) > 0 ? rankingTrace.note : null,
         },
       },
     });
