@@ -10,11 +10,14 @@
  */
 const { pool } = require('../config/database');
 
-// TEMPORARY LOCK (2026-06-16): advancement is held at Supervisor 1 (rank 1).
-// Supervisor 2 and above are NOT awarded until the structural "leg" rule (BUG-2 —
-// binary legs vs unilevel direct-lines) is decided and reconciled. This is the SAFE
-// direction (it only blocks promotions, never grants one). Raise/remove to re-enable.
-const MAX_AWARDABLE_RANK = 1;
+// Leg rule decided (2026-06-20): ranking points come purely from the unilevel /
+// repurchase basis (sponsor tree). The BINARY tree's ONLY role in ranking is the
+// both-legs requirement — a rank with left_rank_required / right_rank_required is
+// awarded only when a qualified member exists in BOTH the left and right binary leg
+// (see getSubtreeQualifiedRankCounts + the leftRequirementMet/rightRequirementMet
+// gate below). Cap lifted to the full ladder. Awarded ranks are pending_fulfillment
+// — cash release stays manual.
+const MAX_AWARDABLE_RANK = 10;
 
 function toNumber(value) {
   return Number(value || 0);
@@ -221,7 +224,8 @@ function computeRankAwardsFromEvents({
 
   for (const definition of orderedDefinitions) {
     const rankNo = toNumber(definition.rank);
-    // LOCK: do not award Supervisor 2+ until the BUG-2 leg rule is decided.
+    // Safety ceiling only (full ladder = 10); the real gate is the both-legs
+    // requirement + the points check below.
     if (rankNo > MAX_AWARDABLE_RANK) break;
     if (rankNo <= 0 || rankNo <= currentRank) continue;
 
