@@ -26,6 +26,7 @@ async function main() {
   const { pool } = require('../config/database');
   const { getEffectiveAccountState, countsForPairingSource } = require('../services/accountState');
   const { getPairing } = require('../services/income/pairing');
+  const { getPairingCounts } = require('../services/network');
 
   const [meRows] = await pool.query(
     `SELECT u.uid, u.currentaccttype, m.username, COALESCE(p.ttlincome2,0) AS smb
@@ -87,7 +88,19 @@ async function main() {
   }
   console.log('');
   console.log(`ELIGIBLE legs (PD + fully-paid CD):  L=${eligL}  R=${eligR}  -> matched = ${pairedEligible}  (= ${pv(pairedEligible)} PV)`);
-  console.log(`ALL legs (incl FS / unpaid-CD):      L=${allLeft}  R=${allRight}  -> matched = ${pairedAll}  (= ${pv(pairedAll)} PV)\n`);
+  console.log(`ALL legs (incl FS / unpaid-CD):      L=${allLeft}  R=${allRight}  -> matched = ${pairedAll}  (= ${pv(pairedAll)} PV)`);
+
+  // DISPLAY basis: getPairingCounts (dashboard + pairing-report leg cards) does NOT add
+  // upgrade pairing bonuses; getPairing (SMB) does. If display < engine, the leg PV shown
+  // is below the Matched PV (= SMB/250) — the "left total < matched PV" report.
+  const counts = await getPairingCounts(Number(me.uid));
+  console.log(`DISPLAY basis (getPairingCounts — dashboard/report, NO upgrade bonuses): L=${Number(counts.totalPointsLeft)} R=${Number(counts.totalPointsRight)}`);
+  console.log(`ENGINE  basis (getPairing — SMB, WITH upgrade bonuses):                   L=${eligL} R=${eligR}`);
+  if (Number(counts.totalPointsLeft) < eligL || Number(counts.totalPointsRight) < eligR) {
+    console.log('>>> DISPLAY legs are LOWER than SMB legs — display omits upgrade bonuses, so');
+    console.log('>>> weak-leg PV shows BELOW Matched PV (= SMB/250). Display bug to fix.');
+  }
+  console.log('');
   console.log(`OVER-CREDIT vs eligible ceiling = ${stored - pairedEligible}  (= ${pv(stored - pairedEligible)} PV)`);
   console.log(`(if the old bug counted ALL sources, matched would be ~${pairedAll} — compare to stored ${stored})\n`);
 

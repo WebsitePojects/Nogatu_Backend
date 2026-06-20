@@ -50,15 +50,15 @@ router.get('/events', memberAuth, async (req, res) => {
 
     const events = await listRankableEventsForMember(uid);
     const sorted = [...events].sort((a, b) =>
-      String(b.source_event_ts || '').localeCompare(String(a.source_event_ts || ''))
-      || Number(b.repurchase_id || 0) - Number(a.repurchase_id || 0));
+      String(b.sourceEventTs || '').localeCompare(String(a.sourceEventTs || ''))
+      || Number(b.sourceEventId || 0) - Number(a.sourceEventId || 0));
 
     const total = sorted.length;
     const totalPoints = sorted.reduce((sum, e) => sum + Number(e.points || 0), 0);
     const offset = (page - 1) * perPage;
     const pageRows = sorted.slice(offset, offset + perPage);
 
-    const ids = [...new Set(pageRows.map((r) => Number(r.source_member_uid)).filter(Boolean))];
+    const ids = [...new Set(pageRows.map((r) => Number(r.sourceMemberUid)).filter(Boolean))];
     let nameMap = {};
     if (ids.length) {
       const [mrows] = await pool.query(
@@ -72,16 +72,16 @@ router.get('/events', memberAuth, async (req, res) => {
 
     res.json({
       events: pageRows.map((r) => {
-        const m = nameMap[Number(r.source_member_uid)] || null;
+        const m = nameMap[Number(r.sourceMemberUid)] || null;
         return {
-          repurchaseId: Number(r.repurchase_id || 0),
-          sourceUid: Number(r.source_member_uid || 0),
+          repurchaseId: Number(r.sourceEventId || 0),
+          sourceUid: Number(r.sourceMemberUid || 0),
           sourceUsername: m?.username || null,
-          sourceName: (m?.fullname && m.fullname.trim()) || m?.username || `UID ${r.source_member_uid}`,
-          depth: Number(r.source_depth || 0),
+          sourceName: (m?.fullname && m.fullname.trim()) || m?.username || `UID ${r.sourceMemberUid}`,
+          depth: Number(r.sourceDepth || 0),
           points: Number(r.points || 0),
-          eventTs: r.source_event_ts,
-          processId: r.source_process_id || null,
+          eventTs: r.sourceEventTs,
+          processId: r.sourceProcessId || null,
         };
       }),
       total,
