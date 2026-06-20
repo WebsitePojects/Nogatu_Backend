@@ -121,7 +121,8 @@ router.get('/', memberAuth, async (req, res) => {
     const tracePerPage = Math.min(100, Math.max(10, Number(req.query.tracePerPage) || 50));
     // History table standard: search (date or source username), sort (date|amount), dir.
     const historySearch = String(req.query.historySearch || '').trim().toLowerCase().slice(0, 40);
-    const historySort = String(req.query.historySort || 'date').toLowerCase() === 'amount' ? 'amount' : 'date';
+    const rawHistorySort = String(req.query.historySort || 'date').toLowerCase();
+    const historySort = ['amount', 'package'].includes(rawHistorySort) ? rawHistorySort : 'date';
     const historyDir = String(req.query.historyDir || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
     // Event Trace has its OWN independent search (separate from History's).
     const traceSearch = String(req.query.traceSearch || '').trim().toLowerCase().slice(0, 40);
@@ -197,10 +198,38 @@ router.get('/', memberAuth, async (req, res) => {
       }
     }
 
-    // Search: match the formatted date or either source username.
-    let historyFiltered = historyRowsAll;
+    // One-month viewability: pairing history is browsed a single month at a time.
+    // Build the month list from all rows, default to the most recent month, and
+    // scope to it (search/sort/paginate then operate within that month only).
+    const monthOf = (r) => String(r.pairedAt || '').slice(0, 7);
+    const availableMonths = [...new Set(historyRowsAll.map(monthOf).filter((m) => /^\d{4}-\d{2}$/.test(m)))]
+      .sort().reverse();
+    const requestedMonth = String(req.query.historyMonth || '').trim();
+    // historyMonth=all bypasses the window (full history) — used by the xlsx export.
+    const wantsAll = requestedMonth.toLowerCase() === 'all';
+    const selectedMonth = wantsAll
+      ? null
+      : ((/^\d{4}-\d{2}$/.test(requestedMonth) ? requestedMonth : null) || availableMonths[0] || null);
+    // Optional date RANGE (from/to, YYYY-MM-DD) takes precedence over the month window.
+    const fromStr = String(req.query.historyFrom || '').trim();
+    const toStr = String(req.query.historyTo || '').trim();
+    const hasRange = /^\d{4}-\d{2}-\d{2}$/.test(fromStr) || /^\d{4}-\d{2}-\d{2}$/.test(toStr);
+    const fromMs = /^\d{4}-\d{2}-\d{2}$/.test(fromStr) ? new Date(`${fromStr}T00:00:00`).getTime() : -Infinity;
+    const toMs = /^\d{4}-\d{2}-\d{2}$/.test(toStr) ? new Date(`${toStr}T23:59:59`).getTime() : Infinity;
+    const inRange = (r) => {
+      const t = new Date(r.pairedAt).getTime();
+      return !Number.isNaN(t) && t >= fromMs && t <= toMs;
+    };
+    const historyScoped = hasRange
+      ? historyRowsAll.filter(inRange)
+      : (selectedMonth
+        ? historyRowsAll.filter((r) => monthOf(r) === selectedMonth)
+        : historyRowsAll);
+
+    // Search within the selected month: match the formatted date or either source username.
+    let historyFiltered = historyScoped;
     if (historySearch) {
-      historyFiltered = historyRowsAll.filter((r) => {
+      historyFiltered = historyScoped.filter((r) => {
         const hay = `${String(r.pairedAt || '')} ${String(r.left?.username || '')} ${String(r.right?.username || '')}`.toLowerCase();
         return hay.includes(historySearch);
       });
@@ -211,7 +240,17 @@ router.get('/', memberAuth, async (req, res) => {
     // unstable and the rows — and their decrementing "source remaining" — jumble.
     // matchSeq is the true chronological order each pair was consumed.
     const dirMul = historyDir === 'asc' ? 1 : -1;
+    const PKG_TIER = { Bronze: 10, Silver: 20, Gold: 30, Platinum: 40, Garnet: 50, Diamond: 60 };
+    const pkgKey = (r) => Math.max(
+      Number(r.left?.packageType) || PKG_TIER[r.left?.packageLabel] || 0,
+      Number(r.right?.packageType) || PKG_TIER[r.right?.packageLabel] || 0,
+    );
     historyFiltered = [...historyFiltered].sort((a, b) => {
+      if (historySort === 'package') {
+        const d = pkgKey(a) - pkgKey(b);
+        if (d !== 0) return d * dirMul;
+        return (Number(a.matchSeq || 0) - Number(b.matchSeq || 0)) * dirMul;
+      }
       if (historySort === 'amount') {
         const d = Number(a.creditedIncome || 0) - Number(b.creditedIncome || 0);
         if (d !== 0) return d * dirMul;
@@ -245,6 +284,8 @@ router.get('/', memberAuth, async (req, res) => {
         perPage: historyPerPage,
         total: historyTotal,
         totalPages: historyTotalPages,
+        month: selectedMonth,
+        availableMonths,
       },
       counts: displayCounts,
       trace,

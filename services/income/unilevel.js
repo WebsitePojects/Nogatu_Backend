@@ -18,23 +18,40 @@ const { getPackagePolicy } = require('../packagePolicy');
  * Get total repurchase points for a user in previous month
  * Mirrors PHP get_totalpoints()
  */
-async function getTotalPointsForRange(uid, start, end) {
-  const [rows] = await pool.query(
-    `SELECT SUM(incentivepoints1) as ttlpoints
-     FROM repurchasetab
-     WHERE uid = ?
-       AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
-       AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
-       AND producttype >= 100`,
-    [uid, start, end]
-  );
+async function getTotalPointsForRange(uid, start, end, bucket = null) {
+  // bucket: 'unilevel' (maintenance/income) | 'hifive' | null (all buckets — legacy).
+  // Legacy rows default to maintenance_bucket='unilevel' (V036), so filtering by
+  // 'unilevel' preserves historical unilevel behavior exactly.
+  const run = async (useBucket) => {
+    const bucketSql = useBucket ? 'AND maintenance_bucket = ?' : '';
+    const params = useBucket ? [uid, start, end, bucket] : [uid, start, end];
+    const [rows] = await pool.query(
+      `SELECT SUM(incentivepoints1) as ttlpoints
+       FROM repurchasetab
+       WHERE uid = ?
+         AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+         AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
+         AND producttype >= 100
+         ${bucketSql}`,
+      params
+    );
+    return Number(rows[0]?.ttlpoints || 0);
+  };
 
-  return Number(rows[0]?.ttlpoints || 0);
+  if (!bucket) return run(false);
+  // Deploy-order safety: if maintenance_bucket isn't present yet (pre-V036), fall back
+  // to all-bucket so unilevel income can never break on a column-missing environment.
+  try {
+    return await run(true);
+  } catch (err) {
+    if (err.code === 'ER_BAD_FIELD_ERROR') return run(false);
+    throw err;
+  }
 }
 
 async function getTotalPoints(uid) {
   const { start, end } = previousMonthRange();
-  return getTotalPointsForRange(uid, start, end);
+  return getTotalPointsForRange(uid, start, end, 'unilevel');
 }
 
 /**
@@ -156,7 +173,7 @@ async function calculateUnilevelForWindow(uid, options = {}) {
   if (!start || !end) return 0;
 
   if (requireMaintenance) {
-    const selfPoints = await getTotalPointsForRange(uid, start, end);
+    const selfPoints = await getTotalPointsForRange(uid, start, end, 'unilevel');
     if (selfPoints < 200) return 0;
   }
 
@@ -180,7 +197,7 @@ async function calculateUnilevelForWindow(uid, options = {}) {
     return 0;
   }
 
-  await calculateUnilevel(uid, 1, state, (memberUid) => getTotalPointsForRange(memberUid, start, end));
+  await calculateUnilevel(uid, 1, state, (memberUid) => getTotalPointsForRange(memberUid, start, end, 'unilevel'));
 
   // Rollup compression: pay only the first `maxReach` QUALIFYING levels, at the
   // effective-level rates (5/3/3/2/2/1/1/1/1/1%).
@@ -292,6 +309,7 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
           AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
           AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
           AND producttype >= 100
+          AND maintenance_bucket = 'unilevel'
         GROUP BY uid, producttype
         HAVING product_points > 0
         ORDER BY last_transdate DESC`,

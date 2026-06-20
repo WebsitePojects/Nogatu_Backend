@@ -15,6 +15,17 @@ function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
   return getPackageBinaryValue(currentaccttype);
 }
 
+// Sum a member's upgrade pairing bonuses (upgradetab transtype=1) so the genealogy
+// leg totals include the same upgrade events the SMB engine (getNumLevels) adds —
+// otherwise the dashboard/report weak-leg PV shows BELOW Matched PV (= SMB/250).
+async function sumUpgradePairingPoints(uid) {
+  const [rows] = await pool.query(
+    'SELECT COALESCE(SUM(binarypoints), 0) AS pts FROM upgradetab WHERE uid = ? AND transtype = 1',
+    [uid]
+  );
+  return Number(rows[0]?.pts || 0);
+}
+
 /**
  * Get all downline UIDs recursively via refid (binary tree)
  * Mirrors PHP getNetworklist()
@@ -271,7 +282,10 @@ async function _collectSubtreePairingCounts(parentUid, leg, result) {
 
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (effectiveRow && countsForPairingSource(effectiveRow)) {
-      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      let points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (Number(row.accttype || 0) < Number(effectiveRow.currentaccttype || row.currentaccttype || 0)) {
+        points += await sumUpgradePairingPoints(row.uid);
+      }
       if (leg === 'left') {
         result.totalPointsLeft += Number(points || 0);
       } else {
@@ -302,7 +316,10 @@ async function _collectDescendantPairingCounts(uid, rootLeg, result) {
 
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (effectiveRow && countsForPairingSource(effectiveRow)) {
-      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      let points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (Number(row.accttype || 0) < Number(effectiveRow.currentaccttype || row.currentaccttype || 0)) {
+        points += await sumUpgradePairingPoints(row.uid);
+      }
       if (rootLeg === 'left') {
         result.totalPointsLeft += Number(points || 0);
       } else {
@@ -607,12 +624,80 @@ function flatTreeVersion(nodes) {
   return `${nodes.length}-${(h >>> 0).toString(36)}`;
 }
 
+/**
+ * Unilevel Points Entry History — every repurchase entry (producttype >= 100) made
+ * by any member in rootUid's SPONSOR (drefid) downline: the individual events that
+ * sum into the account's "points passed to upline" total. Read-only / display only;
+ * sums existing repurchasetab points and mutates no income or balance. Paginated,
+ * newest-first, plus the grand total points + entry count across the WHOLE history.
+ */
+async function getUnilevelPointsHistory(rootUid, { page = 1, perPage = 50 } = {}) {
+  const root = Number(rootUid);
+  if (!root) return { rows: [], total: 0, totalPoints: 0, page: 1, perPage: 50, totalPages: 1 };
+  const size = Math.min(200, Math.max(1, Number(perPage) || 50));
+  const currentPage = Math.max(1, Number(page) || 1);
+  const offset = (currentPage - 1) * size;
+
+  const treeCte = `
+    WITH RECURSIVE sponsor_tree AS (
+      SELECT uid, 0 AS depth FROM usertab WHERE uid = ?
+      UNION ALL
+      SELECT u.uid, st.depth + 1 FROM usertab u
+        INNER JOIN sponsor_tree st ON u.drefid = st.uid AND u.uid <> st.uid
+      WHERE st.depth < 30
+    )`;
+
+  const [[agg]] = await pool.query(
+    `${treeCte}
+     SELECT COUNT(*) AS total, COALESCE(SUM(rp.incentivepoints1), 0) AS totalPoints
+     FROM repurchasetab rp
+     INNER JOIN sponsor_tree st ON st.uid = rp.uid AND st.depth > 0
+     WHERE rp.producttype >= 100 AND COALESCE(rp.incentivepoints1, 0) > 0`,
+    [root]
+  );
+
+  const [rows] = await pool.query(
+    `${treeCte}
+     SELECT rp.id, rp.uid AS source_uid, st.depth, rp.producttype,
+            rp.incentivepoints1 AS points,
+            DATE_FORMAT(rp.transdate, '%Y-%m-%d %H:%i') AS transdate,
+            m.username, m.firstname, m.lastname
+     FROM repurchasetab rp
+     INNER JOIN sponsor_tree st ON st.uid = rp.uid AND st.depth > 0
+     LEFT JOIN memberstab m ON m.uid = rp.uid
+     WHERE rp.producttype >= 100 AND COALESCE(rp.incentivepoints1, 0) > 0
+     ORDER BY rp.transdate DESC, rp.id DESC
+     LIMIT ?, ?`,
+    [root, offset, size]
+  );
+
+  const total = Number(agg.total || 0);
+  return {
+    rows: rows.map((r) => ({
+      id: Number(r.id),
+      sourceUid: Number(r.source_uid),
+      username: r.username,
+      fullName: `${r.firstname || ''} ${r.lastname || ''}`.trim() || null,
+      depth: Number(r.depth),
+      productType: Number(r.producttype),
+      points: Number(r.points || 0),
+      date: r.transdate,
+    })),
+    total,
+    totalPoints: Number(agg.totalPoints || 0),
+    page: currentPage,
+    perPage: size,
+    totalPages: Math.max(1, Math.ceil(total / size)),
+  };
+}
+
 module.exports = {
   getNetworkList,
   getNetworkMembersDetailed,
   getGenealogyTree,
   getUnilevelTree,
   getSubtreeFlat,
+  getUnilevelPointsHistory,
   flatTreeVersion,
   isInNetwork,
   isInSponsorNetwork,

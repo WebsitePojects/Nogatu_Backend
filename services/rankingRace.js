@@ -10,11 +10,14 @@
  */
 const { pool } = require('../config/database');
 
-// TEMPORARY LOCK (2026-06-16): advancement is held at Supervisor 1 (rank 1).
-// Supervisor 2 and above are NOT awarded until the structural "leg" rule (BUG-2 —
-// binary legs vs unilevel direct-lines) is decided and reconciled. This is the SAFE
-// direction (it only blocks promotions, never grants one). Raise/remove to re-enable.
-const MAX_AWARDABLE_RANK = 1;
+// Leg rule decided (2026-06-20): ranking points come purely from the unilevel /
+// repurchase basis (sponsor tree). The BINARY tree's ONLY role in ranking is the
+// both-legs requirement — a rank with left_rank_required / right_rank_required is
+// awarded only when a qualified member exists in BOTH the left and right binary leg
+// (see getSubtreeQualifiedRankCounts + the leftRequirementMet/rightRequirementMet
+// gate below). Cap lifted to the full ladder. Awarded ranks are pending_fulfillment
+// — cash release stays manual.
+const MAX_AWARDABLE_RANK = 10;
 
 function toNumber(value) {
   return Number(value || 0);
@@ -221,7 +224,8 @@ function computeRankAwardsFromEvents({
 
   for (const definition of orderedDefinitions) {
     const rankNo = toNumber(definition.rank);
-    // LOCK: do not award Supervisor 2+ until the BUG-2 leg rule is decided.
+    // Safety ceiling only (full ladder = 10); the real gate is the both-legs
+    // requirement + the points check below.
     if (rankNo > MAX_AWARDABLE_RANK) break;
     if (rankNo <= 0 || rankNo <= currentRank) continue;
 
@@ -303,10 +307,31 @@ function summarizeAchievementStatus(achievements = []) {
   };
 }
 
+/**
+ * Display-only basis correction for the ranking snapshot (V023 rule #3).
+ *
+ * The rankable-event pool nets a member's OWN already-credited consumption out of
+ * GROSS (via rank_global_consumptiontab). Re-subtracting that own consumption as
+ * CONSUMED double-counts it and floors REMAINING to 0 for ranked members. Add the
+ * own PRIOR consumption back into the displayed gross so:
+ *     GROSS     = rawDownline - others_consumed
+ *     REMAINING = GROSS - own_consumed
+ * New consumption from the current rebuild (newConsumedPoints) is NOT added back —
+ * those points came from the live event pool and are correctly already excluded.
+ * Pure + award-neutral: rank awards are gated by the event pool, never by these.
+ */
+function computeDisplayBasis({ grossRankablePoints = 0, consumedPoints = 0, newConsumedPoints = 0 } = {}) {
+  const ownPriorConsumed = Math.max(0, toNumber(consumedPoints) - toNumber(newConsumedPoints));
+  const displayGross     = toNumber(grossRankablePoints) + ownPriorConsumed;
+  const displayRemaining = Math.max(0, displayGross - toNumber(consumedPoints));
+  return { displayGross, displayRemaining };
+}
+
 module.exports = {
   listRankableEventsForMember,
   sortRankableEvents,
   consumePointsForRank,
   computeRankAwardsFromEvents,
+  computeDisplayBasis,
   summarizeAchievementStatus,
 };
