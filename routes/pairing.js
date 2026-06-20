@@ -121,7 +121,8 @@ router.get('/', memberAuth, async (req, res) => {
     const tracePerPage = Math.min(100, Math.max(10, Number(req.query.tracePerPage) || 50));
     // History table standard: search (date or source username), sort (date|amount), dir.
     const historySearch = String(req.query.historySearch || '').trim().toLowerCase().slice(0, 40);
-    const historySort = String(req.query.historySort || 'date').toLowerCase() === 'amount' ? 'amount' : 'date';
+    const rawHistorySort = String(req.query.historySort || 'date').toLowerCase();
+    const historySort = ['amount', 'package'].includes(rawHistorySort) ? rawHistorySort : 'date';
     const historyDir = String(req.query.historyDir || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
     // Event Trace has its OWN independent search (separate from History's).
     const traceSearch = String(req.query.traceSearch || '').trim().toLowerCase().slice(0, 40);
@@ -239,7 +240,17 @@ router.get('/', memberAuth, async (req, res) => {
     // unstable and the rows — and their decrementing "source remaining" — jumble.
     // matchSeq is the true chronological order each pair was consumed.
     const dirMul = historyDir === 'asc' ? 1 : -1;
+    const PKG_TIER = { Bronze: 10, Silver: 20, Gold: 30, Platinum: 40, Garnet: 50, Diamond: 60 };
+    const pkgKey = (r) => Math.max(
+      Number(r.left?.packageType) || PKG_TIER[r.left?.packageLabel] || 0,
+      Number(r.right?.packageType) || PKG_TIER[r.right?.packageLabel] || 0,
+    );
     historyFiltered = [...historyFiltered].sort((a, b) => {
+      if (historySort === 'package') {
+        const d = pkgKey(a) - pkgKey(b);
+        if (d !== 0) return d * dirMul;
+        return (Number(a.matchSeq || 0) - Number(b.matchSeq || 0)) * dirMul;
+      }
       if (historySort === 'amount') {
         const d = Number(a.creditedIncome || 0) - Number(b.creditedIncome || 0);
         if (d !== 0) return d * dirMul;

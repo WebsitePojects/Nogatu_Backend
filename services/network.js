@@ -15,6 +15,17 @@ function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
   return getPackageBinaryValue(currentaccttype);
 }
 
+// Sum a member's upgrade pairing bonuses (upgradetab transtype=1) so the genealogy
+// leg totals include the same upgrade events the SMB engine (getNumLevels) adds —
+// otherwise the dashboard/report weak-leg PV shows BELOW Matched PV (= SMB/250).
+async function sumUpgradePairingPoints(uid) {
+  const [rows] = await pool.query(
+    'SELECT COALESCE(SUM(binarypoints), 0) AS pts FROM upgradetab WHERE uid = ? AND transtype = 1',
+    [uid]
+  );
+  return Number(rows[0]?.pts || 0);
+}
+
 /**
  * Get all downline UIDs recursively via refid (binary tree)
  * Mirrors PHP getNetworklist()
@@ -271,7 +282,10 @@ async function _collectSubtreePairingCounts(parentUid, leg, result) {
 
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (effectiveRow && countsForPairingSource(effectiveRow)) {
-      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      let points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (Number(row.accttype || 0) < Number(effectiveRow.currentaccttype || row.currentaccttype || 0)) {
+        points += await sumUpgradePairingPoints(row.uid);
+      }
       if (leg === 'left') {
         result.totalPointsLeft += Number(points || 0);
       } else {
@@ -302,7 +316,10 @@ async function _collectDescendantPairingCounts(uid, rootLeg, result) {
 
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (effectiveRow && countsForPairingSource(effectiveRow)) {
-      const points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      let points = resolveGenealogyPoints(effectiveRow.currentaccttype, effectiveRow.binarypoints);
+      if (Number(row.accttype || 0) < Number(effectiveRow.currentaccttype || row.currentaccttype || 0)) {
+        points += await sumUpgradePairingPoints(row.uid);
+      }
       if (rootLeg === 'left') {
         result.totalPointsLeft += Number(points || 0);
       } else {
