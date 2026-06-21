@@ -22,6 +22,11 @@ const { loadBackendEnv, getDbConfig } = require('./env');
 
 const peso = (n) => '₱' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+// codestab.productamount is 0 for repurchase products, so the peso VALUE comes from the catalog price.
+const { MAINTENANCE_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
+const PRODUCT_CODES = MAINTENANCE_PRODUCT_CATALOG.map((p) => Number(p.code));
+const PRODUCT_PRICE = Object.fromEntries(MAINTENANCE_PRODUCT_CATALOG.map((p) => [Number(p.code), Number(p.price)]));
+
 async function main() {
   const envFile = loadBackendEnv();
   const cfg = getDbConfig();
@@ -51,18 +56,25 @@ async function main() {
         WHERE codestatus = 2 AND producttype >= 10 AND producttype <= 90 AND YEAR(dateused) = ?`,
       [y]
     );
-    const [[newR]] = await pool.query(
-      `SELECT COALESCE(SUM(productamount),0) AS s, COUNT(*) AS c
+    const ph = PRODUCT_CODES.map(() => '?').join(',');
+    const [newRows] = await pool.query(
+      `SELECT producttype, COUNT(*) AS cnt
          FROM codestab
-        WHERE codestatus = 2 AND producttype >= 100 AND producttype < 200 AND YEAR(dateused) = ?`,
-      [y]
+        WHERE codestatus = 2 AND producttype IN (${ph}) AND YEAR(dateused) = ?
+        GROUP BY producttype`,
+      [...PRODUCT_CODES, y]
     );
-    const oldSales = Number(oldR.s || 0), newSales = Number(newR.s || 0);
+    let newSales = 0, newRowCount = 0;
+    for (const r of newRows) {
+      newSales += Number(r.cnt || 0) * Number(PRODUCT_PRICE[Number(r.producttype)] || 0);
+      newRowCount += Number(r.cnt || 0);
+    }
+    const oldSales = Number(oldR.s || 0);
     const oldPool = oldSales * 0.02, newPool = newSales * 0.02;
     console.log(
       `${y} | ${peso(oldSales).padStart(18)} | ${peso(oldPool).padStart(11)} | ` +
       `${peso(newSales).padStart(18)} | ${peso(newPool).padStart(11)} | ${peso(newPool - oldPool)}` +
-      `   (old rows=${oldR.c}, new rows=${newR.c})`
+      `   (old rows=${oldR.c}, new rows=${newRowCount})`
     );
   }
 
@@ -76,9 +88,12 @@ async function main() {
       ORDER BY producttype`
   );
   for (const r of byType) {
-    const bucket = (r.producttype >= 100 && r.producttype < 200) ? 'PRODUCT (NEW basis)'
+    const isProduct = PRODUCT_PRICE[Number(r.producttype)] != null;
+    const bucket = isProduct ? 'PRODUCT (NEW basis, catalog-priced)'
       : (r.producttype >= 10 && r.producttype <= 90) ? 'package (OLD basis)' : 'other';
-    console.log(`  producttype ${String(r.producttype).padStart(4)} | rows=${String(r.c).padStart(7)} | sum=${peso(r.s).padStart(18)} | ${bucket}`);
+    // Products: value = rows * catalog price (productamount is 0 in codestab). Packages: SUM(productamount).
+    const value = isProduct ? Number(r.c || 0) * Number(PRODUCT_PRICE[Number(r.producttype)] || 0) : Number(r.s || 0);
+    console.log(`  producttype ${String(r.producttype).padStart(4)} | rows=${String(r.c).padStart(7)} | value=${peso(value).padStart(18)} | ${bucket}`);
   }
 
   // Under-count probe (reviewer 🟡): used PRODUCT codes with NULL dateused are genuinely

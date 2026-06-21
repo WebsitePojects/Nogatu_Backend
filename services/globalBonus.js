@@ -12,6 +12,13 @@ const { MAINTENANCE_PRODUCT_CATALOG } = require('../constants/maintenanceProduct
 // admin-error 150) can NEVER silently inflate the pool (reviewer 🟡, 2026-06-21).
 const REPURCHASE_PRODUCT_CODES = MAINTENANCE_PRODUCT_CATALOG.map((p) => Number(p.code));
 
+// Peso VALUE per repurchase product comes from the catalog price, NOT codestab.productamount:
+// proven on staging 2026-06-21 that productamount is 0 for every used repurchase product code
+// (the maintenance generation path leaves it 0), so SUM(productamount) would zero the pool.
+const REPURCHASE_PRODUCT_PRICE = Object.fromEntries(
+  MAINTENANCE_PRODUCT_CATALOG.map((p) => [Number(p.code), Number(p.price)])
+);
+
 const STOCKIST_PORTIONS = {
   2: { points: 1, label: 'Mobile Stockist' },
   3: { points: 2, label: 'City Stockist' },
@@ -183,14 +190,19 @@ function getPortionDetails(userRow, rankLevel) {
 async function getAnnualNetSales(year) {
   const placeholders = REPURCHASE_PRODUCT_CODES.map(() => '?').join(',');
   const [rows] = await pool.query(
-    `SELECT COALESCE(SUM(productamount), 0) AS totalNetSales
-     FROM codestab
-     WHERE codestatus = 2
-       AND producttype IN (${placeholders})
-       AND YEAR(dateused) = ?`,
+    `SELECT producttype, COUNT(*) AS cnt
+       FROM codestab
+      WHERE codestatus = 2
+        AND producttype IN (${placeholders})
+        AND YEAR(dateused) = ?
+      GROUP BY producttype`,
     [...REPURCHASE_PRODUCT_CODES, year]
   );
-  return toMoney(rows[0]?.totalNetSales || 0);
+  let total = 0;
+  for (const r of rows) {
+    total += Number(r.cnt || 0) * Number(REPURCHASE_PRODUCT_PRICE[Number(r.producttype)] || 0);
+  }
+  return toMoney(total);
 }
 
 async function getEligibleMemberRows() {
