@@ -47,9 +47,26 @@ async function main() {
   );
   console.log(`candidate sponsors (>=5 directs): ${cands.length}\n`);
 
-  // ── Bucket A: un-submitted qualified sets (auto-credit-on-load) ──
+  // Batch-fetch lifetime hi-five already paid (ttlincome5) for all candidates — the
+  // authoritative "already paid" basis. Reconcile against it so legacy/manual hi-five
+  // payments (not tracked in hifive_qualificationstab) are NOT credited again.
+  const ids = cands.map((c) => Number(c.uid)).filter(Boolean);
+  const paidMap = new Map();
+  if (ids.length) {
+    const [pr] = await pool.query(
+      `SELECT uid, COALESCE(ttlincome5,0) AS paid FROM payouttotaltab WHERE uid IN (${ids.map(() => '?').join(',')})`,
+      ids
+    );
+    for (const r of pr) paidMap.set(Number(r.uid), Number(r.paid || 0));
+  }
+
+  // ── Bucket A: qualified hi-five, reconciled against ttlincome5 (monotonic) ──
+  //   entitlement = SUM(qualifiedSets * reward)  (total hi-five ever earned)
+  //   naive       = SUM(availableClaims * reward) (qualified minus Node-claimed)
+  //   owed        = max(0, entitlement - ttlincome5)  (the SAFE figure — never double-pays)
   const bucketA = [];
-  let totalA = 0;
+  let totalNaive = 0;   // claimedSets model (what the first report showed)
+  let totalOwed = 0;    // ttlincome5-reconciled (safe)
   let scanned = 0;
   for (const c of cands) {
     scanned += 1;
@@ -57,16 +74,22 @@ async function main() {
     const status = await buildHiFiveStatus(Number(c.uid)).catch(() => null);
     const pkg = status?.packageBonus;
     if (!pkg) continue;
-    const amt = Number(pkg.totalAvailableCashAmount || 0);
-    if (amt >= 1) {
-      const detail = (pkg.packages || []).filter((p) => Number(p.availableClaims) > 0)
+    const packages = pkg.packages || [];
+    const entitlement = packages.reduce((s, p) => s + Number(p.qualifiedSets || 0) * Number(p.rewardAmount || 0), 0);
+    const naive = Number(pkg.totalAvailableCashAmount || 0);
+    const paid = Number(paidMap.get(Number(c.uid)) || 0);
+    const owed = Math.max(0, entitlement - paid);
+    if (naive >= 1 || owed >= 1) {
+      const detail = packages.filter((p) => Number(p.availableClaims) > 0)
         .map((p) => `${p.name}:${p.availableClaims}x${p.rewardAmount}`).join(' ');
-      bucketA.push({ uid: c.uid, username: c.username, amt, detail });
-      totalA += amt;
+      bucketA.push({ uid: c.uid, username: c.username, naive, entitlement, paid, owed, detail });
+      totalNaive += naive;
+      totalOwed += owed;
     }
     if (scanned % 50 === 0) process.stdout.write(`  …${scanned}/${cands.length}\r`);
   }
-  bucketA.sort((a, b) => b.amt - a.amt);
+  bucketA.sort((a, b) => b.owed - a.owed || b.naive - a.naive);
+  const totalA = totalOwed;
 
   // ── Bucket B: existing pending_review package claims ──
   const [pend] = await pool.query(
@@ -90,14 +113,24 @@ async function main() {
 
   const fmt = (n) => Number(n).toLocaleString('en-PH', { minimumFractionDigits: 2 });
 
-  console.log(`\n========== HI-FIVE AUTO-CREDIT EXPOSURE (read-only) ==========`);
-  console.log(`A. un-submitted qualified sets (auto-credit on wallet load): members=${bucketA.length}  total=${fmt(totalA)}`);
-  console.log(`B. existing pending_review claims (credit by approving):     rows=${bucketB.length}  total=${fmt(totalB)}`);
-  console.log(`GRAND TOTAL hi-five that would be credited:                  ${fmt(totalA + totalB)}\n`);
+  const legacyPaid = bucketA.filter((a) => a.owed < a.naive - 0.5);
 
-  console.log(`--- top A (un-submitted qualified) ---`);
+  console.log(`\n========== HI-FIVE AUTO-CREDIT EXPOSURE (read-only) ==========`);
+  console.log(`A. qualified hi-five (un-submitted sets):`);
+  console.log(`     NAIVE  (claimedSets model, first report):        ${fmt(totalNaive)}`);
+  console.log(`     OWED   (reconciled vs ttlincome5 — SAFE basis):  ${fmt(totalOwed)}   <-- credit only this`);
+  console.log(`     members with owed>0: ${bucketA.filter((a) => a.owed >= 1).length}`);
+  console.log(`     members where legacy hi-five already paid (owed < naive): ${legacyPaid.length}` +
+    `  (naive would DOUBLE-PAY ${fmt(legacyPaid.reduce((s, a) => s + (a.naive - a.owed), 0))})`);
+  console.log(`B. existing pending_review claims (credit by approving):     rows=${bucketB.length}  total=${fmt(totalB)}`);
+  console.log(`GRAND TOTAL (safe) = owed A + B:                             ${fmt(totalOwed + totalB)}\n`);
+
+  console.log(`--- top A (by owed) ---`);
+  console.log(`  uid        username           owed         (naive / entitlement / alreadyPaid)  detail`);
   for (const a of bucketA.slice(0, 30)) {
-    console.log(`  uid=${String(a.uid).padEnd(9)} @${String(a.username).slice(0, 16).padEnd(16)} ${fmt(a.amt).padStart(12)}  ${a.detail}`);
+    const flag = a.owed < a.naive - 0.5 ? ' [LEGACY-PAID]' : '';
+    console.log(`  ${String(a.uid).padEnd(9)} @${String(a.username).slice(0, 16).padEnd(16)} ${fmt(a.owed).padStart(12)}  ` +
+      `(${fmt(a.naive)} / ${fmt(a.entitlement)} / ${fmt(a.paid)})  ${a.detail}${flag}`);
   }
   if (bucketB.length) {
     console.log(`\n--- top B (pending_review claims) ---`);
@@ -107,8 +140,8 @@ async function main() {
   }
 
   if (opt.csv) {
-    console.log('\n--- CSV A (uid,username,amount,detail) ---');
-    for (const a of bucketA) console.log(`A,${a.uid},${a.username},${a.amt},"${a.detail}"`);
+    console.log('\n--- CSV A (uid,username,owed,naive,entitlement,alreadyPaid,detail) ---');
+    for (const a of bucketA) console.log(`A,${a.uid},${a.username},${a.owed},${a.naive},${a.entitlement},${a.paid},"${a.detail}"`);
     console.log('--- CSV B (uid,username,package,sets,amount) ---');
     for (const b of bucketB) console.log(`B,${b.uid},${b.username},${b.pkg},${b.sets},${b.amt}`);
   }
