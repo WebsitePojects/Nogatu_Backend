@@ -111,9 +111,19 @@ router.get('/leg/:side', memberAuth, async (req, res) => {
 router.get('/', memberAuth, async (req, res) => {
   try {
     const uid = Number(req.session.uid);
-    const accttype = Number(req.session.currentaccttype || req.session.accttype || 0);
-    const packagePolicy = getPackagePolicy(accttype);
     const effectiveAccount = await getEffectiveAccountState(uid);
+    // Resolve the package from the member's authoritative usertab record — NOT the session.
+    // Under admin read-only view-as the session's currentaccttype is the admin's (0), which
+    // made a real Silver account render as "Unknown Package Rules". Reading the DB record also
+    // fixes a stale session after an upgrade (member didn't re-login).
+    const accttype = Number(
+      effectiveAccount?.currentaccttype ||
+      effectiveAccount?.accttype ||
+      req.session.currentaccttype ||
+      req.session.accttype ||
+      0
+    );
+    const packagePolicy = getPackagePolicy(accttype);
     const sourceEligible = countsForPairingSource(effectiveAccount);
     const historyPage = Math.max(1, Number(req.query.historyPage || req.query.page) || 1);
     const historyPerPage = Math.min(100, Math.max(10, Number(req.query.historyPerPage || req.query.perPage) || 50));
