@@ -1,6 +1,6 @@
 const MAINTENANCE_PRODUCT_CATALOG = [
   { code: 100, voucherKey: 'bl', hifiveKey: 'bl', name: 'Nogatu Barley Juice', price: 850, incentivePoints: 50 },
-  { code: 101, voucherKey: 'gl', hifiveKey: 'gl', name: 'Nogatu Glow', price: 550, incentivePoints: 45 },
+  { code: 101, voucherKey: 'gl', hifiveKey: 'gl', name: 'Nogatu Glow', price: 580, incentivePoints: 45 },
   { code: 102, voucherKey: 'glc', hifiveKey: 'glc', name: 'Vitamin C with Collagen & Glutathione', price: 500, incentivePoints: 40 },
   { code: 103, voucherKey: 'cm', hifiveKey: 'cm', name: 'Nogatu Coffee Mix', price: 495, incentivePoints: 40 },
   { code: 104, voucherKey: 'cd', hifiveKey: 'cd', name: 'Chocolate Drink Mix', price: 710, incentivePoints: 45 },
