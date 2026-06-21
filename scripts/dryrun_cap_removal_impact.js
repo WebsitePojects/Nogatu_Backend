@@ -45,6 +45,22 @@ async function main() {
   console.log(`mode=${opt.all ? 'ALL Bronze/Silver' : 'near-seal only (>=90% of old seal)'} limit=${opt.limit || 'none'}\n`);
 
   const { pool } = require('../config/database');
+
+  // Force the NEW Bronze/Silver caps in THIS process only (read-only sim), so the dry-run is
+  // accurate even when run on blue — whose on-disk packagePolicy.js may still carry the old
+  // 40k/80k seals. getPairing reads sealingPoint/ceiling at runtime via packagePolicy, so this
+  // override makes getPairing compute the POST-deploy pairing total. It does NOT touch the live
+  // nogatu-mlm process (this is a separate node invocation) and writes nothing.
+  const policy = require('../services/packagePolicy');
+  for (const t of [10, 20]) {
+    if (policy.PACKAGE_POLICY_MAP[t]) {
+      policy.PACKAGE_POLICY_MAP[t].lifetimeIncomeCeiling = 0;
+      policy.PACKAGE_POLICY_MAP[t].sealingPoint = 0;
+    }
+  }
+  console.log('[dry-run] forcing NEW caps in-process: Bronze/Silver sealingPoint=0, lifetimeIncomeCeiling=0');
+  console.log('[dry-run] (read-only simulation — live app + on-disk policy untouched)\n');
+
   const { getPairing } = require('../services/income/pairing');
 
   // Candidate selection. currentaccttype is the live package (post-upgrade); the seal applied
