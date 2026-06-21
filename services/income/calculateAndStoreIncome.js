@@ -120,7 +120,7 @@ async function calculateAndStoreIncome(uid, accttype) {
     // already in ttlincome5 so it never double-pays; new qualifying sets credit here.
     // Runs under the per-uid GET_LOCK held by lockConn (serialized, idempotent).
     try {
-      await autoCreditEligibleHiFivePackages(uid, lockConn);
+      await autoCreditEligibleHiFivePackages(uid);
     } catch (hifiveErr) {
       console.error('[Income] hi-five auto-credit failed for uid', uid, hifiveErr.message);
     }
