@@ -167,12 +167,18 @@ function getPortionDetails(userRow, rankLevel) {
   };
 }
 
+// Global Bonus basis (Minutes concern #6/D, CONFIRMED 2026-06-21): the 2% annual pool is
+// computed from USED repurchase PRODUCT codes ONLY (producttype 100-109 = the maintenance
+// product catalog: Barley…Berry NAD+), scoped to the year by dateused (set when the product
+// is repurchased). Entry PACKAGES (producttype 10-60) and VOUCHERS (tracked in voucher_*tab,
+// never in codestab) are EXCLUDED. Previously this summed packages (producttype 10-90), the
+// inverse of the confirmed rule — see dryrun_globalbonus_basis.js for the proven impact.
 async function getAnnualNetSales(year) {
   const [rows] = await pool.query(
     `SELECT COALESCE(SUM(productamount), 0) AS totalNetSales
      FROM codestab
      WHERE codestatus = 2
-       AND producttype >= 10 AND producttype <= 90
+       AND producttype >= 100 AND producttype < 200
        AND YEAR(dateused) = ?`,
     [year]
   );
