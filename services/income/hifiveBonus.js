@@ -919,11 +919,115 @@ async function submitPackageClaim(uid, packageKey, quantity) {
   return true;
 }
 
+/**
+ * Auto-credit Hi-Five PACKAGE cash on the MONOTONIC basis (mirrors SMB ttlincome2):
+ *
+ *     owed = max(0, totalHiFiveEntitlement - ttlincome5_alreadyPaid)
+ *
+ * where entitlement = SUM over packages of (qualifiedSets * packageReward). It credits `owed`
+ * exactly once; after crediting, ttlincome5 == entitlement so a re-run owes 0. Because the
+ * basis is the authoritative ttlincome5 (which already holds legacy/manual hi-five that has NO
+ * qualification row), this can NEVER double-pay the historical backlog — it only ever pays the
+ * un-paid delta. New qualifying sets raise entitlement and auto-credit on the next load.
+ *
+ * The credit is written to payouthistorytab (transactiontype=1, income5) so it appears in the
+ * member's transaction history (keeping the 1:1 history==totals reconciliation intact).
+ *
+ * MUST be called under the per-uid income lock (calculateAndStoreIncome's GET_LOCK) so two
+ * concurrent page loads cannot both credit the same delta.
+ */
+async function autoCreditEligibleHiFivePackages(uid) {
+  if (!(await hasHiFiveQualificationTable())) return { credited: 0, owed: 0 };
+
+  const status = await buildHiFiveStatus(uid).catch(() => null);
+  const packages = status?.packageBonus?.packages || [];
+  const entitlement = packages.reduce(
+    (sum, p) => sum + Number(p.qualifiedSets || 0) * Number(p.rewardAmount || 0),
+    0
+  );
+  if (entitlement < 1) return { credited: 0, owed: 0, entitlement: 0 };
+
+  // Own transaction + FOR UPDATE on the wallet row makes this atomic AND self-serializing:
+  // a concurrent call blocks on the row lock, then re-reads ttlincome5 (now caught up) and
+  // owes 0 — so it cannot double-credit even outside the income GET_LOCK.
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      'SELECT COALESCE(ttlincome5,0) AS paid, COALESCE(ttlcashbalance,0) AS bal FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [uid]
+    );
+    const alreadyPaid = Number(rows[0]?.paid || 0);
+    const owed = Math.max(0, entitlement - alreadyPaid);
+    if (owed < 1) {
+      await conn.commit();
+      return { credited: 0, owed: 0, entitlement, alreadyPaid };
+    }
+
+    const beginningBalance = Number(rows[0]?.bal || 0);
+    const endingBalance = beginningBalance + owed;
+    const now = nowMySQL();
+    const processKey = createProcessKey(['hifive', 'auto-credit', uid, entitlement]);
+
+    await conn.query(
+      `INSERT INTO payouthistorytab
+       (pid, uid, mainid, beginningbalance, endingbalance, cashbalance,
+        income1, income2, income3, income4, income5, income6,
+        income7, income8, income9, income10,
+        encashment1, tax_1, encashment2, tax_2, encashmentfee, cddeduction,
+        cashstatus, transdate, transactiontype, stockistid, processid)
+       VALUES (NULL, ?, NULL, ?, ?, 0,
+        0, 0, 0, 0, ?, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0,
+        0, ?, 1, 0, ?)`,
+      [uid, beginningBalance, endingBalance, owed, now, processKey]
+    );
+
+    await conn.query(
+      `INSERT INTO payouttotaltab
+       (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
+        ttlcashbalance, ttlpointsbalance, transdate)
+       VALUES (?, NULL, 0, 0, 0, 0, ?, 0, 0, ?, 0, ?)
+       ON DUPLICATE KEY UPDATE
+        ttlincome5 = ttlincome5 + VALUES(ttlincome5),
+        ttlcashbalance = VALUES(ttlcashbalance),
+        transdate = VALUES(transdate)`,
+      [uid, owed, endingBalance, now]
+    );
+
+    try {
+      await conn.query(
+        `INSERT INTO income_eventstab
+         (event_uid, process_key, beneficiary_uid, income_type, source_ref_uid, source_ref_type,
+          gross_amount, tax_deduction, processing_fee, cd_deduction, maintenance_fee,
+          net_amount, status, credited_at)
+         VALUES (?, ?, ?, 'hifive_package', ?, 'hifive_autocredit',
+          ?, 0, 0, 0, 0, ?, 'credited', CURRENT_TIMESTAMP(6))
+         ON DUPLICATE KEY UPDATE event_uid = event_uid`,
+        [createPublicId(), processKey, uid, String(uid), owed, owed]
+      );
+    } catch (ledgerError) {
+      if (ledgerError.code !== 'ER_NO_SUCH_TABLE') throw ledgerError;
+    }
+
+    await conn.commit();
+    return { credited: owed, owed, entitlement, alreadyPaid };
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   PRODUCT_COLS,
   PRODUCT_TYPE_TO_KEY,
   PRODUCT_METADATA,
   PACKAGE_RULES,
+  autoCreditEligibleHiFivePackages,
   summarizeProductReferralRows,
   checkH5Bonus,
   getDirectReferralProductPurchases,
