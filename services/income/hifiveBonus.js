@@ -276,12 +276,15 @@ async function getDirectReferralProductPurchases(uid) {
 async function getMonthlyRedeemedProductSets(uid) {
   const { start, end } = currentMonthRange();
   const claimed = normalizeCountMap(Object.keys(PRODUCT_METADATA));
+  // Scope on the IMMUTABLE creation date (transdate); fall back to redeemdate only for
+  // pre-deploy legacy rows where transdate is NULL. redeemdate alone is unsafe because the
+  // admin process step overwrites it, which would re-scope a redeem into a later month.
   const [rows] = await pool.query(
     `SELECT producttype, COALESCE(SUM(ttlbonus), 0) AS redeemed
        FROM h5historytab
       WHERE uid = ? AND transactiontype = 1
-        AND DATE_FORMAT(redeemdate, '%Y-%m-%d') >= ?
-        AND DATE_FORMAT(redeemdate, '%Y-%m-%d') <= ?
+        AND DATE_FORMAT(COALESCE(transdate, redeemdate), '%Y-%m-%d') >= ?
+        AND DATE_FORMAT(COALESCE(transdate, redeemdate), '%Y-%m-%d') <= ?
       GROUP BY producttype`,
     [uid, start, end]
   );
@@ -929,9 +932,12 @@ async function insertProductRedeem(uid, bonusType, totalBonus) {
     [totalBonus, uid]
   );
 
+  // transdate = IMMUTABLE creation timestamp. redeemdate is later overwritten by the admin
+  // "process" step (routes/admin/redeem.js), so it cannot anchor the monthly reset window —
+  // getMonthlyRedeemedProductSets scopes on transdate instead. (reviewer 🟡, 2026-06-21)
   await pool.query(
-    `INSERT INTO h5historytab (pid, uid, producttype, ttlbonus, redeemstatus, redeemdate, transactiontype, processid)
-     VALUES (NULL, ?, ?, ?, 0, NOW(), 1, ?)`,
+    `INSERT INTO h5historytab (pid, uid, producttype, ttlbonus, redeemstatus, redeemdate, transdate, transactiontype, processid)
+     VALUES (NULL, ?, ?, ?, 0, NOW(), NOW(), 1, ?)`,
     [uid, productType, totalBonus, crypto.randomUUID()]
   );
 
