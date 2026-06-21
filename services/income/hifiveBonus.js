@@ -603,69 +603,87 @@ async function approvePackageClaim(qualificationUid, { adminUid = null, adminNot
     }
 
     const [walletRows] = await conn.query(
-      'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      'SELECT ttlcashbalance, COALESCE(ttlincome5,0) AS paid FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
       [claim.member_uid]
     );
 
+    // MONOTONIC GUARD (2026-06-21): Hi-Five is auto-credited via ttlincome5. Approving a claim
+    // must NEVER pay entitlement that is already in ttlincome5 (legacy + auto-credit), or it
+    // double-pays. Credit only the still-unpaid portion.
+    const alreadyPaid = Number(walletRows[0]?.paid || 0);
+    let hifiveEntitlement = 0;
+    try {
+      const status = await buildHiFiveStatus(claim.member_uid);
+      hifiveEntitlement = (status?.packageBonus?.packages || []).reduce(
+        (sum, p) => sum + Number(p.qualifiedSets || 0) * Number(p.rewardAmount || 0), 0
+      );
+    } catch (_) { hifiveEntitlement = alreadyPaid + Number(formattedClaim.totalPayout || 0); }
+    const remainingOwed = Math.max(0, hifiveEntitlement - alreadyPaid);
+    const creditAmount = Math.min(Number(formattedClaim.totalPayout || 0), remainingOwed);
+
     const beginningBalance = Number(walletRows[0]?.ttlcashbalance || 0);
-    const endingBalance = beginningBalance + formattedClaim.totalPayout;
+    const endingBalance = beginningBalance + creditAmount;
     const now = nowMySQL();
     const processKey = createProcessKey(['hifive', 'package-claim', qualificationUid]);
 
-    await conn.query(
-      `INSERT INTO payouthistorytab
-       (pid, uid, mainid, beginningbalance, endingbalance, cashbalance,
-        income1, income2, income3, income4, income5, income6,
-        income7, income8, income9, income10,
-        encashment1, tax_1, encashment2, tax_2, encashmentfee, cddeduction,
-        cashstatus, transdate, transactiontype, stockistid, processid)
-       VALUES (NULL, ?, NULL, ?, ?, 0,
-        0, 0, 0, 0, ?, 0,
-        0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0,
-        0, ?, 1, 0, ?)`,
-      [
-        claim.member_uid,
-        beginningBalance,
-        endingBalance,
-        formattedClaim.totalPayout,
-        now,
-        processKey,
-      ]
-    );
-
-    await conn.query(
-      `INSERT INTO payouttotaltab
-       (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
-        ttlcashbalance, ttlpointsbalance, transdate)
-       VALUES (?, NULL, 0, 0, 0, 0, ?, 0, 0, ?, 0, ?)
-       ON DUPLICATE KEY UPDATE
-        ttlincome5 = ttlincome5 + VALUES(ttlincome5),
-        ttlcashbalance = VALUES(ttlcashbalance),
-        transdate = VALUES(transdate)`,
-      [claim.member_uid, formattedClaim.totalPayout, endingBalance, now]
-    );
-
-    try {
+    // Only move money for the still-unpaid portion. If creditAmount is 0 (entitlement already
+    // covered by ttlincome5), the claim is still marked paid below but no cash is credited.
+    if (creditAmount > 0) {
       await conn.query(
-        `INSERT INTO income_eventstab
-         (event_uid, process_key, beneficiary_uid, income_type, source_ref_uid, source_ref_type,
-          gross_amount, tax_deduction, processing_fee, cd_deduction, maintenance_fee,
-          net_amount, status, credited_at)
-         VALUES (?, ?, ?, 'hifive_package', ?, 'hifive_qualificationstab',
-          ?, 0, 0, 0, 0, ?, 'credited', CURRENT_TIMESTAMP(6))`,
+        `INSERT INTO payouthistorytab
+         (pid, uid, mainid, beginningbalance, endingbalance, cashbalance,
+          income1, income2, income3, income4, income5, income6,
+          income7, income8, income9, income10,
+          encashment1, tax_1, encashment2, tax_2, encashmentfee, cddeduction,
+          cashstatus, transdate, transactiontype, stockistid, processid)
+         VALUES (NULL, ?, NULL, ?, ?, 0,
+          0, 0, 0, 0, ?, 0,
+          0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0,
+          0, ?, 1, 0, ?)`,
         [
-          createPublicId(),
-          processKey,
           claim.member_uid,
-          qualificationUid,
-          formattedClaim.totalPayout,
-          formattedClaim.totalPayout,
+          beginningBalance,
+          endingBalance,
+          creditAmount,
+          now,
+          processKey,
         ]
       );
-    } catch (ledgerError) {
-      if (ledgerError.code !== 'ER_NO_SUCH_TABLE') {
-        throw ledgerError;
+
+      await conn.query(
+        `INSERT INTO payouttotaltab
+         (uid, mainid, ttlincome1, ttlincome2, ttlincome3, ttlincome4, ttlincome5, ttlincome51, ttlincome6,
+          ttlcashbalance, ttlpointsbalance, transdate)
+         VALUES (?, NULL, 0, 0, 0, 0, ?, 0, 0, ?, 0, ?)
+         ON DUPLICATE KEY UPDATE
+          ttlincome5 = ttlincome5 + VALUES(ttlincome5),
+          ttlcashbalance = VALUES(ttlcashbalance),
+          transdate = VALUES(transdate)`,
+        [claim.member_uid, creditAmount, endingBalance, now]
+      );
+
+      try {
+        await conn.query(
+          `INSERT INTO income_eventstab
+           (event_uid, process_key, beneficiary_uid, income_type, source_ref_uid, source_ref_type,
+            gross_amount, tax_deduction, processing_fee, cd_deduction, maintenance_fee,
+            net_amount, status, credited_at)
+           VALUES (?, ?, ?, 'hifive_package', ?, 'hifive_qualificationstab',
+            ?, 0, 0, 0, 0, ?, 'credited', CURRENT_TIMESTAMP(6))`,
+          [
+            createPublicId(),
+            processKey,
+            claim.member_uid,
+            qualificationUid,
+            creditAmount,
+            creditAmount,
+          ]
+        );
+      } catch (ledgerError) {
+        if (ledgerError.code !== 'ER_NO_SUCH_TABLE') {
+          throw ledgerError;
+        }
       }
     }
 
@@ -709,7 +727,8 @@ async function approvePackageClaim(qualificationUid, { adminUid = null, adminNot
         statusLabel: getClaimStatusLabel('paid'),
         adminNotes: String(adminNotes || '').trim() || 'Approved and paid by admin',
       },
-      creditedAmount: formattedClaim.totalPayout,
+      creditedAmount: creditAmount,
+      alreadyPaidSkipped: Math.max(0, Number(formattedClaim.totalPayout || 0) - creditAmount),
     };
   } catch (error) {
     await conn.rollback();
@@ -888,35 +907,15 @@ async function insertProductRedeem(uid, bonusType, totalBonus) {
 }
 
 async function submitPackageClaim(uid, packageKey, quantity) {
-  if (!(await hasHiFiveQualificationTable())) {
-    throw new Error('Package Hi-Five claims are not ready because the qualification table is missing.');
-  }
-
-  const normalizedKey = String(packageKey || '').toLowerCase();
-  const rule = PACKAGE_RULES_BY_KEY[normalizedKey];
-  if (!rule) {
-    throw new Error('Invalid package Hi-Five type.');
-  }
-
-  const claimCount = Math.max(1, Number(quantity) || 1);
-  const now = new Date().toISOString();
-
-  for (let index = 0; index < claimCount; index += 1) {
-    await pool.query(
-      `INSERT INTO hifive_qualificationstab
-       (qualification_uid, member_uid, hifive_type, trigger_event_uid, package_or_product, qualifying_count, status, suspicious_flags, admin_notes)
-       VALUES (?, ?, 'package', ?, ?, 1, 'pending_review', NULL, ?)`,
-      [
-        crypto.randomUUID(),
-        uid,
-        `package:${normalizedKey}:${now}:${index}:${crypto.randomUUID()}`,
-        normalizedKey,
-        'Member-submitted package Hi-Five cash claim',
-      ]
-    );
-  }
-
-  return true;
+  // DISABLED 2026-06-21: Hi-Five package cash is now AUTO-CREDITED on the monotonic basis
+  // (autoCreditEligibleHiFivePackages: owed = max(0, entitlement - ttlincome5)). Manual claim
+  // submission is gone because approve was additive and would DOUBLE-PAY entitlement that
+  // ttlincome5 already records (legacy + auto-credit). Members no longer submit claims.
+  void uid; void packageKey; void quantity;
+  const err = new Error('Hi-Five package cash is now credited automatically — no claim submission is needed.');
+  err.statusCode = 410;
+  err.code = 'HIFIVE_AUTO_CREDITED';
+  throw err;
 }
 
 /**
