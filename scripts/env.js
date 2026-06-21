@@ -10,7 +10,19 @@ function loadBackendEnv() {
     ? '.env.prod'
     : (fs.existsSync(path.resolve(__dirname, '..', '.env.development')) ? '.env.development' : '.env.dev');
 
-  require('dotenv').config({ path: path.resolve(__dirname, '..', envFile) });
+  const envPath = path.resolve(__dirname, '..', envFile);
+  // Fail LOUD if the selected env file is missing. Without this, a script run with
+  // NODE_ENV=production on a host that has no .env.prod (e.g. GREEN/staging) loads NOTHING,
+  // and getDbConfig() then falls back to defaults that point at the PROD database — the
+  // "looks like prod but is the unconfigured fallback" trap. Refusing beats guessing.
+  if (!fs.existsSync(envPath)) {
+    throw new Error(
+      `[env] ${envFile} not found (NODE_ENV=${process.env.NODE_ENV || 'unset'}). Refusing to run ` +
+      `with an unconfigured environment — this is the trap that would silently target the prod DB. ` +
+      `Use the right NODE_ENV for this host (green: NO NODE_ENV -> .env.dev; blue: NODE_ENV=production -> .env.prod).`
+    );
+  }
+  require('dotenv').config({ path: envPath });
   return envFile;
 }
 
@@ -20,7 +32,9 @@ function getDbConfig() {
     port: Number(process.env.DB_PORT || 3306),
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || process.env.DB_PASS || '',
-    database: process.env.DB_NAME || 'nogatualliance_sysdb',
+    // NO prod-name default: an unset DB_NAME must fail to connect, never silently resolve to
+    // the live production database. loadBackendEnv() above already refuses a missing env file.
+    database: process.env.DB_NAME,
   };
 }
 
