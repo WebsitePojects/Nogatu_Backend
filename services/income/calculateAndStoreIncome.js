@@ -20,6 +20,7 @@ const { insertIncome } = require('./insertIncome');
 const { getEffectiveAccountState } = require('../accountState');
 const { getPackagePolicy } = require('../packagePolicy');
 const { applyLifetimeIncomeCeiling } = require('./incomeCapPolicy');
+const { autoCreditEligibleHiFivePackages } = require('./hifiveBonus');
 
 const INCOME_PAYOUT_FLAGS = {
   unilevel: true,
@@ -112,6 +113,16 @@ async function calculateAndStoreIncome(uid, accttype) {
     // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.
     if (pairingResult.dailyReports && pairingResult.dailyReports.length > 0) {
       await savePairingReport(uid, pairingResult.dailyReports, lockConn);
+    }
+
+    // ── Hi-Five package cash — monotonic auto-credit (no claim request) ──────
+    // owed = max(0, hifiveEntitlement - ttlincome5). Reconciles legacy/manual hi-five
+    // already in ttlincome5 so it never double-pays; new qualifying sets credit here.
+    // Runs under the per-uid GET_LOCK held by lockConn (serialized, idempotent).
+    try {
+      await autoCreditEligibleHiFivePackages(uid, lockConn);
+    } catch (hifiveErr) {
+      console.error('[Income] hi-five auto-credit failed for uid', uid, hifiveErr.message);
     }
 
     // ── Return fresh totals after update ─────────────────────────────
