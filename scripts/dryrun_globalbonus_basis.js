@@ -81,6 +81,24 @@ async function main() {
     console.log(`  producttype ${String(r.producttype).padStart(4)} | rows=${String(r.c).padStart(7)} | sum=${peso(r.s).padStart(18)} | ${bucket}`);
   }
 
+  // Under-count probe (reviewer 🟡): used PRODUCT codes with NULL dateused are genuinely
+  // used but YEAR(dateused)=? silently drops them from the pool. Surface the magnitude so
+  // it is a conscious business call, not a silent loss.
+  console.log('\n--- used products with NULL dateused (silently excluded from every year) ---');
+  try {
+    const [[nd]] = await pool.query(
+      `SELECT COUNT(*) AS c, COALESCE(SUM(productamount),0) AS s
+         FROM codestab
+        WHERE codestatus = 2 AND producttype >= 100 AND producttype <= 109 AND dateused IS NULL`
+    );
+    console.log(`  rows=${nd.c} sum=${peso(nd.s)}` +
+      (Number(nd.c) > 0
+        ? `  ← ${peso(Number(nd.s) * 0.02)} of pool is invisible to the year-scoped basis. Decide: backfill dateused or accept.`
+        : '  ← clean (all used products have a dateused).'));
+  } catch (e) {
+    console.log(`  NULL-dateused probe skipped: ${e.code || e.message}`);
+  }
+
   // Already-distributed pools: stored rows do NOT change; only FUTURE distribution differs.
   console.log('\n--- already-distributed global-bonus pools (retroactive-risk check) ---');
   try {

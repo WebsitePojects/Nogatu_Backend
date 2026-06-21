@@ -4,6 +4,13 @@
  */
 const { pool } = require('../config/database');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
+const { MAINTENANCE_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
+
+// Single source of truth for the repurchase PRODUCT codes that form the Global Bonus
+// basis (Minutes #6/D). Derived from the catalog so adding/removing a product updates
+// the basis automatically — and so a stray producttype outside the catalog (e.g. an
+// admin-error 150) can NEVER silently inflate the pool (reviewer 🟡, 2026-06-21).
+const REPURCHASE_PRODUCT_CODES = MAINTENANCE_PRODUCT_CATALOG.map((p) => Number(p.code));
 
 const STOCKIST_PORTIONS = {
   2: { points: 1, label: 'Mobile Stockist' },
@@ -174,13 +181,14 @@ function getPortionDetails(userRow, rankLevel) {
 // never in codestab) are EXCLUDED. Previously this summed packages (producttype 10-90), the
 // inverse of the confirmed rule — see dryrun_globalbonus_basis.js for the proven impact.
 async function getAnnualNetSales(year) {
+  const placeholders = REPURCHASE_PRODUCT_CODES.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT COALESCE(SUM(productamount), 0) AS totalNetSales
      FROM codestab
      WHERE codestatus = 2
-       AND producttype >= 100 AND producttype < 200
+       AND producttype IN (${placeholders})
        AND YEAR(dateused) = ?`,
-    [year]
+    [...REPURCHASE_PRODUCT_CODES, year]
   );
   return toMoney(rows[0]?.totalNetSales || 0);
 }
@@ -377,8 +385,22 @@ async function calculateGlobalBonus(yearInput, options = {}) {
   };
 }
 
-async function distributeGlobalBonus(yearInput, processId = 'system') {
+async function distributeGlobalBonus(yearInput, processId = 'system', options = {}) {
   await ensureGlobalBonusTables();
+  // Guard: never silently re-distribute a year that was already paid out. Re-running would
+  // overwrite the stored pool and DELETE/re-insert the per-member shares at the CURRENT
+  // basis (now repurchase-products, not packages) — contradicting what members were already
+  // credited/told. Require an explicit force flag with sign-off. (reviewer 🔴, 2026-06-21)
+  const { force = false } = options;
+  const existingPool = await getPoolRecord(yearInput).catch(() => null);
+  if (existingPool && Number(existingPool.status) === 1 && !force) {
+    throw new Error(
+      `Global bonus for year ${existingPool.year} was already distributed` +
+      `${existingPool.distributedDate ? ` on ${existingPool.distributedDate}` : ''}. ` +
+      'Re-distributing would overwrite the stored pool and per-member shares under a ' +
+      'different basis. Pass { force: true } only with explicit sign-off.'
+    );
+  }
   const summary = await calculateGlobalBonus(yearInput);
   const conn = await pool.getConnection();
 
