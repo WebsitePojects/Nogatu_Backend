@@ -75,7 +75,7 @@ async function main() {
   const [hist] = await pool.query(
     `SELECT income5, beginningbalance, endingbalance, transactiontype, transdate, processid
        FROM payouthistorytab WHERE uid=? AND transactiontype=1 AND income5>0
-      ORDER BY id DESC LIMIT 3`, [uid]
+      ORDER BY pid DESC LIMIT 3`, [uid]
   );
   console.log('recent income5 history rows:');
   for (const h of hist) console.log(`   income5=${h.income5} bal ${h.beginningbalance}->${h.endingbalance} date=${String(h.transdate)} pid=${String(h.processid).slice(0,16)}`);
