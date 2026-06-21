@@ -14,6 +14,18 @@ const { pool } = require('../../config/database');
 const { previousMonthRange, currentMonthRange, PRODUCT_TYPES } = require('../../utils/helpers');
 const { getPackagePolicy } = require('../packagePolicy');
 
+// Unilevel is RELEASED on/after the 5th of the month (Asia/Manila), crediting the PREVIOUS
+// month's commission ("released every 5th of the following month"). Before the 5th, settlement
+// returns 0 so nothing is credited early — keeps the released-on-the-5th rule accurate whether
+// it fires on member wallet load or via the monthly cron (scripts/settle_unilevel_month.js).
+const UNILEVEL_RELEASE_DAY = 5;
+
+function isUnilevelReleaseWindow(now = new Date()) {
+  // Manila is a fixed UTC+8 offset (no DST). Read the day-of-month in Manila wall-clock.
+  const manilaDay = new Date(now.getTime() + 8 * 60 * 60 * 1000).getUTCDate();
+  return manilaDay >= UNILEVEL_RELEASE_DAY;
+}
+
 /**
  * Get total repurchase points for a user in previous month
  * Mirrors PHP get_totalpoints()
@@ -225,6 +237,8 @@ async function calculateUnilevelForWindow(uid, options = {}) {
  * @returns {number} Total unilevel income
  */
 async function getUnilevel(uid) {
+  // Released only on/after the 5th (Manila). Before then no prev-month unilevel is settled.
+  if (!isUnilevelReleaseWindow()) return 0;
   const { start, end } = previousMonthRange();
   return calculateUnilevelForWindow(uid, {
     start,
@@ -370,6 +384,8 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
 
 module.exports = {
   getUnilevel,
+  isUnilevelReleaseWindow,
+  UNILEVEL_RELEASE_DAY,
   checkLastMaintenance,
   checkUnilevelTransDate,
   getProjectedCurrentMonthUnilevel,

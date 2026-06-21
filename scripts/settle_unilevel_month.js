@@ -36,7 +36,7 @@ async function main() {
   const limit = Math.max(0, Number(arg('limit')) || 0);
 
   const { pool } = require('../config/database');
-  const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('../services/income/unilevel');
+  const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate, isUnilevelReleaseWindow } = require('../services/income/unilevel');
   const { insertIncome } = require('../services/income/insertIncome');
   const { applyLifetimeIncomeCeiling } = require('../services/income/incomeCapPolicy');
   const { getPackagePolicy } = require('../services/packagePolicy');
@@ -47,6 +47,10 @@ async function main() {
       ORDER BY u.uid ASC ${limit ? `LIMIT ${limit}` : ''}`
   );
   console.log(`[settle-unilevel] ${members.length} member(s)${dryRun ? '  (DRY RUN — no writes)' : ''}`);
+  if (!isUnilevelReleaseWindow()) {
+    console.log('[settle-unilevel] NOTE: it is before the 5th (Manila) — release window is CLOSED.');
+    console.log('[settle-unilevel] getUnilevel() returns 0 until the 5th, so this run credits nothing by design.');
+  }
 
   let credited = 0, creditedAmount = 0, voided = 0, capped = 0, alreadyDone = 0, lockFail = 0, eligible = 0;
 
