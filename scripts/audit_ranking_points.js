@@ -100,11 +100,11 @@ async function sumRepurchasePoints(conn, uids) {
     const ph = slice.map(() => '?').join(',');
     // eslint-disable-next-line no-await-in-loop
     const [[agg]] = await conn.query(
-      `SELECT COUNT(*) AS rows, COALESCE(SUM(incentivepoints1), 0) AS points
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(incentivepoints1), 0) AS points
          FROM repurchasetab WHERE uid IN (${ph})`,
       slice
     );
-    rows += num(agg.rows);
+    rows += num(agg.cnt);
     points += num(agg.points);
   }
   return { rows, points };
@@ -129,10 +129,10 @@ async function auditOne(conn, member) {
 
   // 2. Own repurchases (informational — EXCLUDED from own gross).
   const [[own]] = await conn.query(
-    `SELECT COUNT(*) AS rows, COALESCE(SUM(incentivepoints1),0) AS points FROM repurchasetab WHERE uid = ?`,
+    `SELECT COUNT(*) AS cnt, COALESCE(SUM(incentivepoints1),0) AS points FROM repurchasetab WHERE uid = ?`,
     [uid]
   );
-  console.log(`  own repurchases: ${num(own.rows)} rows, ${num(own.points)} pts (excluded from own ranking — rolls to uplines)`);
+  console.log(`  own repurchases: ${num(own.cnt)} rows, ${num(own.points)} pts (excluded from own ranking — rolls to uplines)`);
 
   // 3. Expected gross = downline repurchase points that should roll UP to this member.
   const descUids = await descendantUids(conn, uid);
