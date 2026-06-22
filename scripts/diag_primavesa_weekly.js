@@ -76,6 +76,7 @@ function weeklyBreakdown(leftPoints, rightPoints, allDates, accttype) {
   let lcounter = 0, rcounter = 0, ttlbpay = 0;
   const weeklyCredits = new Map(), monthlyCredits = new Map();
   const week = new Map(); // weekKey -> { matched, credited }
+  const perDate = [];
 
   for (const date of sortedDates) {
     let lt = 0; for (const lp of leftPoints) if (lp.date === date && (num(lp.codeid) === 1 || num(lp.codeid) === 3)) lt += num(lp.points);
@@ -98,8 +99,15 @@ function weeklyBreakdown(leftPoints, rightPoints, allDates, accttype) {
     ttlbpay += credited;
     const w = week.get(weekKey) || { matched: 0, credited: 0 };
     w.matched += bpay; w.credited += credited; week.set(weekKey, w);
+    if (bpay > 0 || credited > 0) perDate.push({ date: String(date).slice(0, 10), weekKey, matched: bpay, credited });
   }
-  return { week, total: ttlbpay, weeklyCap: maxPay, monthCap };
+  return { week, perDate, total: ttlbpay, weeklyCap: maxPay, monthCap };
+}
+
+const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function weekdayOf(dateStr) {
+  const d = new Date(`${String(dateStr).slice(0, 10)}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) ? '---' : DOW[d.getUTCDay()];
 }
 
 async function main() {
@@ -111,14 +119,22 @@ async function main() {
   const leftPoints = [], rightPoints = [], allDates = new Set(), sideMap = {};
   const totals = { totalleft: 0, totalpointsleft: 0, totalright: 0, totalpointsright: 0 };
   await getNumLevels(uid, 1, leftPoints, rightPoints, allDates, sideMap, totals, getPackagePairingDepthLimit(acct));
-  const { week, total, weeklyCap, monthCap } = weeklyBreakdown(leftPoints, rightPoints, allDates, acct);
+  const { week, perDate, total, weeklyCap, monthCap } = weeklyBreakdown(leftPoints, rightPoints, allDates, acct);
 
   // Validate against the real engine.
   const engine = await getPairing(uid, acct);
 
   console.log(`\nMember uid ${uid}  package code ${acct}  weeklyCap ${weeklyCap}  monthlyCap ${monthCap}`);
   console.log(`Legs: LEFT ${totals.totalpointsleft} pts / RIGHT ${totals.totalpointsright} pts  (matched min)\n`);
-  console.log('  WEEK        MATCHED   CAP      CREDITED   CAPPED-OFF');
+
+  console.log('  PER-DATE (only dates with pairing activity):');
+  console.log('  DATE         DAY   WEEK      MATCHED   EARNED(credited)');
+  for (const r of perDate) {
+    const capped = r.matched - r.credited;
+    console.log(`  ${r.date}   ${weekdayOf(r.date)}   ${r.weekKey}  ${String(r.matched).padStart(8)}  ${String(r.credited).padStart(8)}${capped > 0.5 ? `   (capped ${capped})` : ''}`);
+  }
+
+  console.log('\n  WEEK        MATCHED   CAP      CREDITED   CAPPED-OFF');
   let sumMatched = 0, sumCredited = 0, sumCapped = 0;
   for (const wk of Array.from(week.keys()).sort()) {
     const w = week.get(wk);
