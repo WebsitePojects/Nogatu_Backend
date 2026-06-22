@@ -35,6 +35,22 @@ function monthKeyForDate(dateValue) {
   return String(dateValue).slice(0, 7);
 }
 
+// Comp-plan pairing week = Tuesday 00:00 -> Monday 23:59 (Asia/Manila), matching the encashment
+// window (services/income/encashmentWindow.js getManilaWeekStartUtc). The weekly SMB cap MUST
+// bucket by this Tue-start week, NOT the ISO Monday-start week: using getISOWeek mis-allocated a
+// Monday's earnings into the wrong cap window and wrongly sealed pairing (CONFIRMED 2026-06-22 by
+// management — e.g. Primavesa's Jun 01 (Mon) belongs to the Tue May 26 week, not the Jun 01 ISO
+// week). Pairing groups by whole Manila days, so key each day by the date of the Tuesday that
+// starts its week (Manila is a fixed UTC+8 offset, so the calendar-day key is exact).
+function pairingWeekKey(dateValue) {
+  const ymd = String(dateValue).slice(0, 10);
+  const d = new Date(`${ymd}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return ymd;
+  const daysSinceTue = (d.getUTCDay() - 2 + 7) % 7; // JS getUTCDay(): Tue = 2
+  d.setUTCDate(d.getUTCDate() - daysSinceTue);
+  return d.toISOString().slice(0, 10);
+}
+
 async function getUpgradeAccounts(uid) {
   const [rows] = await pool.query(
     `SELECT uid,
@@ -221,7 +237,8 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
     const transWeek = Number(getISOWeek(date));
     const monthKey = monthKeyForDate(date);
     const bpay = Number(ttlcounter || 0);
-    const weekKey = `${String(date).slice(0, 4)}-W${String(transWeek).padStart(2, '0')}`;
+    // Weekly cap bucket = comp-plan Tue 00:00 -> Mon 23:59 Manila week (NOT ISO Mon-Sun).
+    const weekKey = pairingWeekKey(date);
     const weekRemaining = Math.max(0, maxPay - Number(weeklyCredits.get(weekKey) || 0));
     const monthRemaining = monthCap > 0
       ? Math.max(0, monthCap - Number(monthlyCredits.get(monthKey) || 0))
@@ -462,4 +479,4 @@ async function savePairingReport(uid, reports, conn = pool) {
   }
 }
 
-module.exports = { getPairing, getPairingReport, savePairingReport, totalPairingAmount, PAIRING_CAPS };
+module.exports = { getPairing, getPairingReport, savePairingReport, totalPairingAmount, pairingWeekKey, PAIRING_CAPS };
