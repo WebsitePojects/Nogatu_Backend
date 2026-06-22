@@ -1,8 +1,12 @@
 const { pool } = require('../config/database');
 const events = require('../routes/events');
+const { runRankingEventInOwnTransaction } = require('./rankingEventProcessor');
 
 const POLL_INTERVAL_MS = 1000;
 const LEASE_SECONDS = 30;
+// Grace window before the recovery sweeper adopts a 'processing' marker — long enough
+// for the in-request deferred attempt to finish on its own first.
+const STALE_EVENT_GRACE_SECONDS = 10;
 let workerTimer = null;
 let workerBusy = false;
 
@@ -112,6 +116,50 @@ async function flushPendingRankingOutbox(limit = 20) {
   return publishClaimedRows(await claimRows({ limit }));
 }
 
+/**
+ * Run a repurchase's ranking cascade in its own transaction, then publish the SSE
+ * invalidations so every connected member/admin re-sorts live. Used by BOTH the
+ * post-commit deferred call in the maintenance route and the recovery sweeper.
+ * Idempotent end-to-end (see runRankingEventInOwnTransaction).
+ */
+async function processAndPublishRankingEvent(repurchaseId) {
+  const result = await runRankingEventInOwnTransaction(repurchaseId);
+  try {
+    await flushRankingOutboxForRepurchase(repurchaseId);
+  } catch (error) {
+    console.error('[RankingRealtime] publish after process failed; recovery worker will retry:', error.message);
+  }
+  return result;
+}
+
+/**
+ * Recovery: any repurchase whose post-commit ranking attempt did not finish (server
+ * restart, lock timeout, transient error) leaves a durable 'processing' marker. Adopt
+ * the ones older than the grace window and complete them. This is what makes the live
+ * leaderboard self-healing globally — no operator step required.
+ */
+async function sweepStaleRankingEvents(limit = 20) {
+  const [rows] = await pool.query(
+    `SELECT repurchase_id
+       FROM ranking_event_processstab
+      WHERE status = 'processing'
+        AND started_at < (CURRENT_TIMESTAMP(6) - INTERVAL ? SECOND)
+      ORDER BY started_at ASC
+      LIMIT ?`,
+    [STALE_EVENT_GRACE_SECONDS, Math.max(1, Math.min(100, Number(limit) || 20))]
+  );
+  let processed = 0;
+  for (const row of rows) {
+    try {
+      await processAndPublishRankingEvent(Number(row.repurchase_id));
+      processed += 1;
+    } catch (error) {
+      console.error('[RankingRealtime] stale ranking sweep failed for', row.repurchase_id, error.message);
+    }
+  }
+  return processed;
+}
+
 function startRankingRealtimeWorker() {
   if (workerTimer) return workerTimer;
   workerTimer = setInterval(async () => {
@@ -119,6 +167,7 @@ function startRankingRealtimeWorker() {
     workerBusy = true;
     try {
       await flushPendingRankingOutbox();
+      await sweepStaleRankingEvents();
     } catch (error) {
       console.error('[RankingRealtime] recovery poll failed:', error.message);
     } finally {
@@ -140,6 +189,8 @@ module.exports = {
   publishOutboxRow,
   flushRankingOutboxForRepurchase,
   flushPendingRankingOutbox,
+  processAndPublishRankingEvent,
+  sweepStaleRankingEvents,
   startRankingRealtimeWorker,
   stopRankingRealtimeWorker,
 };

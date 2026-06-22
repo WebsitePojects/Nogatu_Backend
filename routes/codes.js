@@ -11,12 +11,8 @@ const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
 const { listMemberActivationHistory } = require('../services/codeHistory');
 const { refreshMemberRankSnapshot } = require('../services/ranking');
-const {
-  acquireRankingLock,
-  releaseRankingLock,
-  processRepurchaseRankingEvent,
-} = require('../services/rankingEventProcessor');
-const { flushRankingOutboxForRepurchase } = require('../services/rankingRealtime');
+const { recordPendingRankingEvent } = require('../services/rankingEventProcessor');
+const { processAndPublishRankingEvent } = require('../services/rankingRealtime');
 const { getTotalPointsForRange } = require('../services/income/unilevel');
 
 /**
@@ -353,7 +349,6 @@ router.post('/upgrade', memberAuth, async (req, res) => {
  */
 router.post('/maintenance', memberAuth, async (req, res) => {
   let conn;
-  let rankingLockHeld = false;
   try {
     const uid = req.session.uid;
     const code = sanitizeAlphaNum(req.body?.code || '');
@@ -435,33 +430,33 @@ router.post('/maintenance', memberAuth, async (req, res) => {
       processKey: createProcessKey(['code-maintenance-use', code, uid, transType, nowMySQL()]),
     });
 
+    // Phase 1 (in this transaction): durably record that this repurchase OWES ranking
+    // work, so the member's maintenance/hi-five purchase can COMMIT immediately. ALL
+    // maintenance AND hi-five product points roll up to the buyer's sponsor uplines as
+    // ranking points (buyer excluded) — the actual cascade runs AFTER commit so a ranking
+    // hiccup can never block or roll back a member's maintenance (which also gates their
+    // unilevel eligibility).
     const rankingPoints = Number(codeData.unilevelpoints || 0);
     if (rankingPoints > 0) {
-      await acquireRankingLock(conn);
-      rankingLockHeld = true;
-      await processRepurchaseRankingEvent(conn, {
+      await recordPendingRankingEvent(conn, {
         repurchaseId: repurchaseResult.insertId,
         sourceMemberUid: uid,
         points: rankingPoints,
-        maintenanceBucket,
-        transactionType: transType,
       });
     }
 
     await conn.commit();
 
-    // Rebuild ranking snapshot in background — do not block the response
-    if (rankingLockHeld) {
-      try { await releaseRankingLock(conn); } catch (error) {
-        console.error('[Ranking] advisory lock release after commit failed:', error.message);
-      } finally {
-        rankingLockHeld = false;
-      }
-    }
-    // Delivery is best-effort here; the durable outbox worker recovers failures.
+    // Purchase is durable. Drive the LIVE leaderboard now (best-effort, non-blocking):
+    // process the ranking cascade in its own transaction + publish SSE invalidations so
+    // every connected member/admin re-sorts within ~150 ms — anywhere in the world. If
+    // this misses (restart / lock contention), the durable 'processing' marker is swept
+    // by the realtime worker within seconds. Idempotent: ranking is never double-credited.
     if (rankingPoints > 0) {
-      flushRankingOutboxForRepurchase(repurchaseResult.insertId).catch((error) => {
-        console.error('[RankingRealtime] immediate publish failed; recovery worker will retry:', error.message);
+      setImmediate(() => {
+        processAndPublishRankingEvent(repurchaseResult.insertId).catch((error) => {
+          console.error('[RankingRealtime] deferred ranking process failed; recovery worker will retry:', error.message);
+        });
       });
     }
 
@@ -471,11 +466,6 @@ router.post('/maintenance', memberAuth, async (req, res) => {
     console.error('[Codes] Maintenance error:', err);
     res.status(500).json({ error: 'Internal server error' });
   } finally {
-    if (conn && rankingLockHeld) {
-      try { await releaseRankingLock(conn); } catch (error) {
-        console.error('[Ranking] advisory lock release failed:', error.message);
-      }
-    }
     if (conn) conn.release();
   }
 });

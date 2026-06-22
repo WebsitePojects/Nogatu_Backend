@@ -1,3 +1,4 @@
+const { pool } = require('../config/database');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { rebuildRankSnapshot } = require('./ranking');
 const { applyRepurchaseDelta } = require('./rankPoints');
@@ -173,6 +174,84 @@ async function processRepurchaseRankingEvent(conn, event, overrides = {}) {
   return { alreadyProcessed: false, repurchaseId, eventUid, affectedMemberUids: affected };
 }
 
+/**
+ * Phase 1 (inside the purchase transaction): durably record that this repurchase
+ * OWES ranking work — WITHOUT doing the work. Keyed by repurchase_id (PK) so it is
+ * idempotent. This lets the member's maintenance/hi-five purchase COMMIT immediately;
+ * the ranking cascade is run afterwards (best-effort) and, if that misses, the
+ * realtime worker sweeps the committed 'processing' marker. Decoupling this from the
+ * purchase means a ranking hiccup (lock timeout / work limit / restart) can never roll
+ * back or block a member's maintenance (which itself gates their unilevel eligibility).
+ */
+async function recordPendingRankingEvent(conn, event) {
+  const repurchaseId = Number(event?.repurchaseId);
+  const sourceMemberUid = Number(event?.sourceMemberUid);
+  const points = Number(event?.points || 0);
+  if (!repurchaseId || !sourceMemberUid || !Number.isFinite(points) || points <= 0) {
+    return false;
+  }
+  const processKey = createProcessKey(['ranking-repurchase', repurchaseId]);
+  await conn.query(
+    `INSERT INTO ranking_event_processstab
+       (repurchase_id, source_member_uid, points, process_key, status)
+     VALUES (?, ?, ?, ?, 'processing')
+     ON DUPLICATE KEY UPDATE
+       source_member_uid = VALUES(source_member_uid),
+       points = VALUES(points)`,
+    [repurchaseId, sourceMemberUid, points, processKey]
+  );
+  return true;
+}
+
+/**
+ * Phase 2 (AFTER the purchase commit, on its OWN connection/transaction): run the
+ * ranking cascade for a repurchase that has a durable 'processing' marker. Safe to call
+ * repeatedly and from multiple callers at once (the in-request deferred call AND the
+ * recovery sweeper): the per-repurchase `FOR UPDATE` inside processRepurchaseRankingEvent
+ * plus the global advisory lock serialize them, and a 'completed' marker short-circuits
+ * re-runs — so the gross-point delta can NEVER be applied twice. A failure here never
+ * touches the already-committed purchase; the marker simply stays 'processing' for the
+ * next sweep. (applyRepurchaseDelta is non-idempotent on its own, so it is critical that
+ * the delta and the status='completed' write commit together in this single transaction.)
+ */
+async function runRankingEventInOwnTransaction(repurchaseId, deps = {}) {
+  const id = Number(repurchaseId);
+  if (!id) return { skipped: true, reason: 'invalid-id' };
+  const getConnection = deps.getConnection || (() => pool.getConnection());
+  const conn = await getConnection();
+  let lockHeld = false;
+  try {
+    const [[marker]] = await conn.query(
+      `SELECT repurchase_id, source_member_uid, points, status
+         FROM ranking_event_processstab WHERE repurchase_id = ? LIMIT 1`,
+      [id]
+    );
+    if (!marker) return { skipped: true, reason: 'no-marker', repurchaseId: id };
+    if (marker.status === 'completed') {
+      return { skipped: true, reason: 'already-completed', repurchaseId: id };
+    }
+
+    await conn.beginTransaction();
+    await acquireRankingLock(conn);
+    lockHeld = true;
+    const result = await processRepurchaseRankingEvent(conn, {
+      repurchaseId: Number(marker.repurchase_id),
+      sourceMemberUid: Number(marker.source_member_uid),
+      points: Number(marker.points),
+    });
+    await conn.commit();
+    return result;
+  } catch (error) {
+    try { await conn.rollback(); } catch (rollbackError) { /* surface original */ }
+    throw error;
+  } finally {
+    if (lockHeld) {
+      try { await releaseRankingLock(conn); } catch (releaseError) { /* lock auto-frees on disconnect */ }
+    }
+    conn.release();
+  }
+}
+
 module.exports = {
   RANKING_LOCK_NAME,
   MAX_RANKING_WORK_ITEMS,
@@ -181,4 +260,6 @@ module.exports = {
   getSponsorAncestors,
   getBinaryAncestors,
   processRepurchaseRankingEvent,
+  recordPendingRankingEvent,
+  runRankingEventInOwnTransaction,
 };
