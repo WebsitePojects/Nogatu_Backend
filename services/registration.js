@@ -579,11 +579,19 @@ async function registerMember({
       [memberPublicId, memberReferralSlug, newUid]
     ).catch(() => {});
 
+    // C3 FIX: binary_tree_closuretab is load-bearing — the pairing eligibility gate
+    // (canEarnPairing) and placement balancing read it. A swallowed write left the new member
+    // out of the closure with NO error → their sponsor's pairing could never see them (silent
+    // denial). Tolerate ONLY a missing table (legacy env; the recursive fallback covers it);
+    // re-throw any real failure so the whole registration transaction rolls back atomically,
+    // same as every other write here — never create a member with a broken closure.
+    const tolerateMissingClosure = (e) => { if (e && e.code !== 'ER_NO_SUCH_TABLE') throw e; console.warn('[register] binary_tree_closuretab missing — closure row skipped (recursive eligibility fallback applies):', e?.code); };
+
     await conn.query(
       `INSERT IGNORE INTO binary_tree_closuretab (ancestor_uid, descendant_uid, depth, leg)
        VALUES (?, ?, 0, 'self')`,
       [newUid, newUid]
-    ).catch(() => {});
+    ).catch(tolerateMissingClosure);
 
     await conn.query(
       `INSERT IGNORE INTO binary_tree_closuretab (ancestor_uid, descendant_uid, depth, leg)
@@ -592,7 +600,7 @@ async function registerMember({
        FROM binary_tree_closuretab
        WHERE descendant_uid = ?`,
       [newUid, finalPlacementUid, Number(finalPosition) === 1 ? 'left' : 'right', finalPlacementUid]
-    ).catch(() => {});
+    ).catch(tolerateMissingClosure);
 
     await conn.query(
       `INSERT INTO binary_point_eventstab

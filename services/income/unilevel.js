@@ -14,6 +14,18 @@ const { pool } = require('../../config/database');
 const { previousMonthRange, currentMonthRange, PRODUCT_TYPES } = require('../../utils/helpers');
 const { getPackagePolicy } = require('../packagePolicy');
 
+// Unilevel is RELEASED on/after the 5th of the month (Asia/Manila), crediting the PREVIOUS
+// month's commission ("released every 5th of the following month"). Before the 5th, settlement
+// returns 0 so nothing is credited early — keeps the released-on-the-5th rule accurate whether
+// it fires on member wallet load or via the monthly cron (scripts/settle_unilevel_month.js).
+const UNILEVEL_RELEASE_DAY = 5;
+
+function isUnilevelReleaseWindow(now = new Date()) {
+  // Manila is a fixed UTC+8 offset (no DST). Read the day-of-month in Manila wall-clock.
+  const manilaDay = new Date(now.getTime() + 8 * 60 * 60 * 1000).getUTCDate();
+  return manilaDay >= UNILEVEL_RELEASE_DAY;
+}
+
 /**
  * Get total repurchase points for a user in previous month
  * Mirrors PHP get_totalpoints()
@@ -86,13 +98,33 @@ async function checkUnilevelTransDate(uid) {
 /**
  * Update income transaction date after calculation
  */
-async function updateIncomeTransDate(uid, incomeType) {
-  await pool.query(
+async function updateIncomeTransDate(uid, incomeType, conn = pool) {
+  await conn.query(
     `INSERT INTO incometransdatetab (id, uid, incometype, lasttransdate)
      VALUES (NULL, ?, ?, NOW())
      ON DUPLICATE KEY UPDATE lasttransdate = NOW()`,
     [uid, incomeType]
   );
+}
+
+/**
+ * H2 backstop — monotonic per-month guard independent of the incometransdatetab stamp.
+ * True if a unilevel (income4) credit row already exists for this member in the CURRENT
+ * calendar month. Even if the stamp row is deleted/reset, this prevents a second monthly
+ * credit (double-pay). Scoped to the current month because unilevel is released this month
+ * for the previous month's maintenance.
+ */
+async function hasUnilevelCreditedThisMonth(uid, conn = pool) {
+  const { start, end } = currentMonthRange();
+  const [rows] = await conn.query(
+    `SELECT 1 FROM payouthistorytab
+      WHERE uid = ? AND income4 > 0
+        AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+        AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
+      LIMIT 1`,
+    [uid, start, end]
+  );
+  return rows.length > 0;
 }
 
 function addUnilevelPointsToLevelBucket(totals, level, points) {
@@ -212,10 +244,10 @@ async function calculateUnilevelForWindow(uid, options = {}) {
     total += Number(state.pointsByLevel[actualLevel] || 0) * rate;
   }
 
-  if (preventDuplicateCredit && total > 0) {
-    await updateIncomeTransDate(uid, 4);
-  }
-
+  // H1 FIX: do NOT stamp incometransdatetab here. Stamping inside this compute function (on the
+  // autocommitting pool) marked the month "settled" BEFORE the caller actually credited the cash —
+  // so if the insert threw or the cap zeroed it, the month was lost permanently. The stamp now
+  // happens in the caller, in the SAME transaction as the credit, only after the insert succeeds.
   return total;
 }
 
@@ -225,6 +257,8 @@ async function calculateUnilevelForWindow(uid, options = {}) {
  * @returns {number} Total unilevel income
  */
 async function getUnilevel(uid) {
+  // Released only on/after the 5th (Manila). Before then no prev-month unilevel is settled.
+  if (!isUnilevelReleaseWindow()) return 0;
   const { start, end } = previousMonthRange();
   return calculateUnilevelForWindow(uid, {
     start,
@@ -370,8 +404,12 @@ async function getUnilevelProductPointContributors(uid, options = {}) {
 
 module.exports = {
   getUnilevel,
+  isUnilevelReleaseWindow,
+  UNILEVEL_RELEASE_DAY,
   checkLastMaintenance,
   checkUnilevelTransDate,
+  updateIncomeTransDate,
+  hasUnilevelCreditedThisMonth,
   getProjectedCurrentMonthUnilevel,
   getUnilevelProductPointContributors,
   getUnilevelRateForLevel,

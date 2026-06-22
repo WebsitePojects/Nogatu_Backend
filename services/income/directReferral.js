@@ -41,12 +41,14 @@ async function getDREF(uid) {
 
   let totalDref = 0;
   let countByType = { 10: 0, 20: 0, 30: 0, 40: 0, 50: 0, 60: 0 };
+  const eligibleDirectUids = []; // M2: upgrade incentive must follow the same per-row eligibility
 
   for (const row of rows) {
     const effectiveRow = await getEffectiveAccountState(row.uid, row);
     if (!countsForDirectReferralSource(effectiveRow)) {
       continue;
     }
+    eligibleDirectUids.push(Number(row.uid));
 
     totalDref += Number(effectiveRow.directreferral || 0);
     const acctType = Number(effectiveRow.currentaccttype || effectiveRow.accttype || 0);
@@ -66,15 +68,21 @@ async function getDREF(uid) {
   result.hifive = result.bronze + result.silver + result.gold +
                   result.platinum + result.diamond + result.amethyst;
 
-  // Add upgrade incentive points from direct referrals
-  const [upgradeRows] = await pool.query(
-    `SELECT SUM(incentivepoints) as ttlIncentive
-     FROM upgradetab
-     WHERE uid IN (SELECT uid FROM usertab WHERE drefid = ?) AND transtype = 1`,
-    [uid]
-  );
-
-  const upgradeIncentive = Number(upgradeRows[0]?.ttlIncentive || 0);
+  // M2 FIX: add upgrade-incentive points ONLY from directs that ALSO pass the per-row
+  // eligibility filter above. Previously this summed incentives for ALL directs (drefid=?)
+  // regardless of countsForDirectReferralSource, so FS / unpaid-CD directs' upgrade incentives
+  // still inflated the sponsor's DR (over-pay). Now it mirrors the totalDref eligibility.
+  let upgradeIncentive = 0;
+  if (eligibleDirectUids.length > 0) {
+    const placeholders = eligibleDirectUids.map(() => '?').join(',');
+    const [upgradeRows] = await pool.query(
+      `SELECT SUM(incentivepoints) as ttlIncentive
+       FROM upgradetab
+       WHERE uid IN (${placeholders}) AND transtype = 1`,
+      eligibleDirectUids
+    );
+    upgradeIncentive = Number(upgradeRows[0]?.ttlIncentive || 0);
+  }
 
   result.directreferral = totalDref + upgradeIncentive;
 

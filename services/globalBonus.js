@@ -4,6 +4,20 @@
  */
 const { pool } = require('../config/database');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
+const { MAINTENANCE_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
+
+// Single source of truth for the repurchase PRODUCT codes that form the Global Bonus
+// basis (Minutes #6/D). Derived from the catalog so adding/removing a product updates
+// the basis automatically — and so a stray producttype outside the catalog (e.g. an
+// admin-error 150) can NEVER silently inflate the pool (reviewer 🟡, 2026-06-21).
+const REPURCHASE_PRODUCT_CODES = MAINTENANCE_PRODUCT_CATALOG.map((p) => Number(p.code));
+
+// Peso VALUE per repurchase product comes from the catalog price, NOT codestab.productamount:
+// proven on staging 2026-06-21 that productamount is 0 for every used repurchase product code
+// (the maintenance generation path leaves it 0), so SUM(productamount) would zero the pool.
+const REPURCHASE_PRODUCT_PRICE = Object.fromEntries(
+  MAINTENANCE_PRODUCT_CATALOG.map((p) => [Number(p.code), Number(p.price)])
+);
 
 const STOCKIST_PORTIONS = {
   2: { points: 1, label: 'Mobile Stockist' },
@@ -167,16 +181,28 @@ function getPortionDetails(userRow, rankLevel) {
   };
 }
 
+// Global Bonus basis (Minutes concern #6/D, CONFIRMED 2026-06-21): the 2% annual pool is
+// computed from USED repurchase PRODUCT codes ONLY (producttype 100-109 = the maintenance
+// product catalog: Barley…Berry NAD+), scoped to the year by dateused (set when the product
+// is repurchased). Entry PACKAGES (producttype 10-60) and VOUCHERS (tracked in voucher_*tab,
+// never in codestab) are EXCLUDED. Previously this summed packages (producttype 10-90), the
+// inverse of the confirmed rule — see dryrun_globalbonus_basis.js for the proven impact.
 async function getAnnualNetSales(year) {
+  const placeholders = REPURCHASE_PRODUCT_CODES.map(() => '?').join(',');
   const [rows] = await pool.query(
-    `SELECT COALESCE(SUM(productamount), 0) AS totalNetSales
-     FROM codestab
-     WHERE codestatus = 2
-       AND producttype >= 10 AND producttype <= 90
-       AND YEAR(dateused) = ?`,
-    [year]
+    `SELECT producttype, COUNT(*) AS cnt
+       FROM codestab
+      WHERE codestatus = 2
+        AND producttype IN (${placeholders})
+        AND YEAR(dateused) = ?
+      GROUP BY producttype`,
+    [...REPURCHASE_PRODUCT_CODES, year]
   );
-  return toMoney(rows[0]?.totalNetSales || 0);
+  let total = 0;
+  for (const r of rows) {
+    total += Number(r.cnt || 0) * Number(REPURCHASE_PRODUCT_PRICE[Number(r.producttype)] || 0);
+  }
+  return toMoney(total);
 }
 
 async function getEligibleMemberRows() {
@@ -371,8 +397,22 @@ async function calculateGlobalBonus(yearInput, options = {}) {
   };
 }
 
-async function distributeGlobalBonus(yearInput, processId = 'system') {
+async function distributeGlobalBonus(yearInput, processId = 'system', options = {}) {
   await ensureGlobalBonusTables();
+  // Guard: never silently re-distribute a year that was already paid out. Re-running would
+  // overwrite the stored pool and DELETE/re-insert the per-member shares at the CURRENT
+  // basis (now repurchase-products, not packages) — contradicting what members were already
+  // credited/told. Require an explicit force flag with sign-off. (reviewer 🔴, 2026-06-21)
+  const { force = false } = options;
+  const existingPool = await getPoolRecord(yearInput).catch(() => null);
+  if (existingPool && Number(existingPool.status) === 1 && !force) {
+    throw new Error(
+      `Global bonus for year ${existingPool.year} was already distributed` +
+      `${existingPool.distributedDate ? ` on ${existingPool.distributedDate}` : ''}. ` +
+      'Re-distributing would overwrite the stored pool and per-member shares under a ' +
+      'different basis. Pass { force: true } only with explicit sign-off.'
+    );
+  }
   const summary = await calculateGlobalBonus(yearInput);
   const conn = await pool.getConnection();
 

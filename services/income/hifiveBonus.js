@@ -240,6 +240,11 @@ async function checkH5Bonus(uid) {
 }
 
 async function getDirectReferralProductPurchases(uid) {
+  // Hi-Five PRODUCT qualifying RESETS MONTHLY (Minutes #14/B, CONFIRMED 2026-06-21): count
+  // only THIS month's distinct directs per product, so unclaimed wait-progress (e.g. 4 of 5)
+  // does NOT carry into next month. (Package Hi-Five is all-time/monotonic; PRODUCT is the
+  // reset/wait one. Eligibility ≥200 maintenance is already monthly via getMaintenanceProductPoints.)
+  const { start, end } = currentMonthRange();
   const [rows] = await pool.query(
     `SELECT
         r.producttype,
@@ -254,12 +259,40 @@ async function getDirectReferralProductPurchases(uid) {
      LEFT JOIN memberstab m ON m.uid = child.uid
      WHERE child.drefid = ?
        AND r.producttype >= 100
+       AND DATE_FORMAT(r.transdate, '%Y-%m-%d') >= ?
+       AND DATE_FORMAT(r.transdate, '%Y-%m-%d') <= ?
      GROUP BY r.producttype, r.uid, m.username, m.firstname, m.lastname
      ORDER BY r.producttype ASC, cnt DESC, lastTransdate DESC`,
-    [uid]
+    [uid, start, end]
   );
 
   return summarizeProductReferralRows(rows);
+}
+
+// Hi-Five PRODUCT claimed sets ALSO reset monthly (Minutes #14/B): only THIS month's redeems
+// gate this month's availability. Without this, a prior month's redeems (cumulative in
+// h5bonustab) would wrongly suppress a member's fresh monthly entitlement. Sourced from
+// h5historytab (redeemdate-scoped) to stay consistent with the monthly qualifying window above.
+async function getMonthlyRedeemedProductSets(uid) {
+  const { start, end } = currentMonthRange();
+  const claimed = normalizeCountMap(Object.keys(PRODUCT_METADATA));
+  // Scope on the IMMUTABLE creation date (transdate); fall back to redeemdate only for
+  // pre-deploy legacy rows where transdate is NULL. redeemdate alone is unsafe because the
+  // admin process step overwrites it, which would re-scope a redeem into a later month.
+  const [rows] = await pool.query(
+    `SELECT producttype, COALESCE(SUM(ttlbonus), 0) AS redeemed
+       FROM h5historytab
+      WHERE uid = ? AND transactiontype = 1
+        AND DATE_FORMAT(COALESCE(transdate, redeemdate), '%Y-%m-%d') >= ?
+        AND DATE_FORMAT(COALESCE(transdate, redeemdate), '%Y-%m-%d') <= ?
+      GROUP BY producttype`,
+    [uid, start, end]
+  );
+  for (const row of rows) {
+    const key = PRODUCT_TYPE_TO_KEY[row.producttype];
+    if (key) claimed[key] = Number(row.redeemed || 0);
+  }
+  return claimed;
 }
 
 async function getMaintenanceProductPoints(uid) {
@@ -829,7 +862,9 @@ async function getPackageClaimedSets(uid) {
 async function buildHiFiveStatus(uid) {
   const [productClaimedByKey, directReferralProducts, maintenancePoints, directReferralPackages, rewardAmounts, packageClaimedSets, directReferralCount] =
     await Promise.all([
-      checkH5Bonus(uid),
+      // PRODUCT claimed = THIS month's redeems (Minutes #14/B monthly reset), not the all-time
+      // h5bonustab counter — kept consistent with the monthly qualifying window below.
+      getMonthlyRedeemedProductSets(uid),
       getDirectReferralProductPurchases(uid),
       getMaintenanceProductPoints(uid),
       getDirectReferralPackageCounts(uid),
@@ -897,9 +932,12 @@ async function insertProductRedeem(uid, bonusType, totalBonus) {
     [totalBonus, uid]
   );
 
+  // transdate = IMMUTABLE creation timestamp. redeemdate is later overwritten by the admin
+  // "process" step (routes/admin/redeem.js), so it cannot anchor the monthly reset window —
+  // getMonthlyRedeemedProductSets scopes on transdate instead. (reviewer 🟡, 2026-06-21)
   await pool.query(
-    `INSERT INTO h5historytab (pid, uid, producttype, ttlbonus, redeemstatus, redeemdate, transactiontype, processid)
-     VALUES (NULL, ?, ?, ?, 0, NOW(), 1, ?)`,
+    `INSERT INTO h5historytab (pid, uid, producttype, ttlbonus, redeemstatus, redeemdate, transdate, transactiontype, processid)
+     VALUES (NULL, ?, ?, ?, 0, NOW(), NOW(), 1, ?)`,
     [uid, productType, totalBonus, crypto.randomUUID()]
   );
 

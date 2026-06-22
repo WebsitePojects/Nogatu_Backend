@@ -5,6 +5,7 @@
 const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
+const { pool } = require('../config/database');
 const {
   buildHiFiveStatus,
   insertProductRedeem,
@@ -59,26 +60,41 @@ router.post('/redeem', memberAuth, async (req, res) => {
       });
     }
 
-    const productStatus = status.productBonus.products.find((item) => item.key === bonusType);
-    if (!productStatus) {
-      return res.status(400).json({ error: 'Invalid product Hi-Five type.' });
-    }
+    // Serialize per-uid: re-read + check + insert under an advisory lock so two concurrent
+    // redeems can't both pass the availableClaims gate and double-redeem one set (TOCTOU).
+    // (reviewer 🟡, 2026-06-21) — advisory lock is connection-held; release in finally.
+    const lockName = `hifive_redeem_${uid}`;
+    const lockConn = await pool.getConnection();
+    try {
+      const [[lk]] = await lockConn.query('SELECT GET_LOCK(?, 10) AS got', [lockName]);
+      if (!lk || Number(lk.got) !== 1) {
+        return res.status(409).json({ error: 'Another redemption is in progress. Please try again.' });
+      }
 
-    if (!status.productBonus.eligible) {
-      return res.status(422).json({
-        error: `You need ${status.productBonus.pointsNeeded} more maintenance point(s) to redeem Hi-Five products.`,
+      // Authoritative read UNDER the lock (the earlier read may be stale vs a concurrent redeem).
+      const lockedStatus = await buildHiFiveStatus(uid);
+      const lockedProduct = lockedStatus.productBonus.products.find((item) => item.key === bonusType);
+      if (!lockedProduct) {
+        return res.status(400).json({ error: 'Invalid product Hi-Five type.' });
+      }
+      if (!lockedStatus.productBonus.eligible) {
+        return res.status(422).json({
+          error: `You need ${lockedStatus.productBonus.pointsNeeded} more maintenance point(s) to redeem Hi-Five products.`,
+        });
+      }
+      if (claimQty > lockedProduct.availableClaims) {
+        return res.status(422).json({ error: 'Requested product redemption exceeds your available Hi-Five product claims.' });
+      }
+
+      await insertProductRedeem(uid, bonusType, claimQty);
+      return res.json({
+        success: true,
+        message: `${lockedProduct.name} product Hi-Five redemption submitted successfully.`,
       });
+    } finally {
+      await lockConn.query('SELECT RELEASE_LOCK(?)', [lockName]).catch(() => {});
+      lockConn.release();
     }
-
-    if (claimQty > productStatus.availableClaims) {
-      return res.status(422).json({ error: 'Requested product redemption exceeds your available Hi-Five product claims.' });
-    }
-
-    await insertProductRedeem(uid, bonusType, claimQty);
-    return res.json({
-      success: true,
-      message: `${productStatus.name} product Hi-Five redemption submitted successfully.`,
-    });
   } catch (err) {
     console.error('[HiFive] Redeem error:', err);
     res.status(500).json({ error: err.message });

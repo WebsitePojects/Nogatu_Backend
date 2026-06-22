@@ -1,0 +1,2 @@
+# Shell scripts must keep LF endings so they run on the Linux VPS (CRLF breaks the shebang).
+*.sh text eol=lf

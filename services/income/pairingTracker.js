@@ -452,17 +452,21 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
   const leftEvents = events.filter((row) => row.ownerLeg === 'left');
   const rightEvents = events.filter((row) => row.ownerLeg === 'right');
   const eligibility = await getBinaryPairingEligibility(ownerUid, conn);
-  // PHP production has no personal-direct unlock gate: all account types
-  // can receive pairing income whenever eligible source nodes exist on both
-  // legs of their subtree.  Credits are never locked — eligibility is
-  // informational only (shown in the UI but does not block earnings).
+  // The pairing WALLET credit (getPairing → ttlincome2) is gated by this same owner eligibility:
+  // a member must personally recruit ≥1 qualified direct before pairing pays out (CONFIRMED rule
+  // 2026-06-22; spillover-only legs do NOT pay). The trace/ledger MUST mirror that gate — otherwise
+  // it records "Credited" matches the wallet never paid (the t01left case: trace 250 vs wallet 0),
+  // a false money record. When the owner is ineligible we lock credits → creditedIncome=0 → no
+  // income_eventstab credited row is written (guard below) → History/summary read 0, matching the
+  // wallet. The match still appears in the Event Trace as eligibility-locked (honest, not phantom).
+  const ownerCanEarn = eligibility?.canEarnPairing !== false;
   const ledgerRows = buildPairingLedgerEntries({
     ownerUid,
     accttype,
     leftEvents,
     rightEvents,
-    creditsLocked: false,
-    creditsLockedReason: null,
+    creditsLocked: !ownerCanEarn,
+    creditsLockedReason: ownerCanEarn ? null : (eligibility?.reason || 'Owner not yet eligible for pairing (no personally-recruited qualified direct).'),
   });
   const balances = summarizePairingBalances({ leftEvents, rightEvents, ledgerRows });
   const hasIncomeEventTable = await ensureIncomeEventTable(conn);
@@ -505,6 +509,20 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
       } catch (error) {
         if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
       }
+    } else if (hasIncomeEventTable && !ownerCanEarn) {
+      // ONLY when the OWNER is pairing-INELIGIBLE (no personally-recruited qualified direct) do
+      // we reverse a prior phantom credit: the owner never earns pairing, so any credited mirror
+      // row is false (the t01left case — trace 250 vs wallet 0). We deliberately do NOT reverse a
+      // merely cap-zeroed match for an ELIGIBLE owner, since that may reflect a genuine wallet
+      // credit (the cap is a separate display concern). process_key is deterministic per
+      // ledgerUid, so this targets exactly the stale row. Self-heals on next sync; ttlincome2
+      // (the wallet) is never touched.
+      const reverseKey = createProcessKey(['pairing-income', row.ledgerUid]);
+      await conn.query(
+        `UPDATE income_eventstab SET status = 'reversed', net_amount = 0
+          WHERE process_key = ? AND income_type = 'pairing_bonus' AND status = 'credited'`,
+        [reverseKey]
+      ).catch((error) => { if (error.code !== 'ER_NO_SUCH_TABLE') throw error; });
     }
 
     await conn.query(
