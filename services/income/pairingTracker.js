@@ -509,6 +509,20 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
       } catch (error) {
         if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
       }
+    } else if (hasIncomeEventTable && !ownerCanEarn) {
+      // ONLY when the OWNER is pairing-INELIGIBLE (no personally-recruited qualified direct) do
+      // we reverse a prior phantom credit: the owner never earns pairing, so any credited mirror
+      // row is false (the t01left case — trace 250 vs wallet 0). We deliberately do NOT reverse a
+      // merely cap-zeroed match for an ELIGIBLE owner, since that may reflect a genuine wallet
+      // credit (the cap is a separate display concern). process_key is deterministic per
+      // ledgerUid, so this targets exactly the stale row. Self-heals on next sync; ttlincome2
+      // (the wallet) is never touched.
+      const reverseKey = createProcessKey(['pairing-income', row.ledgerUid]);
+      await conn.query(
+        `UPDATE income_eventstab SET status = 'reversed', net_amount = 0
+          WHERE process_key = ? AND income_type = 'pairing_bonus' AND status = 'credited'`,
+        [reverseKey]
+      ).catch((error) => { if (error.code !== 'ER_NO_SUCH_TABLE') throw error; });
     }
 
     await conn.query(
