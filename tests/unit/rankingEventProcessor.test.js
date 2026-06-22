@@ -136,3 +136,20 @@ test('maintenance route processes ranking before commit and removes background r
   assert.doesNotMatch(routeSource, /setImmediate\s*\(/);
   assert.doesNotMatch(routeSource, /refreshMemberRankSnapshot/);
 });
+
+test('ranking rollout scripts load guarded env and reconciliation stays read-only', () => {
+  const reconcile = fs.readFileSync(
+    path.resolve(__dirname, '../../scripts/reconcile_realtime_rankings.js'),
+    'utf8'
+  );
+  const replay = fs.readFileSync(
+    path.resolve(__dirname, '../../scripts/replay_ranking_events.js'),
+    'utf8'
+  );
+  assert.match(reconcile, /loadBackendEnv\(\)/);
+  assert.doesNotMatch(reconcile, /\b(?:INSERT|UPDATE|DELETE|REPLACE|TRUNCATE|ALTER|DROP)\b/i);
+  assert.match(replay, /--from-id/);
+  assert.match(replay, /--mark-baseline-through/);
+  assert.match(replay, /processRepurchaseRankingEvent/);
+  assert.match(replay, /acquireRankingLock/);
+});
