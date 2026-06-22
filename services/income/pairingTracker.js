@@ -204,6 +204,42 @@ function buildPairingLedgerEntries({ ownerUid, accttype, leftEvents = [], rightE
   return ledgerRows;
 }
 
+// Encode-based ledger: ONE row per binary encode (a member joining a leg), in chronological
+// order, showing the encode's PV and the resulting running strong-leg remaining (|left - right|).
+// This is the member-friendly "one record per user" view — vs buildPairingLedgerEntries, which is
+// per matched left×right pair (and so fragments a single Garnet into many small rows). An encode
+// that lands on the WEAK leg matches the surplus → -PV (strong leg shrinks); one on the leading
+// (or tied) leg grows the surplus → +PV. Events are already eligibility-filtered upstream.
+function buildEncodeLedger({ leftEvents = [], rightEvents = [] }) {
+  const events = [...leftEvents, ...rightEvents]
+    .filter((e) => toNumber(e.pointValue) > 0 && e.eventUid && e.eventTs)
+    .sort((a, b) => new Date(a.eventTs) - new Date(b.eventTs) || String(a.eventUid).localeCompare(String(b.eventUid)));
+
+  let left = 0;
+  let right = 0;
+  const rows = [];
+  for (const e of events) {
+    const pv = toNumber(e.pointValue);
+    const strongLegBefore = left >= right ? 'left' : 'right';
+    const addsToStrong = e.ownerLeg === strongLegBefore; // landed on the leading/tied leg
+    if (e.ownerLeg === 'left') left += pv; else right += pv;
+    rows.push({
+      encodeUid: e.eventUid,
+      sourceMemberUid: e.sourceMemberUid,
+      username: e.username,
+      fullName: e.fullName,
+      packageType: e.packageType,
+      eventType: e.eventType,             // 'registration' | 'upgrade'
+      pairedAt: e.eventTs,
+      leg: e.ownerLeg,                    // 'left' | 'right'
+      pointValue: pv,                     // binaryValue (client ÷ 250 = PV)
+      addsToStrong,                       // true = +PV to strong leg; false = -PV (matched the weak leg)
+      strongRemainingAfter: Math.abs(left - right),
+    });
+  }
+  return rows;
+}
+
 function summarizePairingBalances({ leftEvents = [], rightEvents = [], ledgerRows = [] }) {
   const totalLeftPoints = leftEvents.reduce((sum, row) => sum + toNumber(row.point_value ?? row.pointValue ?? row.binarypoints ?? row.points), 0);
   const totalRightPoints = rightEvents.reduce((sum, row) => sum + toNumber(row.point_value ?? row.pointValue ?? row.binarypoints ?? row.points), 0);
@@ -570,6 +606,7 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
     sourceBackfill,
     eligibility,
     balances,
+    encodeRows: buildEncodeLedger({ leftEvents, rightEvents }),
   };
 }
 
@@ -630,6 +667,7 @@ async function getPairingTrace(ownerUid, accttype, options = {}, conn = pool) {
   return {
     rows: paginated.rows,
     allRows: normalizedRows,
+    encodeTrace: syncResult.encodeRows || [],
     summary: syncResult.summary,
     packageName: ACCOUNT_TYPES[accttype] || 'Unknown',
     weeklyCap: toNumber(PAIRING_CAPS[accttype] || 0),
@@ -897,6 +935,7 @@ async function getPairingLegAccounts(ownerUid, accttype, side, options = {}, con
 module.exports = {
   normalizeTrackerEvent,
   buildPairingLedgerEntries,
+  buildEncodeLedger,
   summarizePairingBalances,
   summarizePairingTrace,
   buildPairingHistoryRows,

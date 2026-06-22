@@ -117,8 +117,14 @@ async function main() {
 
   let totalOver = 0;
   for (const o of over) totalOver += o.over;
-  console.log(`\n[cap-fix] OVER-PAID under the old ISO bug (KEPT, no clawback): ${over.length} member(s), total ${totalOver.toFixed(2)}`);
-  for (const o of over) console.log(`  uid ${o.uid}  paid ${o.paid} -> engine ${o.engine}  (over by ${o.over.toFixed(2)} - NOT touched)`);
+  // engine < paid is DOMINATED by LEGACY-SMB members: the new engine reconstructs only the
+  // event-traceable fraction, so a legacy leader shows engine ~0 against a large already-paid
+  // ttlincome2. This is EXPECTED (money-integrity rule: stored > engine for legacy SMB is NOT
+  // over-credit) and is NEVER touched here. A genuine ISO over-cap would instead show engine
+  // only slightly below paid. Either way: KEPT, monotonic, no clawback.
+  console.log(`\n[cap-fix] engine < paid (legacy-unreconstructable SMB and/or ISO over-cap) -- KEPT, NOT touched: ${over.length} member(s), total ${totalOver.toFixed(2)}`);
+  console.log('  (legacy members show engine ~0 vs a large paid ttlincome2 -- their real earnings are authoritative + already paid; this is NOT over-payment.)');
+  for (const o of over) console.log(`  uid ${o.uid}  paid ${o.paid} -> engine ${o.engine}  (${o.engine === 0 ? 'legacy: engine cannot reconstruct' : 'kept'}, diff ${o.over.toFixed(2)} - NOT touched)`);
 
   if (!COMMIT) {
     console.log('\n[cap-fix] DRY-RUN: nothing written. Re-run with --commit --uids <owed list> to credit the pairing deltas.');

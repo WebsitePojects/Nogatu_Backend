@@ -89,12 +89,17 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
     }
 
     if (search) {
-      // Match username, the full voucher code (VCH-000123), or the bare numeric id
-      // (so both "VCH-000123", "123", and "vch-123" find the same voucher).
+      // Match username, the full voucher code (VCH-000123), the bare numeric id
+      // (so "VCH-000123", "123", and "vch-123" all find the same voucher), OR any ER
+      // reference recorded against the voucher's availments (e.g. "ER-2026-00124").
       const pattern = `%${search}%`;
       const digits = search.replace(/\D/g, '');
-      const ors = ['m.username LIKE ?', "CONCAT('VCH-', LPAD(v.id, 6, '0')) LIKE ?"];
-      const searchParams = [pattern, pattern];
+      const ors = [
+        'm.username LIKE ?',
+        "CONCAT('VCH-', LPAD(v.id, 6, '0')) LIKE ?",
+        'EXISTS (SELECT 1 FROM voucher_availmentstab a WHERE a.voucher_id = v.id AND a.er_number LIKE ?)',
+      ];
+      const searchParams = [pattern, pattern, pattern];
       if (digits) {
         ors.push('CAST(v.id AS CHAR) LIKE ?');
         searchParams.push(`%${digits}%`);
