@@ -120,6 +120,11 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               DATE_FORMAT(v.expiry_date, '%Y-%m-%d %H:%i') AS expiry_at,
               DATE_FORMAT(v.first_used_at, '%Y-%m-%d %H:%i') AS first_used_at,
               DATE_FORMAT(v.use_expires_at, '%Y-%m-%d %H:%i') AS use_expires_at,
+              (SELECT a.er_number FROM voucher_availmentstab a
+                 WHERE a.voucher_id = v.id
+                 ORDER BY a.availment_date DESC, a.id DESC LIMIT 1) AS latest_er,
+              (SELECT COUNT(*) FROM voucher_availmentstab a
+                 WHERE a.voucher_id = v.id) AS er_count,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
        LEFT JOIN memberstab m ON m.uid = v.uid
@@ -155,6 +160,8 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
           expiryAt: row.expiry_at,
           firstUsedAt: row.first_used_at,
           useExpiresAt: row.use_expires_at,
+          latestEr: row.latest_er || null,
+          erCount: Number(row.er_count || 0),
           expiryMode,
           expiryLabel: buildVoucherExpiryLabel({
             unusedExpiryDate: row.expiry_at,
