@@ -452,17 +452,21 @@ async function syncPairingLedger(ownerUid, accttype, conn = pool) {
   const leftEvents = events.filter((row) => row.ownerLeg === 'left');
   const rightEvents = events.filter((row) => row.ownerLeg === 'right');
   const eligibility = await getBinaryPairingEligibility(ownerUid, conn);
-  // PHP production has no personal-direct unlock gate: all account types
-  // can receive pairing income whenever eligible source nodes exist on both
-  // legs of their subtree.  Credits are never locked — eligibility is
-  // informational only (shown in the UI but does not block earnings).
+  // The pairing WALLET credit (getPairing → ttlincome2) is gated by this same owner eligibility:
+  // a member must personally recruit ≥1 qualified direct before pairing pays out (CONFIRMED rule
+  // 2026-06-22; spillover-only legs do NOT pay). The trace/ledger MUST mirror that gate — otherwise
+  // it records "Credited" matches the wallet never paid (the t01left case: trace 250 vs wallet 0),
+  // a false money record. When the owner is ineligible we lock credits → creditedIncome=0 → no
+  // income_eventstab credited row is written (guard below) → History/summary read 0, matching the
+  // wallet. The match still appears in the Event Trace as eligibility-locked (honest, not phantom).
+  const ownerCanEarn = eligibility?.canEarnPairing !== false;
   const ledgerRows = buildPairingLedgerEntries({
     ownerUid,
     accttype,
     leftEvents,
     rightEvents,
-    creditsLocked: false,
-    creditsLockedReason: null,
+    creditsLocked: !ownerCanEarn,
+    creditsLockedReason: ownerCanEarn ? null : (eligibility?.reason || 'Owner not yet eligible for pairing (no personally-recruited qualified direct).'),
   });
   const balances = summarizePairingBalances({ leftEvents, rightEvents, ledgerRows });
   const hasIncomeEventTable = await ensureIncomeEventTable(conn);

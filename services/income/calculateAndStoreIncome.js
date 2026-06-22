@@ -15,7 +15,7 @@ const { pool } = require('../../config/database');
 const { getDREF } = require('./directReferral');
 const { getPairing, savePairingReport } = require('./pairing');
 const { getLeadershipBonus } = require('./leadership');
-const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate } = require('./unilevel');
+const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate, updateIncomeTransDate, hasUnilevelCreditedThisMonth } = require('./unilevel');
 const { insertIncome } = require('./insertIncome');
 const { getEffectiveAccountState } = require('../accountState');
 const { getPackagePolicy } = require('../packagePolicy');
@@ -54,11 +54,16 @@ async function calculateAndStoreIncome(uid, accttype) {
     // Production ewallet.php allows all accounts to receive pairing income
     // when eligible source nodes exist on both legs; only source-node
     // contribution is restricted by effective account state.
-    await getEffectiveAccountState(uid);
+    // M1 FIX: derive the pairing-cap + package-policy basis from the DB currentaccttype
+    // (effective account state), NOT the route session's accttype. A member who upgraded but
+    // has not re-logged carried the OLD, lower weekly/monthly cap in the session → pairing
+    // under-credited until relogin. The session value is only a fallback now.
+    const effectiveAccount = await getEffectiveAccountState(uid);
+    const capAccttype = Number(effectiveAccount?.currentaccttype || effectiveAccount?.accttype || 0) || Number(accttype || 0);
 
     // ── Continuous income (deduplication via Math.max) ───────────────
     const drefResult = await getDREF(uid);
-    const pairingResult = await getPairing(uid, accttype);
+    const pairingResult = await getPairing(uid, capAccttype);
     const leadershipAmount = await getLeadershipBonus(uid);
 
     const newDref = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
@@ -74,14 +79,18 @@ async function calculateAndStoreIncome(uid, accttype) {
     if (INCOME_PAYOUT_FLAGS.unilevel) {
       const hasMaintenance = await checkLastMaintenance(uid);
       const alreadyCalcUnilevel = await checkUnilevelTransDate(uid);
-      if (hasMaintenance && !alreadyCalcUnilevel) {
+      // H2 backstop: in addition to the incometransdatetab stamp, refuse if a unilevel
+      // (income4) credit row already exists this calendar month — so a deleted/reset stamp
+      // can never re-credit the month (double-pay).
+      const alreadyCreditedThisMonth = await hasUnilevelCreditedThisMonth(uid);
+      if (hasMaintenance && !alreadyCalcUnilevel && !alreadyCreditedThisMonth) {
         activeUnilevel = await getUnilevel(uid);
       }
     }
 
     // ── Persist if there is new income ───────────────────────────────
     const capResult = applyLifetimeIncomeCeiling({
-      packagePolicy: getPackagePolicy(accttype),
+      packagePolicy: getPackagePolicy(capAccttype),
       storedTotals: stored,
       proposedIncome: {
         dref: newDref,
@@ -94,20 +103,46 @@ async function calculateAndStoreIncome(uid, accttype) {
 
     const allowedIncome = capResult.allowedIncome;
     const totalNewIncome = capResult.allowedTotal;
-    const endingBalance = beginningBalance + totalNewIncome;
 
     if (totalNewIncome >= 1) {
-      await insertIncome(uid, {
-        dref: allowedIncome.dref,
-        paircash: allowedIncome.paircash,
-        leadership: allowedIncome.leadership,
-        unilevel: allowedIncome.unilevel,
-        hifive: allowedIncome.hifive,
-        ppctemp: 0,
-        pairproduct: 0,
-        beginningbalance: beginningBalance,
-        endingbalance: endingBalance,
-      }, lockConn);
+      // C1 FIX (lost-update overpay): re-read the wallet balance FOR UPDATE inside a
+      // transaction so a concurrent encashment (which also FOR UPDATEs this row) cannot be
+      // lost. Previously income-calc read ttlcashbalance with no row lock and wrote it
+      // absolutely (beginning + newIncome) — a debit committed in between was wiped, leaving
+      // the member their full balance AND the encashment payout. Holding the row lock from the
+      // re-read through COMMIT serializes both money writers on the same row; the fresh balance
+      // also keeps the payouthistory beginning/ending snapshot accurate.
+      await lockConn.beginTransaction();
+      try {
+        const [freshRows] = await lockConn.query(
+          'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? FOR UPDATE',
+          [uid]
+        );
+        const freshBeginning = Number(freshRows[0]?.ttlcashbalance ?? beginningBalance);
+        const freshEnding = freshBeginning + totalNewIncome;
+        await insertIncome(uid, {
+          dref: allowedIncome.dref,
+          paircash: allowedIncome.paircash,
+          leadership: allowedIncome.leadership,
+          unilevel: allowedIncome.unilevel,
+          hifive: allowedIncome.hifive,
+          ppctemp: 0,
+          pairproduct: 0,
+          beginningbalance: freshBeginning,
+          endingbalance: freshEnding,
+        }, lockConn);
+        // H1 FIX: stamp the unilevel monthly guard in the SAME transaction as the credit, and
+        // only after the insert succeeded. Previously the stamp was written (autocommit) during
+        // getUnilevel BEFORE the credit, so a throw/cap-to-zero left the month marked settled but
+        // unpaid → permanent monthly underpay. Now a rolled-back credit also rolls back the stamp.
+        if (Number(allowedIncome.unilevel || 0) >= 1) {
+          await updateIncomeTransDate(uid, 4, lockConn);
+        }
+        await lockConn.commit();
+      } catch (txErr) {
+        await lockConn.rollback();
+        throw txErr;
+      }
     }
 
     // Save full per-date pairing breakdown so pairingstab mirrors PHP behavior.

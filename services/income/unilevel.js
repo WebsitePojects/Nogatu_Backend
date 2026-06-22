@@ -98,13 +98,33 @@ async function checkUnilevelTransDate(uid) {
 /**
  * Update income transaction date after calculation
  */
-async function updateIncomeTransDate(uid, incomeType) {
-  await pool.query(
+async function updateIncomeTransDate(uid, incomeType, conn = pool) {
+  await conn.query(
     `INSERT INTO incometransdatetab (id, uid, incometype, lasttransdate)
      VALUES (NULL, ?, ?, NOW())
      ON DUPLICATE KEY UPDATE lasttransdate = NOW()`,
     [uid, incomeType]
   );
+}
+
+/**
+ * H2 backstop — monotonic per-month guard independent of the incometransdatetab stamp.
+ * True if a unilevel (income4) credit row already exists for this member in the CURRENT
+ * calendar month. Even if the stamp row is deleted/reset, this prevents a second monthly
+ * credit (double-pay). Scoped to the current month because unilevel is released this month
+ * for the previous month's maintenance.
+ */
+async function hasUnilevelCreditedThisMonth(uid, conn = pool) {
+  const { start, end } = currentMonthRange();
+  const [rows] = await conn.query(
+    `SELECT 1 FROM payouthistorytab
+      WHERE uid = ? AND income4 > 0
+        AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+        AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
+      LIMIT 1`,
+    [uid, start, end]
+  );
+  return rows.length > 0;
 }
 
 function addUnilevelPointsToLevelBucket(totals, level, points) {
@@ -224,10 +244,10 @@ async function calculateUnilevelForWindow(uid, options = {}) {
     total += Number(state.pointsByLevel[actualLevel] || 0) * rate;
   }
 
-  if (preventDuplicateCredit && total > 0) {
-    await updateIncomeTransDate(uid, 4);
-  }
-
+  // H1 FIX: do NOT stamp incometransdatetab here. Stamping inside this compute function (on the
+  // autocommitting pool) marked the month "settled" BEFORE the caller actually credited the cash —
+  // so if the insert threw or the cap zeroed it, the month was lost permanently. The stamp now
+  // happens in the caller, in the SAME transaction as the credit, only after the insert succeeds.
   return total;
 }
 
@@ -388,6 +408,8 @@ module.exports = {
   UNILEVEL_RELEASE_DAY,
   checkLastMaintenance,
   checkUnilevelTransDate,
+  updateIncomeTransDate,
+  hasUnilevelCreditedThisMonth,
   getProjectedCurrentMonthUnilevel,
   getUnilevelProductPointContributors,
   getUnilevelRateForLevel,

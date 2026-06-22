@@ -36,7 +36,7 @@ async function main() {
   const limit = Math.max(0, Number(arg('limit')) || 0);
 
   const { pool } = require('../config/database');
-  const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate, isUnilevelReleaseWindow } = require('../services/income/unilevel');
+  const { getUnilevel, checkLastMaintenance, checkUnilevelTransDate, isUnilevelReleaseWindow, updateIncomeTransDate, hasUnilevelCreditedThisMonth } = require('../services/income/unilevel');
   const { insertIncome } = require('../services/income/insertIncome');
   const { applyLifetimeIncomeCeiling } = require('../services/income/incomeCapPolicy');
   const { getPackagePolicy } = require('../services/packagePolicy');
@@ -76,13 +76,17 @@ async function main() {
       const [lk] = await conn.query('SELECT GET_LOCK(?, 10) AS s', [lockKey]);
       if (Number(lk[0]?.s || 0) !== 1) { lockFail += 1; continue; }
 
+      // H2 backstop: skip if a unilevel (income4) credit already exists this month, independent
+      // of the incometransdatetab stamp — so a deleted/reset stamp can never re-credit (double-pay).
       // eslint-disable-next-line no-await-in-loop
-      const amount = await getUnilevel(uid); // maintenance gate + dedup guard internal
+      if (await hasUnilevelCreditedThisMonth(uid, conn)) { voided += 1; continue; }
+
+      // eslint-disable-next-line no-await-in-loop
+      const amount = await getUnilevel(uid); // maintenance gate + month stamp guard (returns 0 if already stamped)
       if (amount < 1) { voided += 1; continue; }
 
       // eslint-disable-next-line no-await-in-loop
       const [[stored]] = await conn.query('SELECT * FROM payouttotaltab WHERE uid = ?', [uid]);
-      const bal = Number(stored?.ttlcashbalance || 0);
       const cap = applyLifetimeIncomeCeiling({
         packagePolicy: getPackagePolicy(accttype),
         storedTotals: stored || {},
@@ -91,11 +95,28 @@ async function main() {
       const allowedUni = Number(cap.allowedIncome?.unilevel || 0);
       const total = Number(cap.allowedTotal || 0);
       if (total >= 1) {
+        // C1: re-read the balance FOR UPDATE inside a txn so a concurrent encashment isn't lost.
+        // H1: stamp the month guard in the SAME txn, only after the credit succeeds.
         // eslint-disable-next-line no-await-in-loop
-        await insertIncome(uid, {
-          dref: 0, paircash: 0, leadership: 0, unilevel: allowedUni, hifive: 0, ppctemp: 0,
-          beginningbalance: bal, endingbalance: bal + total,
-        }, conn);
+        await conn.beginTransaction();
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const [fresh] = await conn.query('SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? FOR UPDATE', [uid]);
+          const bal = Number(fresh[0]?.ttlcashbalance ?? stored?.ttlcashbalance ?? 0);
+          // eslint-disable-next-line no-await-in-loop
+          await insertIncome(uid, {
+            dref: 0, paircash: 0, leadership: 0, unilevel: allowedUni, hifive: 0, ppctemp: 0,
+            beginningbalance: bal, endingbalance: bal + total,
+          }, conn);
+          // eslint-disable-next-line no-await-in-loop
+          await updateIncomeTransDate(uid, 4, conn);
+          // eslint-disable-next-line no-await-in-loop
+          await conn.commit();
+        } catch (txErr) {
+          // eslint-disable-next-line no-await-in-loop
+          await conn.rollback();
+          throw txErr;
+        }
         credited += 1; creditedAmount += allowedUni;
       } else {
         capped += 1; // at lifetime ceiling — nothing creditable
