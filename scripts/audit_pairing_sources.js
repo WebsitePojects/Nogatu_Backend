@@ -72,8 +72,10 @@ async function main() {
     [root]
   );
 
-  console.log(`\nFound ${rows.length} ${tiers.map((t) => PKG[t]).join('/')} account(s) in the subtree.\n`);
+  console.log(`\nFound ${rows.length} ${tiers.map((t) => PKG[t]).join('/')} account(s) in the subtree.`);
+  console.log('(origin: NEW-ENCODE = registered at this tier; UPGRADE x->y = upgraded into it)\n');
   const blockedByTier = {};
+  const upgradeBlockedByTier = {};
   let blockedValue = 0;
 
   for (const r of rows) {
@@ -82,22 +84,31 @@ async function main() {
     const contributes = countsForPairingSource(eff);
     const tier = num(r.currentaccttype);
     const expected = num(BINARY_VALUE[tier]);
-    if (!contributes) {
+    const upgraded = num(r.currentaccttype) > num(r.accttype);
+    const origin = upgraded ? `UPGRADE ${PKG[num(r.accttype)] || r.accttype}->${PKG[tier]}` : 'NEW-ENCODE';
+    const who = `${PKG[tier]} uid ${r.uid} ${r.username || ''} depth ${num(r.depth)} [${origin}]`;
+    if (contributes) {
+      console.log(`  PAIRS ✓   ${who}  eff ${getAccountStateLabel(eff)}  value ${expected}`);
+    } else {
       // eslint-disable-next-line no-await-in-loop
       const reason = await blockedReason(r, eff);
       blockedByTier[tier] = (blockedByTier[tier] || 0) + 1;
+      if (upgraded) upgradeBlockedByTier[tier] = (upgradeBlockedByTier[tier] || 0) + 1;
       blockedValue += expected;
-      console.log(`  BLOCKED  ${PKG[tier]}  uid ${r.uid} ${r.username || ''}  depth ${num(r.depth)}  ` +
-        `raw[codeid=${num(r.codeid)} cdstatus=${num(r.cdstatus)}] -> eff ${getAccountStateLabel(eff)}  ` +
-        `binaryValue ${expected} NOT reaching upline  :: ${reason}`);
+      console.log(`  BLOCKED ✗ ${who}  raw[codeid=${num(r.codeid)} cdstatus=${num(r.cdstatus)}] -> eff ${getAccountStateLabel(eff)}  ` +
+        `value ${expected} NOT reaching upline  :: ${reason}`);
     }
   }
 
   console.log('\n========== SUMMARY ==========');
   for (const tier of tiers) {
-    const total = rows.filter((r) => num(r.currentaccttype) === tier).length;
+    const tierRows = rows.filter((r) => num(r.currentaccttype) === tier);
+    const total = tierRows.length;
+    const newEncode = tierRows.filter((r) => num(r.currentaccttype) === num(r.accttype)).length;
+    const upgrade = total - newEncode;
     const blocked = blockedByTier[tier] || 0;
-    console.log(`  ${PKG[tier]}: ${total} total, ${blocked} BLOCKED (non-contributing), ${total - blocked} contributing.`);
+    const upBlocked = upgradeBlockedByTier[tier] || 0;
+    console.log(`  ${PKG[tier]}: ${total} total (${newEncode} new-encode, ${upgrade} upgrade) | ${blocked} BLOCKED [${upBlocked} of them upgrades], ${total - blocked} pairing.`);
   }
   console.log(`  Total binary value NOT reaching the upline from blocked Gold/Garnet: ${blockedValue}`);
   console.log('  NOTE: BLOCKED accounts contribute 0 to EVERY upline on their leg (incl. Elmer). Resolution is operational');
