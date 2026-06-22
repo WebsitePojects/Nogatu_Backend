@@ -175,6 +175,20 @@ router.get('/unilevel/flat', memberAuth, async (req, res) => {
   try {
     const uid = Number(req.session.uid);
     const nodes = await getSubtreeFlat(uid, 'unilevel');
+    // Additive enrichment: each member's repurchase ranking-points contribution
+    // (Σ repurchasetab.incentivepoints1 — the product points that feed ranking), for the
+    // per-level DOCX export. Does not alter the shared getSubtreeFlat query.
+    const uids = nodes.map((n) => Number(n.uid)).filter(Boolean);
+    if (uids.length) {
+      const ph = uids.map(() => '?').join(',');
+      const [rp] = await pool.query(
+        `SELECT uid, COALESCE(SUM(incentivepoints1), 0) AS pts
+           FROM repurchasetab WHERE uid IN (${ph}) GROUP BY uid`,
+        uids
+      );
+      const map = new Map(rp.map((r) => [Number(r.uid), Number(r.pts)]));
+      for (const n of nodes) n.rankingPoints = map.get(Number(n.uid)) || 0;
+    }
     res.json({ rootUid: uid, treeType: 'unilevel', count: nodes.length, version: treeVersion(nodes), nodes });
   } catch (err) {
     console.error('[Genealogy] Unilevel flat error:', err);
