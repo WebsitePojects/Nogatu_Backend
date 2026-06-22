@@ -11,7 +11,12 @@ const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
 const { listMemberActivationHistory } = require('../services/codeHistory');
 const { refreshMemberRankSnapshot } = require('../services/ranking');
-const { applyRepurchaseDelta } = require('../services/rankPoints');
+const {
+  acquireRankingLock,
+  releaseRankingLock,
+  processRepurchaseRankingEvent,
+} = require('../services/rankingEventProcessor');
+const { flushRankingOutboxForRepurchase } = require('../services/rankingRealtime');
 const { getTotalPointsForRange } = require('../services/income/unilevel');
 
 /**
@@ -312,7 +317,7 @@ router.post('/upgrade', memberAuth, async (req, res) => {
 
     await conn.commit();
 
-    // Rebuild ranking snapshot in background — do not block the response
+    // The database commit is complete; release the connection-scoped race lock.
     setImmediate(() => {
       refreshMemberRankSnapshot(uid).catch(err =>
         console.error('[Ranking] post-upgrade rebuild failed:', err)
@@ -348,6 +353,7 @@ router.post('/upgrade', memberAuth, async (req, res) => {
  */
 router.post('/maintenance', memberAuth, async (req, res) => {
   let conn;
+  let rankingLockHeld = false;
   try {
     const uid = req.session.uid;
     const code = sanitizeAlphaNum(req.body?.code || '');
@@ -408,7 +414,7 @@ router.post('/maintenance', memberAuth, async (req, res) => {
     }
 
     // Insert repurchase record (tagged to the chosen maintenance bucket).
-    await conn.query(
+    const [repurchaseResult] = await conn.query(
       `INSERT INTO repurchasetab (id, uid, producttype, maintenance_bucket, code, transtype, codeid,
        incentivepoints1, transdate)
        VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, NOW())`,
@@ -429,26 +435,47 @@ router.post('/maintenance', memberAuth, async (req, res) => {
       processKey: createProcessKey(['code-maintenance-use', code, uid, transType, nowMySQL()]),
     });
 
+    const rankingPoints = Number(codeData.unilevelpoints || 0);
+    if (rankingPoints > 0) {
+      await acquireRankingLock(conn);
+      rankingLockHeld = true;
+      await processRepurchaseRankingEvent(conn, {
+        repurchaseId: repurchaseResult.insertId,
+        sourceMemberUid: uid,
+        points: rankingPoints,
+        maintenanceBucket,
+        transactionType: transType,
+      });
+    }
+
     await conn.commit();
 
     // Rebuild ranking snapshot in background — do not block the response
-    setImmediate(() => {
-      refreshMemberRankSnapshot(uid).catch(err =>
-        console.error('[Ranking] post-maintenance rebuild failed:', err)
-      );
-      // Phase-1 SHADOW: incrementally propagate this repurchase up the sponsor
-      // chain (O(depth)). Does NOT drive the live leaderboard yet — reconciled first.
-      applyRepurchaseDelta(null, uid, Number(codeData.unilevelpoints || 0)).catch(err =>
-        console.error('[RankPoints] shadow propagate failed:', err.message)
-      );
-    });
+    if (rankingLockHeld) {
+      try { await releaseRankingLock(conn); } catch (error) {
+        console.error('[Ranking] advisory lock release after commit failed:', error.message);
+      } finally {
+        rankingLockHeld = false;
+      }
+    }
+    // Delivery is best-effort here; the durable outbox worker recovers failures.
+    if (rankingPoints > 0) {
+      flushRankingOutboxForRepurchase(repurchaseResult.insertId).catch((error) => {
+        console.error('[RankingRealtime] immediate publish failed; recovery worker will retry:', error.message);
+      });
+    }
 
-    res.json({ success: true, producttype: codeData.producttype });
+    res.json({ success: true, producttype: codeData.producttype, rankingUpdated: rankingPoints > 0 });
   } catch (err) {
     if (conn) await conn.rollback();
     console.error('[Codes] Maintenance error:', err);
     res.status(500).json({ error: 'Internal server error' });
   } finally {
+    if (conn && rankingLockHeld) {
+      try { await releaseRankingLock(conn); } catch (error) {
+        console.error('[Ranking] advisory lock release failed:', error.message);
+      }
+    }
     if (conn) conn.release();
   }
 });

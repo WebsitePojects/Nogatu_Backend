@@ -292,7 +292,12 @@ const SCHEMA_REQUIREMENTS = {
     },
   },
   RANKING: {
-    tables: ['rankingstab', 'rank_sequence_countertab'],
+    tables: [
+      'rankingstab',
+      'rank_sequence_countertab',
+      'ranking_event_processstab',
+      'ranking_realtime_outboxtab',
+    ],
     columns: {
       rankingstab: {
         highest_rank_no: {},
@@ -304,6 +309,17 @@ const SCHEMA_REQUIREMENTS = {
         race_last_awarded_at: {},
         pending_achievement_count: {},
         last_calculated_at: {},
+      },
+      ranking_event_processstab: {
+        repurchase_id: {},
+        status: {},
+        completed_at: {},
+      },
+      ranking_realtime_outboxtab: {
+        repurchase_id: {},
+        affected_member_uids: {},
+        status: {},
+        available_at: {},
       },
     },
   },

@@ -424,7 +424,7 @@ async function nextSequenceId(conn) {
 // Achievement insertion — writes both per-member and global consumption rows
 // ---------------------------------------------------------------------------
 
-async function insertAchievementAward(memberUid, award, definitionByRank, grossRankablePoints, conn) {
+async function insertAchievementAward(memberUid, award, definitionByRank, grossRankablePoints, conn, context = null) {
   const definition   = definitionByRank.get(toNumber(award.rank));
   const achievementUid = createPublicId();
   const sequenceId   = await nextSequenceId(conn);
@@ -508,6 +508,7 @@ async function insertAchievementAward(memberUid, award, definitionByRank, grossR
         // INSERT IGNORE skips duplicates on re-run; without this guard a rebuild
         // would double-deduct and silently drain uplines.
         if (gcResult.affectedRows === 1) {
+          context?.newConsumptionSourceUids?.add(toNumber(row.sourceMemberUid));
           try {
             // eslint-disable-next-line global-require
             await require('./rankPoints').applyConsumptionDelta(conn, toNumber(row.sourceMemberUid), toNumber(row.pointsConsumed));
@@ -749,7 +750,9 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
     const definitionByRank     = new Map(definitions.map((d) => [toNumber(d.rank), d]));
 
     // --- BOTTOM-UP: process all direct sponsor children before this member ---
-    const sponsorChildren = await getSponsorChildren(memberUid, conn);
+    const sponsorChildren = ctx.recurseChildren === false
+      ? []
+      : await getSponsorChildren(memberUid, conn);
     rankLog('rank.rebuild.start', {
       memberUid,
       packageType,
@@ -808,7 +811,7 @@ async function rebuildRankSnapshot(uid, conn = pool, context = null) {
         award.remainingRankablePointsAfterAward = Math.max(
           0, raceState.grossRankablePoints - rollingConsumedPoints
         );
-        await insertAchievementAward(memberUid, award, definitionByRank, raceState.grossRankablePoints, conn);
+        await insertAchievementAward(memberUid, award, definitionByRank, raceState.grossRankablePoints, conn, ctx);
       }
     }
 

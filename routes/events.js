@@ -34,6 +34,14 @@ function publishToAdmins(event, data) {
   return n;
 }
 
+function publishToAllUsers(event, data) {
+  let n = 0;
+  for (const set of memberClients.values()) {
+    for (const res of set) { writeEvent(res, event, data); n += 1; }
+  }
+  return n;
+}
+
 function openStream(req, res, registry, key) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -81,6 +89,7 @@ router.get('/admin/stream', adminAuth, (req, res) => {
 });
 
 router.publishToUser = publishToUser;
+router.publishToAllUsers = publishToAllUsers;
 router.publishToAdmins = publishToAdmins;
 
 module.exports = router;

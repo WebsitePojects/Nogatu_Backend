@@ -393,6 +393,7 @@ async function start() {
     // Start the background job worker (durable job_queuetab poller: support orphan
     // upload cleanup, etc.). Safe to no-op if Cloudinary is unconfigured.
     try { require('./services/jobWorker').startWorker(); } catch (e) { console.error('[Server] jobWorker start failed:', e.message); }
+    try { require('./services/rankingRealtime').startRankingRealtimeWorker(); } catch (e) { console.error('[Server] ranking realtime worker start failed:', e.message); }
     // Signal PM2 that the process is ready (used by wait_ready in ecosystem.config.js)
     if (process.send) process.send('ready');
   });

@@ -21,7 +21,7 @@ test('ranking race service exports the approved engine entry points', () => {
   assert.equal(typeof rankingRace.summarizeAchievementStatus, 'function');
 });
 
-test('event ownership marks repurchase events as self, left, and right', async () => {
+test('sponsor-tree ranking normalizes all eligible product events to unilevel ownership', async () => {
   const fakeConn = {
     async query() {
       return [[
@@ -54,7 +54,7 @@ test('event ownership marks repurchase events as self, left, and right', async (
   };
 
   const events = await rankingRace.listRankableEventsForMember(9001, fakeConn);
-  assert.deepEqual(events.map((row) => row.sourceLeg), ['self', 'left', 'right']);
+  assert.deepEqual(events.map((row) => row.sourceLeg), ['unilevel', 'unilevel', 'unilevel']);
   assert.deepEqual(events.map((row) => row.points), [50, 250, 500]);
 });
 
