@@ -83,23 +83,19 @@ function formatActivationHistoryEntry(row) {
         ? `${fromName} transferred this code to ${toName}.`
         : `Transferred this code to ${toName}.`;
   } else if (eventType === 'registration_use' || eventType === 'registration-used') {
-    summary = actorName !== 'Unknown'
-      ? `${actorName} used this code for registration.`
-      : toName !== 'Unknown'
-        ? `${toName} used this code for registration.`
-        : 'Used this code for registration.';
+    // The member who USED the code = the new registrant (to_uid / registration_uid),
+    // NOT the actor — the actor may be the sponsor/holder who transferred it to them.
+    summary = toName !== 'Unknown'
+      ? `${toName} used this code for registration.`
+      : 'Used this code for registration.';
   } else if (eventType === 'upgrade_use') {
-    summary = actorName !== 'Unknown'
-      ? `${actorName} used this code for account upgrade.`
-      : toName !== 'Unknown'
-        ? `${toName} used this code for account upgrade.`
-        : 'Used this code for account upgrade.';
+    summary = toName !== 'Unknown'
+      ? `${toName} used this code for account upgrade.`
+      : 'Used this code for account upgrade.';
   } else if (eventType === 'maintenance_use') {
-    summary = actorName !== 'Unknown'
-      ? `${actorName} used this code for repurchase.`
-      : toName !== 'Unknown'
-        ? `${toName} used this code for repurchase.`
-        : 'Used this code for repurchase.';
+    summary = toName !== 'Unknown'
+      ? `${toName} used this code for repurchase.`
+      : 'Used this code for repurchase.';
   }
 
   return {
