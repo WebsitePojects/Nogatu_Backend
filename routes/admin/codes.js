@@ -112,6 +112,7 @@ router.get('/', adminAuth, async (req, res) => {
     let legacyHistoryByCode = new Map();
     let latestReleaseByCode = new Map();
     let latestTransferByCode = new Map();
+    let latestRegistrationByCode = new Map();
 
     if (pageCodes.length > 0) {
       const [legacyHistoryRows] = await pool.query(
@@ -153,6 +154,22 @@ router.get('/', adminAuth, async (req, res) => {
           pageCodes
         );
         latestTransferByCode = firstRowByCode(transferRows);
+
+        // True OWNER of a USED code = the registrant (registration_uid / to_uid),
+        // NOT codestab.uid — registration sets codestatus=2 but never updates uid,
+        // so c.uid stays the last transfer-holder. Resolve the real registrant here.
+        const [registrationRows] = await pool.query(
+          `SELECT a.code,
+                  rm.username AS registrant_username,
+                  TRIM(CONCAT(COALESCE(rm.firstname,''), ' ', COALESCE(rm.lastname,''))) AS registrant_fullname
+           FROM activation_code_usagetab a
+           LEFT JOIN memberstab rm ON rm.uid = COALESCE(a.registration_uid, a.to_uid)
+           WHERE a.event_type = 'registration_use'
+             AND a.code IN (${codePlaceholders})
+           ORDER BY a.id DESC`,
+          pageCodes
+        );
+        latestRegistrationByCode = firstRowByCode(registrationRows);
       }
     }
 
@@ -160,12 +177,16 @@ router.get('/', adminAuth, async (req, res) => {
       const legacyHistory = legacyHistoryByCode.get(r.code) || null;
       const releaseAudit = latestReleaseByCode.get(r.code) || null;
       const transferAudit = latestTransferByCode.get(r.code) || null;
+      const registrationAudit = latestRegistrationByCode.get(r.code) || null;
       const generatedByUsername = r.generated_by_username || r.processid || null;
       const generatedByName = r.generated_by_name || null;
-      const currentOwnerUsername = r.owner_username || transferAudit?.to_username || generatedByUsername || null;
-      const currentOwnerFullname = r.owner_fullname
-        ? r.owner_fullname.trim() || null
-        : (!r.owner_username && generatedByName ? generatedByName : null);
+      // Prefer the registrant (who consumed the code) over codestab.uid (last holder).
+      const ownerUsername = registrationAudit?.registrant_username || r.owner_username || null;
+      const ownerFullname = (registrationAudit?.registrant_fullname || '').trim()
+        || (r.owner_fullname ? r.owner_fullname.trim() : '') || null;
+      const currentOwnerUsername = ownerUsername || transferAudit?.to_username || generatedByUsername || null;
+      const currentOwnerFullname = ownerFullname
+        || (!ownerUsername && generatedByName ? generatedByName : null);
 
       let transferHistory = legacyHistory?.history || null;
       if (!transferHistory && transferAudit?.to_username) {
@@ -179,11 +200,11 @@ router.get('/', adminAuth, async (req, res) => {
         producttype: r.producttype,
         producttypeName: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
         uid: r.uid,
-        ownerUsername: r.owner_username || null,
-        ownerFullname: r.owner_fullname ? r.owner_fullname.trim() || null : null,
+        ownerUsername,
+        ownerFullname,
         currentOwnerUsername,
         currentOwnerFullname,
-        currentOwnerLabel: r.owner_username ? 'Member Owner' : generatedByUsername ? 'Initial Owner / Generator' : null,
+        currentOwnerLabel: ownerUsername ? 'Member Owner' : generatedByUsername ? 'Initial Owner / Generator' : null,
         generatedByUsername,
         generatedByName,
         releasedByUsername: releaseAudit?.admin_username || null,
