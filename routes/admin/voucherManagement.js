@@ -95,7 +95,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
       const pattern = `%${search}%`;
       const ors = [
         'm.username LIKE ?',
-        'EXISTS (SELECT 1 FROM codestab c WHERE c.uid = v.uid AND c.code LIKE ?)',
+        'EXISTS (SELECT 1 FROM activation_code_usagetab acu WHERE acu.to_uid = v.uid AND acu.code LIKE ?)',
       ];
       const searchParams = [pattern, pattern];
       filters.push(`(${ors.join(' OR ')})`);
@@ -119,9 +119,9 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               DATE_FORMAT(v.expiry_date, '%Y-%m-%d %H:%i') AS expiry_at,
               DATE_FORMAT(v.first_used_at, '%Y-%m-%d %H:%i') AS first_used_at,
               DATE_FORMAT(v.use_expires_at, '%Y-%m-%d %H:%i') AS use_expires_at,
-              (SELECT c.code FROM codestab c
-                 WHERE c.uid = v.uid AND c.producttype = v.package_type AND c.codestatus = 2
-                 ORDER BY c.dateused DESC, c.id DESC LIMIT 1) AS source_code,
+              (SELECT acu.code FROM activation_code_usagetab acu
+                 WHERE acu.to_uid = v.uid
+                 ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
        LEFT JOIN memberstab m ON m.uid = v.uid
