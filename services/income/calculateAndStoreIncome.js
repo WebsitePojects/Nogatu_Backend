@@ -68,7 +68,13 @@ async function calculateAndStoreIncome(uid, accttype) {
 
     const newDref = Math.max(0, drefResult.directreferral - Number(stored.ttlincome1 || 0));
     const newPairing = Math.max(0, pairingResult.totalPay - Number(stored.ttlincome2 || 0));
-    const newLeadership = Math.max(0, leadershipAmount - Number(stored.ttlincome3 || 0));
+    // leadership_credit_offset (V037, default 0 for everyone): a fixed per-account forgiveness
+    // shift so an account whose paid ttlincome3 exceeds its current engine entitlement can keep
+    // earning forward growth. Idempotent — steady state ttlincome3 = engine + offset (bounded).
+    const newLeadership = Math.max(
+      0,
+      leadershipAmount - Number(stored.ttlincome3 || 0) + Number(stored.leadership_credit_offset || 0)
+    );
     // Package Hi-Five cash is release-controlled through the claim-review flow.
     // Keep wallet/dashboard calculation from auto-crediting income5, or the same
     // entitlement can be credited again when admin approves the claim.
