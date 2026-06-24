@@ -17,6 +17,7 @@ const applicationLimiter = rateLimit({
 function normalizeApplicationFields(body = {}) {
   return {
     name: String(body?.name || '').trim(),
+    sponsorName: String(body?.sponsorName || '').trim(),
     phone: String(body?.phone || '').trim(),
     email: String(body?.email || '').trim().toLowerCase(),
   };
@@ -42,13 +43,13 @@ router.post('/', applicationLimiter, async (req, res) => {
   try {
     await ensureApplicationsTable();
 
-    const { name, phone, email } = normalizeApplicationFields(req.body);
+    const { name, sponsorName, phone, email } = normalizeApplicationFields(req.body);
 
-    if (!name || !phone || !email) {
-      return res.status(400).json({ error: 'Name, contact number, and email are required.' });
+    if (!name || !sponsorName || !phone || !email) {
+      return res.status(400).json({ error: 'Name, sponsor full name, contact number, and email are required.' });
     }
 
-    if (name.length > 150 || phone.length > 50 || email.length > 200) {
+    if (name.length > 150 || sponsorName.length > 150 || phone.length > 50 || email.length > 200) {
       return res.status(400).json({ error: 'One or more fields are too long.' });
     }
 
@@ -75,10 +76,10 @@ router.post('/', applicationLimiter, async (req, res) => {
 
     const [result] = await pool.query(
       `INSERT INTO distributor_applicationstab
-       (name, phone, email, letter_of_intent_url, letter_of_intent_public_id, letter_of_intent_filename,
+       (name, sponsor_name, phone, email, letter_of_intent_url, letter_of_intent_public_id, letter_of_intent_filename,
         letter_of_intent_uploaded_at, status, follow_up_status, ip_address, submitted_at)
-       VALUES (?, ?, ?, NULL, NULL, NULL, NULL, 'pending', 'new', ?, NOW())`,
-      [name, phone, email, req.ip || null]
+       VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 'pending', 'new', ?, NOW())`,
+      [name, sponsorName, phone, email, req.ip || null]
     );
 
     res.json({

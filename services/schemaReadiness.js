@@ -175,6 +175,7 @@ const SCHEMA_REQUIREMENTS = {
     tables: ['distributor_applicationstab'],
     columns: {
       distributor_applicationstab: {
+        sponsor_name: { typeIncludes: 'varchar(150)' },
         age: {},
         letter_of_intent_url: { typeIncludes: 'varchar(500)' },
         letter_of_intent_public_id: { typeIncludes: 'varchar(255)' },
