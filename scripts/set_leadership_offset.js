@@ -45,6 +45,14 @@ const FORCE = process.argv.includes('--force');
 
     const engine = Number(await getLeadershipBonus(uid));
     const offset = Math.max(0, Number((stored - engine).toFixed(2)));
+
+    // Guard: this forgiveness offset only applies to OVER-credited accounts (stored > engine).
+    // If an account is NOT over-credited (offset would be 0) the feature is a no-op and writing
+    // it could mask an account that should just earn normally — skip explicitly, never write 0.
+    if (offset === 0) {
+      console.log(`uid ${uid}: stored=${stored} engine=${engine.toFixed(2)} -> NOT over-credited (stored<=engine); no offset needed — skipped`);
+      continue;
+    }
     console.log(`uid ${uid}: stored=${stored} engine=${engine.toFixed(2)} -> NEW offset=${offset} (was ${curOff})`);
 
     if (COMMIT) {
