@@ -207,12 +207,14 @@ router.post('/', handleUpload, async (req, res) => {
 
     uploadedUrl = await uploadToCloudinary(req.file);
     const mediaUrl = uploadedUrl || normalizeImageUrl(image_url);
+    // Keep the original upload name so downloads retain it (fl_attachment) instead of "file".
+    const mediaFilename = req.file ? String(req.file.originalname || '').slice(0, 255) : null;
 
     const [result] = await pool.query(
-      'INSERT INTO newstab (title, content, type, image_url, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO newstab (title, content, type, image_url, media_filename, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
       // created_by is an INT column → use the numeric admin id, not the username string
       // (req.session.adminid is the username; adminNumericId is accesstab.id).
-      [normalizedTitle, normalizedContent, type, mediaUrl, isPublished ? 1 : 0, req.session.adminNumericId || null]
+      [normalizedTitle, normalizedContent, type, mediaUrl, mediaFilename, isPublished ? 1 : 0, req.session.adminNumericId || null]
     );
 
     res.json({ success: true, id: result.insertId, image_url: mediaUrl });
@@ -259,15 +261,18 @@ router.put('/:id', handleUpload, async (req, res) => {
       return res.status(400).json({ error: 'Content is too long (max 8000 characters)' });
     }
 
-    // Fetch existing post to get old media URL for cleanup
-    const [[existing]] = await pool.query('SELECT image_url FROM newstab WHERE id = ?', [id]);
+    // Fetch existing post to get old media URL + filename for cleanup / retention
+    const [[existing]] = await pool.query('SELECT image_url, media_filename FROM newstab WHERE id = ?', [id]);
     const oldMediaUrl = existing?.image_url || null;
+    const oldMediaFilename = existing?.media_filename || null;
 
     let mediaUrl;
+    let mediaFilename;
     let oldToDelete = null; // delete the replaced/cleared asset only AFTER the row updates
     if (req.file) {
       newUploadedUrl = await uploadToCloudinary(req.file);
       mediaUrl = newUploadedUrl;
+      mediaFilename = String(req.file.originalname || '').slice(0, 255);
       if (oldMediaUrl && oldMediaUrl !== mediaUrl) {
         oldToDelete = oldMediaUrl;
       }
@@ -278,14 +283,16 @@ router.put('/:id', handleUpload, async (req, res) => {
         oldToDelete = oldMediaUrl;
       }
       mediaUrl = requestedUrl;
+      mediaFilename = null; // external/cleared media has no original upload name
     } else {
-      // Not changing media — keep existing
+      // Not changing media — keep existing url + filename
       mediaUrl = oldMediaUrl;
+      mediaFilename = oldMediaFilename;
     }
 
     await pool.query(
-      'UPDATE newstab SET title = ?, content = ?, type = ?, image_url = ?, is_published = ? WHERE id = ?',
-      [normalizedTitle, normalizedContent, type || 'news', mediaUrl, isPublished ? 1 : 0, id]
+      'UPDATE newstab SET title = ?, content = ?, type = ?, image_url = ?, media_filename = ?, is_published = ? WHERE id = ?',
+      [normalizedTitle, normalizedContent, type || 'news', mediaUrl, mediaFilename, isPublished ? 1 : 0, id]
     );
 
     // Row is safely updated — now remove the old asset (non-blocking). Deferring this
