@@ -8,7 +8,7 @@ const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getRankProgress } = require('../services/ranking');
 const { getRankingExplanation } = require('../services/rankingTransparency');
-const { listRankableEventsForMember } = require('../services/rankingRace');
+const { listRankableEventsForMember, listAllContributingEventsForMember } = require('../services/rankingRace');
 
 /**
  * GET /api/ranking
@@ -47,8 +47,11 @@ router.get('/events', memberAuth, async (req, res) => {
     const uid = Number(req.session.uid);
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = Math.min(100, Math.max(5, Number(req.query.perPage) || 25));
+    const scope = req.query.scope === 'full' ? 'full' : 'remaining';
 
-    const events = await listRankableEventsForMember(uid);
+    const events = scope === 'full'
+      ? await listAllContributingEventsForMember(uid)
+      : await listRankableEventsForMember(uid);
     const sorted = [...events].sort((a, b) =>
       String(b.sourceEventTs || '').localeCompare(String(a.sourceEventTs || ''))
       || Number(b.sourceEventId || 0) - Number(a.sourceEventId || 0));
@@ -80,6 +83,8 @@ router.get('/events', memberAuth, async (req, res) => {
           sourceName: (m?.fullname && m.fullname.trim()) || m?.username || `UID ${r.sourceMemberUid}`,
           depth: Number(r.sourceDepth || 0),
           points: Number(r.points || 0),
+          consumed: Number(r.consumedPoints || 0),
+          remaining: Number(r.remainingPoints ?? r.points ?? 0),
           eventTs: r.sourceEventTs,
           processId: r.sourceProcessId || null,
         };
@@ -89,7 +94,10 @@ router.get('/events', memberAuth, async (req, res) => {
       page,
       perPage,
       totalPages: Math.max(1, Math.ceil(total / perPage)),
-      basisLabel: 'Remaining rankable repurchase points',
+      scope,
+      basisLabel: scope === 'full'
+        ? 'All contributing repurchase points (lifetime)'
+        : 'Remaining rankable repurchase points',
     });
   } catch (err) {
     console.error('[Ranking] Events error:', err);

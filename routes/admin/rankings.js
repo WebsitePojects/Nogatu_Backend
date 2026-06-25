@@ -6,7 +6,7 @@ const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAllRankings, processIncentive } = require('../../services/ranking');
-const { listRankableEventsForMember } = require('../../services/rankingRace');
+const { listRankableEventsForMember, listAllContributingEventsForMember } = require('../../services/rankingRace');
 
 /**
  * GET /api/admin/rankings?page=1
@@ -63,8 +63,11 @@ router.get('/:uid/events', adminAuth, adminRights([1, 3]), async (req, res) => {
     }
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = Math.min(100, Math.max(5, Number(req.query.perPage) || 25));
+    const scope = req.query.scope === 'full' ? 'full' : 'remaining';
 
-    const events = await listRankableEventsForMember(uid);
+    const events = scope === 'full'
+      ? await listAllContributingEventsForMember(uid)
+      : await listRankableEventsForMember(uid);
     const sorted = [...events].sort((a, b) =>
       String(b.sourceEventTs || '').localeCompare(String(a.sourceEventTs || ''))
       || Number(b.sourceEventId || 0) - Number(a.sourceEventId || 0));
@@ -96,6 +99,8 @@ router.get('/:uid/events', adminAuth, adminRights([1, 3]), async (req, res) => {
           sourceName: (m?.fullname && m.fullname.trim()) || m?.username || `UID ${r.sourceMemberUid}`,
           depth: Number(r.sourceDepth || 0),
           points: Number(r.points || 0),
+          consumed: Number(r.consumedPoints || 0),
+          remaining: Number(r.remainingPoints ?? r.points ?? 0),
           eventTs: r.sourceEventTs,
         };
       }),
@@ -104,7 +109,10 @@ router.get('/:uid/events', adminAuth, adminRights([1, 3]), async (req, res) => {
       page,
       perPage,
       totalPages: Math.max(1, Math.ceil(total / perPage)),
-      basisLabel: 'Remaining rankable repurchase points',
+      scope,
+      basisLabel: scope === 'full'
+        ? 'All contributing repurchase points (lifetime)'
+        : 'Remaining rankable repurchase points',
     });
   } catch (err) {
     console.error('[Admin Rankings] Events error:', err);

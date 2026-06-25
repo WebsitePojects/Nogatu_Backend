@@ -136,6 +136,75 @@ async function listRankableEventsForMember(uid, conn = pool) {
   })));
 }
 
+// Full contributing ledger: EVERY repurchase event in the member's sponsor tree that
+// carries ranking points — gross + consumed + remaining per event (no remaining filter).
+// Powers the "Full ledger" history view so it reconciles to lifetime gross (e.g. 10,860),
+// not just the unconsumed tail.
+const SPONSOR_TREE_SQL_FULL = `
+  WITH RECURSIVE sponsor_tree AS (
+    SELECT uid, 0 AS depth FROM usertab WHERE uid = ?
+    UNION ALL
+    SELECT u.uid, st.depth + 1 FROM usertab u
+      INNER JOIN sponsor_tree st ON u.drefid = st.uid AND u.uid <> st.uid
+     WHERE st.depth < 30
+  ),
+  gc_totals AS (
+    SELECT repurchase_id, SUM(points_consumed) AS total_consumed
+    FROM rank_global_consumptiontab GROUP BY repurchase_id
+  )
+  SELECT
+    r.id AS repurchase_id, r.uid AS source_member_uid, st.depth AS source_depth,
+    COALESCE(r.incentivepoints1, 0) AS gross_points,
+    COALESCE(gc.total_consumed, 0) AS consumed_points,
+    GREATEST(0, COALESCE(r.incentivepoints1,0) - COALESCE(gc.total_consumed,0)) AS remaining_points,
+    r.transdate AS source_event_ts
+  FROM repurchasetab r
+    INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth > 0
+    LEFT JOIN gc_totals gc ON gc.repurchase_id = r.id
+  WHERE COALESCE(r.incentivepoints1, 0) > 0
+  ORDER BY r.transdate ASC, r.id ASC, r.uid ASC
+`;
+
+const SPONSOR_TREE_SQL_FULL_NO_GC = `
+  WITH RECURSIVE sponsor_tree AS (
+    SELECT uid, 0 AS depth FROM usertab WHERE uid = ?
+    UNION ALL
+    SELECT u.uid, st.depth + 1 FROM usertab u
+      INNER JOIN sponsor_tree st ON u.drefid = st.uid AND u.uid <> st.uid
+     WHERE st.depth < 30
+  )
+  SELECT r.id AS repurchase_id, r.uid AS source_member_uid, st.depth AS source_depth,
+    COALESCE(r.incentivepoints1,0) AS gross_points, 0 AS consumed_points,
+    COALESCE(r.incentivepoints1,0) AS remaining_points, r.transdate AS source_event_ts
+  FROM repurchasetab r INNER JOIN sponsor_tree st ON st.uid = r.uid AND st.depth > 0
+  WHERE COALESCE(r.incentivepoints1,0) > 0
+  ORDER BY r.transdate ASC, r.id ASC, r.uid ASC
+`;
+
+async function listAllContributingEventsForMember(uid, conn = pool) {
+  const memberUid = toNumber(uid);
+  let rows;
+  try {
+    [rows] = await conn.query(SPONSOR_TREE_SQL_FULL, [memberUid]);
+  } catch (err) {
+    if (err.code === 'ER_NO_SUCH_TABLE') {
+      [rows] = await conn.query(SPONSOR_TREE_SQL_FULL_NO_GC, [memberUid]);
+    } else {
+      throw err;
+    }
+  }
+  return sortRankableEvents((rows || []).map((row) => ({
+    sourceEventId:   toNumber(row.repurchase_id),
+    sourceMemberUid: toNumber(row.source_member_uid),
+    sourceDepth:     toNumber(row.source_depth),
+    points:          toNumber(row.gross_points), // header total reflects lifetime gross
+    grossPoints:     toNumber(row.gross_points),
+    consumedPoints:  toNumber(row.consumed_points),
+    remainingPoints: toNumber(row.remaining_points),
+    sourceEventTs:   row.source_event_ts,
+  })));
+}
+
 // ---------------------------------------------------------------------------
 // Point consumption helpers
 // ---------------------------------------------------------------------------
@@ -329,6 +398,7 @@ function computeDisplayBasis({ grossRankablePoints = 0, consumedPoints = 0, newC
 
 module.exports = {
   listRankableEventsForMember,
+  listAllContributingEventsForMember,
   sortRankableEvents,
   consumePointsForRank,
   computeRankAwardsFromEvents,
