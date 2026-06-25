@@ -38,7 +38,7 @@ function firstRowByCode(rows, codeField = 'code') {
  * Generate activation codes
  * Mirrors PHP adminpanel/generate-codes.php
  */
-router.post('/generate', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const { noOfCodes, productType, codeType } = req.body;
 
@@ -68,7 +68,7 @@ router.post('/generate', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
  * GET /api/admin/codes?page=1&q=keyword
  * List all codes (paginated, 100 per page) with optional code search
  */
-router.get('/', adminAuth, async (req, res) => {
+router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const page = Math.max(1, Number(req.query.page) || 1);
@@ -227,7 +227,7 @@ router.get('/', adminAuth, async (req, res) => {
   }
 });
 
-router.get('/history', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.get('/history', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page) || 1);
     const q = (req.query.q || '').trim();
@@ -240,7 +240,7 @@ router.get('/history', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
   }
 });
 
-router.get('/history/export', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.get('/history/export', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
     const history = await listAdminActivationHistory({ page: 1, perPage: 1000, codeQuery: q });
@@ -271,7 +271,7 @@ router.get('/history/export', adminAuth, adminRights([1, 2, 3]), async (req, res
  * GET /api/admin/codes/lookup-account?username=00001
  * Legacy parity helper: search and tag transfer account by username
  */
-router.get('/lookup-account', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.get('/lookup-account', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const username = sanitizeAlphaNum((req.query.username || '').trim());
     if (!username) {
@@ -305,7 +305,7 @@ router.get('/lookup-account', adminAuth, adminRights([1, 2, 3]), async (req, res
  * POST /api/admin/codes/release
  * Release codes for distribution
  */
-router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.post('/release', adminAuth, adminRights([1, 3]), async (req, res) => {
   let conn;
   try {
     const { codes: selectedCodes } = req.body;
@@ -352,7 +352,7 @@ router.post('/release', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
  * POST /api/admin/codes/transfer
  * Transfer codes to member account
  */
-router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.post('/transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const { targetUsername, codes: selectedCodes } = req.body;
@@ -414,7 +414,7 @@ router.post('/transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => 
   }
 });
 
-router.post('/release-transfer', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+router.post('/release-transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
   let conn;
   try {
     const { targetUsername, codes: selectedCodes } = req.body;

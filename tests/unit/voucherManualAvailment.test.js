@@ -314,10 +314,13 @@ test('cashier manual voucher entries start as claimed while member requests stay
   );
 });
 
-test('cashier keeps generate-codes access in the admin router', () => {
+test('cashier is excluded from generate-codes (cashier = voucher only)', () => {
   const router = loadAdminCodesRouter();
   const handlers = getRouteHandlers(router, 'post', '/generate');
   const roleGuard = handlers.find((handler) => Array.isArray(handler.allowedRoles));
 
-  assert.deepEqual(roleGuard?.allowedRoles, [1, 2, 3]);
+  // Policy (2026-06-25): cashier (rights=2) may ONLY access voucher endpoints.
+  // Every /api/admin/codes route must exclude rights 2.
+  assert.deepEqual(roleGuard?.allowedRoles, [1, 3]);
+  assert.ok(!roleGuard.allowedRoles.includes(2), 'cashier must not reach code generation');
 });

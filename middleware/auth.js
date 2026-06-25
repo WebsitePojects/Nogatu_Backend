@@ -49,6 +49,9 @@ async function enforceMemberAccountStatus(req, res) {
 function resolveAdminViewAs(req) {
   if (req.session?.uid) return null;       // a real member session always wins
   if (!req.session?.adminid) return null;  // must be an authenticated admin
+  // Cashier (rights=2) is scoped to voucher endpoints only — never let them
+  // read a member's interface via the view-as header. Administrator/BOD only.
+  if (![1, 3].includes(Number(req.session?.adminrights))) return null;
   const target = Number(req.get('x-view-as-member') || 0);
   return Number.isInteger(target) && target > 0 ? target : null;
 }
