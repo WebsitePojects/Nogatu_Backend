@@ -9,6 +9,7 @@ const {
   normalizeVoucherAvailmentItems,
   computeVoucherAvailmentBalanceUpdate,
   computeVoucherManualAvailmentWalletUpdate,
+  normalizePaymentMethod,
   resolveVoucherAvailmentClaimUpdate,
   resolveInitialVoucherAvailmentClaimState,
 } = require('../../services/voucher');
@@ -218,6 +219,55 @@ test('manual voucher availment rejects when wallet cannot match voucher usage', 
     }),
     /Insufficient wallet balance/
   );
+});
+
+test('payment method normalizes to wallet | cash with a safe fallback', () => {
+  assert.equal(normalizePaymentMethod('cash'), 'cash');
+  assert.equal(normalizePaymentMethod('CASH'), 'cash');
+  assert.equal(normalizePaymentMethod('wallet'), 'wallet');
+  assert.equal(normalizePaymentMethod(''), 'wallet');
+  assert.equal(normalizePaymentMethod('weird'), 'wallet');
+  assert.equal(normalizePaymentMethod(undefined, 'cash'), 'cash');
+});
+
+test('cash (office) availment never debits the e-wallet, even on create', () => {
+  // create as cash: walletApplies=false, no prior debit
+  const created = computeVoucherManualAvailmentWalletUpdate({
+    walletBalance: 0,            // member has zero balance — still allowed
+    previousTotal: 0,
+    nextTotal: 500,
+    previousWalletApplied: false,
+    walletApplies: false,
+  });
+  assert.equal(created.cashDelta, 0);
+  assert.equal(created.walletBalance, 0);   // untouched
+  assert.equal(created.walletApplied, false);
+  assert.equal(created.cashPaid, 500);
+  assert.equal(created.totalValue, 1000);
+});
+
+test('switching a wallet availment to cash refunds the prior wallet debit', () => {
+  const edited = computeVoucherManualAvailmentWalletUpdate({
+    walletBalance: 200,         // 700 - 500 already debited earlier
+    previousTotal: 500,
+    nextTotal: 500,
+    previousWalletApplied: true,  // old method was wallet
+    walletApplies: false,         // new method cash
+  });
+  assert.equal(edited.cashDelta, -500);     // refund
+  assert.equal(edited.walletBalance, 700);  // credited back
+});
+
+test('switching a cash availment to wallet debits the new total', () => {
+  const edited = computeVoucherManualAvailmentWalletUpdate({
+    walletBalance: 1000,
+    previousTotal: 500,
+    nextTotal: 500,
+    previousWalletApplied: false, // old method cash (no prior debit)
+    walletApplies: true,          // new method wallet
+  });
+  assert.equal(edited.cashDelta, 500);
+  assert.equal(edited.walletBalance, 500);
 });
 
 test('voucher request claim update only allows requested entries to be marked claimed', () => {

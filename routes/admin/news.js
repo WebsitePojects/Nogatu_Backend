@@ -85,6 +85,14 @@ function toBool(value, fallback = true) {
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
 }
 
+// Admin-chosen display date (YYYY-MM-DD). Empty → null (falls back to created_at).
+function normalizePostDate(value) {
+  const s = String(value || '').trim();
+  if (!s) return null;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+}
+
 // Resource type of a Cloudinary asset, inferred from its delivery URL.
 function cloudinaryResourceType(url) {
   if (url.includes('/video/upload/')) return 'video';
@@ -170,7 +178,7 @@ router.use(async (_req, res, next) => {
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(
-      'SELECT * FROM newstab ORDER BY created_at DESC'
+      'SELECT * FROM newstab ORDER BY COALESCE(post_date, DATE(created_at)) DESC, id DESC'
     );
     res.json({ posts: rows });
   } catch (err) {
@@ -209,12 +217,13 @@ router.post('/', handleUpload, async (req, res) => {
     const mediaUrl = uploadedUrl || normalizeImageUrl(image_url);
     // Keep the original upload name so downloads retain it (fl_attachment) instead of "file".
     const mediaFilename = req.file ? String(req.file.originalname || '').slice(0, 255) : null;
+    const postDate = normalizePostDate(req.body.post_date);
 
     const [result] = await pool.query(
-      'INSERT INTO newstab (title, content, type, image_url, media_filename, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO newstab (title, content, type, post_date, image_url, media_filename, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       // created_by is an INT column → use the numeric admin id, not the username string
       // (req.session.adminid is the username; adminNumericId is accesstab.id).
-      [normalizedTitle, normalizedContent, type, mediaUrl, mediaFilename, isPublished ? 1 : 0, req.session.adminNumericId || null]
+      [normalizedTitle, normalizedContent, type, postDate, mediaUrl, mediaFilename, isPublished ? 1 : 0, req.session.adminNumericId || null]
     );
 
     res.json({ success: true, id: result.insertId, image_url: mediaUrl });
@@ -290,9 +299,10 @@ router.put('/:id', handleUpload, async (req, res) => {
       mediaFilename = oldMediaFilename;
     }
 
+    const postDate = normalizePostDate(req.body.post_date);
     await pool.query(
-      'UPDATE newstab SET title = ?, content = ?, type = ?, image_url = ?, media_filename = ?, is_published = ? WHERE id = ?',
-      [normalizedTitle, normalizedContent, type || 'news', mediaUrl, mediaFilename, isPublished ? 1 : 0, id]
+      'UPDATE newstab SET title = ?, content = ?, type = ?, post_date = ?, image_url = ?, media_filename = ?, is_published = ? WHERE id = ?',
+      [normalizedTitle, normalizedContent, type || 'news', postDate, mediaUrl, mediaFilename, isPublished ? 1 : 0, id]
     );
 
     // Row is safely updated — now remove the old asset (non-blocking). Deferring this

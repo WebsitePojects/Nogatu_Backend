@@ -88,6 +88,35 @@ router.get('/history', memberAuth, async (req, res) => {
 });
 
 /**
+ * GET /api/codes/resolve-member?username=X
+ * Resolve a target username to a member full name so the transfer/activation
+ * confirmation can show WHO the code goes to (prevents activating for the wrong person).
+ */
+router.get('/resolve-member', memberAuth, async (req, res) => {
+  try {
+    const username = sanitizeAlphaNum(req.query.username || '');
+    if (!username) {
+      return res.status(400).json({ error: 'Username is required' });
+    }
+    const [rows] = await pool.query(
+      'SELECT username, firstname, lastname FROM memberstab WHERE username = ? LIMIT 1',
+      [username]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+    const r = rows[0];
+    res.json({
+      username: r.username,
+      fullName: `${r.firstname || ''} ${r.lastname || ''}`.trim() || r.username,
+    });
+  } catch (err) {
+    console.error('[Codes] resolve-member error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
  * POST /api/codes/transfer
  * Transfer codes to another member
  */
