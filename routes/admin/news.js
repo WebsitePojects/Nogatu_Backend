@@ -78,6 +78,22 @@ function normalizeImageUrl(imageUrl) {
   return trimmed;
 }
 
+// Optional admin-supplied "memo date". Accepts an empty value (falls back to
+// created_at on display) or a strict YYYY-MM-DD calendar date. Returned as a plain
+// string so MySQL stores it as a DATE with no timezone shifting.
+function normalizeDisplayDate(value) {
+  const trimmed = String(value ?? '').trim();
+  if (!trimmed) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    throw new Error('Display date must be in YYYY-MM-DD format');
+  }
+  const parsed = new Date(`${trimmed}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('Display date is invalid');
+  }
+  return trimmed;
+}
+
 function toBool(value, fallback = true) {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'boolean') return value;
@@ -170,7 +186,11 @@ router.use(async (_req, res, next) => {
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(
-      'SELECT * FROM newstab ORDER BY created_at DESC'
+      `SELECT id, title, content, type, image_url, media_filename, is_published,
+              created_by, created_at, updated_at,
+              DATE_FORMAT(display_date, '%Y-%m-%d') AS display_date
+         FROM newstab
+        ORDER BY COALESCE(display_date, DATE(created_at)) DESC, created_at DESC`
     );
     res.json({ posts: rows });
   } catch (err) {
@@ -187,6 +207,7 @@ router.post('/', handleUpload, async (req, res) => {
     const isPublished = toBool(req.body?.is_published, true);
     const normalizedTitle = String(title || '').trim();
     const normalizedContent = String(content || '').trim();
+    const displayDate = normalizeDisplayDate(req.body?.display_date);
 
     if (!['news', 'announcement', 'promo', 'memo'].includes(type)) {
       return res.status(400).json({ error: 'Invalid type' });
@@ -211,10 +232,10 @@ router.post('/', handleUpload, async (req, res) => {
     const mediaFilename = req.file ? String(req.file.originalname || '').slice(0, 255) : null;
 
     const [result] = await pool.query(
-      'INSERT INTO newstab (title, content, type, image_url, media_filename, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO newstab (title, content, type, image_url, media_filename, is_published, created_by, display_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       // created_by is an INT column → use the numeric admin id, not the username string
       // (req.session.adminid is the username; adminNumericId is accesstab.id).
-      [normalizedTitle, normalizedContent, type, mediaUrl, mediaFilename, isPublished ? 1 : 0, req.session.adminNumericId || null]
+      [normalizedTitle, normalizedContent, type, mediaUrl, mediaFilename, isPublished ? 1 : 0, req.session.adminNumericId || null, displayDate]
     );
 
     res.json({ success: true, id: result.insertId, image_url: mediaUrl });
@@ -223,7 +244,9 @@ router.post('/', handleUpload, async (req, res) => {
     // create failed at the DB). Remove the just-uploaded asset so it can't linger forever.
     if (uploadedUrl) deleteFromCloudinary(uploadedUrl).catch(() => {});
     console.error('[Admin/News] POST error:', err.message);
-    if (err.code === 'UPLOAD_NOT_CONFIGURED' || String(err.message || '').includes('Image URL must start')) {
+    if (err.code === 'UPLOAD_NOT_CONFIGURED'
+      || String(err.message || '').includes('Image URL must start')
+      || String(err.message || '').includes('Display date')) {
       return res.status(400).json({ error: err.message });
     }
     res.status(500).json({ error: 'Failed to create post' });
@@ -243,6 +266,7 @@ router.put('/:id', handleUpload, async (req, res) => {
     const isPublished = toBool(req.body?.is_published, true);
     const normalizedTitle = String(title || '').trim();
     const normalizedContent = String(content || '').trim();
+    const displayDate = normalizeDisplayDate(req.body?.display_date);
 
     const effectiveType = type || 'news';
     if (!['news', 'announcement', 'promo', 'memo'].includes(effectiveType)) {
@@ -291,8 +315,8 @@ router.put('/:id', handleUpload, async (req, res) => {
     }
 
     await pool.query(
-      'UPDATE newstab SET title = ?, content = ?, type = ?, image_url = ?, media_filename = ?, is_published = ? WHERE id = ?',
-      [normalizedTitle, normalizedContent, type || 'news', mediaUrl, mediaFilename, isPublished ? 1 : 0, id]
+      'UPDATE newstab SET title = ?, content = ?, type = ?, image_url = ?, media_filename = ?, is_published = ?, display_date = ? WHERE id = ?',
+      [normalizedTitle, normalizedContent, type || 'news', mediaUrl, mediaFilename, isPublished ? 1 : 0, displayDate, id]
     );
 
     // Row is safely updated — now remove the old asset (non-blocking). Deferring this
@@ -304,7 +328,9 @@ router.put('/:id', handleUpload, async (req, res) => {
     // Orphan cleanup: a new file uploaded but the update failed → delete the new asset.
     if (newUploadedUrl) deleteFromCloudinary(newUploadedUrl).catch(() => {});
     console.error('[Admin/News] PUT error:', err.message);
-    if (err.code === 'UPLOAD_NOT_CONFIGURED' || String(err.message || '').includes('Image URL must start')) {
+    if (err.code === 'UPLOAD_NOT_CONFIGURED'
+      || String(err.message || '').includes('Image URL must start')
+      || String(err.message || '').includes('Display date')) {
       return res.status(400).json({ error: err.message });
     }
     res.status(500).json({ error: 'Failed to update post' });
