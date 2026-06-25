@@ -265,6 +265,7 @@ router.post('/:id/availments', adminAuth, adminRights([1, 2, 3]), async (req, re
       erNumber: req.body?.erNumber,
       items: req.body?.items,
       note: req.body?.note,
+      paymentMethod: req.body?.paymentMethod,
       ...getVoucherActor(req),
     });
     res.status(201).json({ success: true, availment });
@@ -294,6 +295,7 @@ router.put('/availments/:availmentId', adminAuth, adminRights([1, 2, 3]), async 
       erNumber: req.body?.erNumber,
       items: req.body?.items,
       note: req.body?.note,
+      paymentMethod: req.body?.paymentMethod,
       ...getVoucherActor(req),
     });
     res.json({ success: true, availment });

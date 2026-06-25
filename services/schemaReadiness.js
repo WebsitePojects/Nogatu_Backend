@@ -217,6 +217,7 @@ const SCHEMA_REQUIREMENTS = {
         claimed_at: {},
         claimed_by_admin: { typeIncludes: 'varchar(120)' },
         note: { typeIncludes: 'varchar(500)' },
+        payment_method: { typeIncludes: 'varchar(16)' },
       },
       voucher_availment_itemstab: {
         item_label: { typeIncludes: 'varchar(255)' },

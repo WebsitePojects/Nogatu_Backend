@@ -247,20 +247,35 @@ function computeVoucherAvailmentBalanceUpdate({
   };
 }
 
+// 'wallet' deducts the member e-wallet; 'cash' = paid in cash at the office (no wallet debit).
+function normalizePaymentMethod(value, fallback = 'wallet') {
+  const v = String(value || '').trim().toLowerCase();
+  if (v === 'cash') return 'cash';
+  if (v === 'wallet') return 'wallet';
+  return fallback;
+}
+
 function computeVoucherManualAvailmentWalletUpdate({
   walletBalance,
   previousTotal = 0,
   nextTotal,
+  previousWalletApplied = true,
+  walletApplies = true,
 }) {
   const currentWalletBalance = roundCurrency(walletBalance);
-  const priorCashPaid = roundCurrency(previousTotal);
   const nextCashPaid = roundCurrency(nextTotal);
 
   if (!Number.isFinite(nextCashPaid) || nextCashPaid <= 0) {
     throw new Error('Voucher availment total must be greater than 0');
   }
 
-  const cashDelta = roundCurrency(nextCashPaid - priorCashPaid);
+  // Only a 'wallet' payment debits the e-wallet. A 'cash' (paid-at-office) availment
+  // leaves the wallet untouched. On edit, refund the prior wallet debit if it applied
+  // (e.g. switching a wallet availment to cash credits the wallet back).
+  const priorWalletDebit = previousWalletApplied ? roundCurrency(previousTotal) : 0;
+  const nextWalletDebit = walletApplies ? nextCashPaid : 0;
+  const cashDelta = roundCurrency(nextWalletDebit - priorWalletDebit);
+
   if (cashDelta > currentWalletBalance) {
     throw new Error('Insufficient wallet balance for this voucher availment');
   }
@@ -271,6 +286,7 @@ function computeVoucherManualAvailmentWalletUpdate({
     voucherUsed: nextCashPaid,
     totalValue: roundCurrency(nextCashPaid * 2),
     walletBalance: roundCurrency(currentWalletBalance - cashDelta),
+    walletApplied: walletApplies,
   };
 }
 
@@ -727,6 +743,7 @@ function formatVoucherAvailmentRow(row, items = []) {
     availmentDate: row.availment_date,
     totalAmount: Number(row.total_amount || 0),
     note: row.note || null,
+    paymentMethod: row.payment_method || 'wallet',
     requestSource: row.request_source || 'cashier',
     claimStatus: row.claim_status || 'requested',
     claimedAt: row.claimed_at || null,
@@ -746,7 +763,7 @@ async function fetchVoucherAvailmentRecord(conn, availmentId) {
   const [rows] = await conn.query(
     `SELECT a.id, a.voucher_id, a.uid, a.er_number,
             DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date,
-            a.total_amount, a.note, a.transaction_id, a.request_source, a.claim_status,
+            a.total_amount, a.note, a.payment_method, a.transaction_id, a.request_source, a.claim_status,
             DATE_FORMAT(a.claimed_at, '%Y-%m-%d %H:%i') AS claimed_at,
             a.claimed_by_admin,
             a.created_by_admin, a.updated_by_admin,
@@ -774,7 +791,7 @@ async function getVoucherAvailments(voucherId) {
   const [rows] = await pool.query(
     `SELECT a.id, a.voucher_id, a.uid, a.er_number,
             DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date,
-            a.total_amount, a.note, a.transaction_id, a.request_source, a.claim_status,
+            a.total_amount, a.note, a.payment_method, a.transaction_id, a.request_source, a.claim_status,
             DATE_FORMAT(a.claimed_at, '%Y-%m-%d %H:%i') AS claimed_at,
             a.claimed_by_admin,
             a.created_by_admin, a.updated_by_admin,
@@ -842,6 +859,7 @@ async function createManualVoucherAvailment({
   erNumber,
   items,
   note,
+  paymentMethod,
   actorAdminId = null,
   actorAdmin = null,
   requestSource = 'cashier',
@@ -859,6 +877,8 @@ async function createManualVoucherAvailment({
   }
 
   const safeNote = normalizeNote(note);
+  const safePaymentMethod = normalizePaymentMethod(paymentMethod);
+  const walletApplies = safePaymentMethod === 'wallet';
 
   const normalized = normalizeVoucherAvailmentItems(items);
   if (normalized.items.length === 0) {
@@ -900,23 +920,42 @@ async function createManualVoucherAvailment({
       nextTotal: normalized.totalAmount,
       now: safeAvailmentDate,
     });
-    const [walletRows] = await conn.query(
-      'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
-      [Number(voucher.uid || 0)]
-    );
-    if (walletRows.length === 0) {
-      throw new Error('Member wallet balance was not found');
+
+    // 'wallet' availments debit the member e-wallet (and need the wallet row locked).
+    // 'cash' (paid at office) availments skip the wallet entirely — so a walk-in with
+    // no payouttotaltab row can still avail. Voucher is consumed in both cases.
+    let walletUpdate;
+    if (walletApplies) {
+      const [walletRows] = await conn.query(
+        'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+        [Number(voucher.uid || 0)]
+      );
+      if (walletRows.length === 0) {
+        throw new Error('Member wallet balance was not found');
+      }
+      walletUpdate = computeVoucherManualAvailmentWalletUpdate({
+        walletBalance: walletRows[0].ttlcashbalance,
+        previousTotal: 0,
+        nextTotal: normalized.totalAmount,
+        previousWalletApplied: false,
+        walletApplies: true,
+      });
+    } else {
+      // Cash: no wallet debit; record the physical cash + 2× value for the transaction row.
+      walletUpdate = {
+        cashDelta: 0,
+        cashPaid: roundCurrency(normalized.totalAmount),
+        voucherUsed: roundCurrency(normalized.totalAmount),
+        totalValue: roundCurrency(normalized.totalAmount * 2),
+        walletBalance: null,
+        walletApplied: false,
+      };
     }
-    const walletUpdate = computeVoucherManualAvailmentWalletUpdate({
-      walletBalance: walletRows[0].ttlcashbalance,
-      previousTotal: 0,
-      nextTotal: normalized.totalAmount,
-    });
 
     const [availmentResult] = await conn.query(
       `INSERT INTO voucher_availmentstab
-        (voucher_id, uid, er_number, availment_date, total_amount, note, request_source, claim_status, claimed_at, claimed_by_admin_id, claimed_by_admin, created_by_admin_id, created_by_admin, updated_by_admin_id, updated_by_admin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (voucher_id, uid, er_number, availment_date, total_amount, note, payment_method, request_source, claim_status, claimed_at, claimed_by_admin_id, claimed_by_admin, created_by_admin_id, created_by_admin, updated_by_admin_id, updated_by_admin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         safeVoucherId,
         Number(voucher.uid || 0),
@@ -924,6 +963,7 @@ async function createManualVoucherAvailment({
         safeAvailmentDate,
         normalized.totalAmount,
         safeNote,
+        safePaymentMethod,
         String(requestSource || 'cashier').trim() || 'cashier',
         claimState.claimStatus,
         toDateOrNull(claimState.claimedAt),
@@ -958,13 +998,15 @@ async function createManualVoucherAvailment({
       ]
     );
 
-    await conn.query(
-      'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = NOW() WHERE uid = ? LIMIT 1',
-      [
-        walletUpdate.walletBalance,
-        Number(voucher.uid || 0),
-      ]
-    );
+    if (walletApplies && walletUpdate.walletBalance !== null) {
+      await conn.query(
+        'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = NOW() WHERE uid = ? LIMIT 1',
+        [
+          walletUpdate.walletBalance,
+          Number(voucher.uid || 0),
+        ]
+      );
+    }
 
     await conn.query(
       'UPDATE voucher_availmentstab SET transaction_id = ? WHERE id = ? LIMIT 1',
@@ -1119,6 +1161,7 @@ async function updateManualVoucherAvailment({
   erNumber,
   items,
   note,
+  paymentMethod,
   actorAdminId = null,
   actorAdmin = null,
 }) {
@@ -1137,6 +1180,7 @@ async function updateManualVoucherAvailment({
   // note === undefined → caller did not send the field → keep the existing note.
   const noteProvided = note !== undefined;
   const safeNote = noteProvided ? normalizeNote(note) : null;
+  const paymentProvided = paymentMethod !== undefined;
 
   const normalized = normalizeVoucherAvailmentItems(items);
   if (normalized.items.length === 0) {
@@ -1188,24 +1232,49 @@ async function updateManualVoucherAvailment({
       nextTotal: normalized.totalAmount,
       now: safeAvailmentDate,
     });
-    const [walletRows] = await conn.query(
-      'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
-      [Number(voucher.uid || 0)]
-    );
-    if (walletRows.length === 0) {
-      throw new Error('Member wallet balance was not found');
+
+    // Payment method: keep the existing one unless the caller sends a new one. The
+    // wallet is only touched when the OLD or NEW method is 'wallet' (a wallet→cash edit
+    // refunds the prior debit; cash→cash needs no wallet at all).
+    const existingMethod = normalizePaymentMethod(existingAvailment.payment_method, 'wallet');
+    const newMethod = paymentProvided ? normalizePaymentMethod(paymentMethod) : existingMethod;
+    const previousWalletApplied = existingMethod === 'wallet';
+    const walletApplies = newMethod === 'wallet';
+    const needWallet = walletApplies || previousWalletApplied;
+
+    let walletUpdate;
+    if (needWallet) {
+      const [walletRows] = await conn.query(
+        'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE',
+        [Number(voucher.uid || 0)]
+      );
+      if (walletRows.length === 0) {
+        throw new Error('Member wallet balance was not found');
+      }
+      walletUpdate = computeVoucherManualAvailmentWalletUpdate({
+        walletBalance: walletRows[0].ttlcashbalance,
+        previousTotal: Number(existingAvailment.total_amount || 0),
+        nextTotal: normalized.totalAmount,
+        previousWalletApplied,
+        walletApplies,
+      });
+    } else {
+      walletUpdate = {
+        cashDelta: 0,
+        cashPaid: roundCurrency(normalized.totalAmount),
+        voucherUsed: roundCurrency(normalized.totalAmount),
+        totalValue: roundCurrency(normalized.totalAmount * 2),
+        walletBalance: null,
+        walletApplied: false,
+      };
     }
-    const walletUpdate = computeVoucherManualAvailmentWalletUpdate({
-      walletBalance: walletRows[0].ttlcashbalance,
-      previousTotal: Number(existingAvailment.total_amount || 0),
-      nextTotal: normalized.totalAmount,
-    });
 
     await conn.query(
       `UPDATE voucher_availmentstab
           SET er_number = ?,
               availment_date = ?,
               total_amount = ?,
+              payment_method = ?,
               ${noteProvided ? 'note = ?,' : ''}
               updated_by_admin_id = ?,
               updated_by_admin = ?
@@ -1214,6 +1283,7 @@ async function updateManualVoucherAvailment({
         safeErNumber,
         safeAvailmentDate,
         normalized.totalAmount,
+        newMethod,
         ...(noteProvided ? [safeNote] : []),
         actorAdminId,
         actorAdmin,
@@ -1268,13 +1338,16 @@ async function updateManualVoucherAvailment({
       );
     }
 
-    await conn.query(
-      'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = NOW() WHERE uid = ? LIMIT 1',
-      [
-        walletUpdate.walletBalance,
-        Number(voucher.uid || 0),
-      ]
-    );
+    // Only write the wallet when a debit/refund actually applies (cash↔cash never does).
+    if (walletUpdate.walletBalance !== null) {
+      await conn.query(
+        'UPDATE payouttotaltab SET ttlcashbalance = ?, transdate = NOW() WHERE uid = ? LIMIT 1',
+        [
+          walletUpdate.walletBalance,
+          Number(voucher.uid || 0),
+        ]
+      );
+    }
 
     await conn.query(
       `UPDATE voucherstab
@@ -1634,6 +1707,7 @@ module.exports = {
   normalizeVoucherAvailmentItems,
   computeVoucherAvailmentBalanceUpdate,
   computeVoucherManualAvailmentWalletUpdate,
+  normalizePaymentMethod,
   resolveVoucherAvailmentClaimUpdate,
   resolveInitialVoucherAvailmentClaimState,
   getVoucherAvailments,

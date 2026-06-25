@@ -28,7 +28,7 @@ router.get('/', async (req, res) => {
     await ensureTable();
     const { type, limit = 50, offset = 0 } = req.query;
 
-    let sql = 'SELECT id, title, content, type, image_url, media_filename, created_at FROM newstab WHERE is_published = 1';
+    let sql = "SELECT id, title, content, type, image_url, media_filename, post_date, created_at, COALESCE(post_date, DATE(created_at)) AS display_date FROM newstab WHERE is_published = 1";
     const params = [];
 
     if (type && ['news', 'announcement', 'promo', 'memo'].includes(type)) {
@@ -36,7 +36,7 @@ router.get('/', async (req, res) => {
       params.push(type);
     }
 
-    sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    sql += ' ORDER BY COALESCE(post_date, DATE(created_at)) DESC, id DESC LIMIT ? OFFSET ?';
     params.push(Number(limit), Number(offset));
 
     const [rows] = await pool.query(sql, params);
