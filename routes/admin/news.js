@@ -209,7 +209,9 @@ router.post('/', handleUpload, async (req, res) => {
 
     const [result] = await pool.query(
       'INSERT INTO newstab (title, content, type, image_url, is_published, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-      [normalizedTitle, normalizedContent, type, mediaUrl, isPublished ? 1 : 0, req.session.adminid]
+      // created_by is an INT column → use the numeric admin id, not the username string
+      // (req.session.adminid is the username; adminNumericId is accesstab.id).
+      [normalizedTitle, normalizedContent, type, mediaUrl, isPublished ? 1 : 0, req.session.adminNumericId || null]
     );
 
     res.json({ success: true, id: result.insertId, image_url: mediaUrl });
