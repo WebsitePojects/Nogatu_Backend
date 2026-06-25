@@ -198,13 +198,15 @@ router.get('/:id/transactions', adminAuth, adminRights([1, 2, 3]), async (req, r
     let rows;
     try {
       [rows] = await pool.query(
-        `SELECT id,
-                DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') AS transaction_date,
-                cash_paid, voucher_used, total_value,
-                source_type, availment_id, external_reference
-         FROM voucher_transactionstab
-         WHERE voucher_id = ?
-         ORDER BY transaction_date DESC, id DESC`,
+        `SELECT vt.id,
+                DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') AS transaction_date,
+                vt.cash_paid, vt.voucher_used, vt.total_value,
+                vt.source_type, vt.availment_id, vt.external_reference,
+                a.note
+         FROM voucher_transactionstab vt
+         LEFT JOIN voucher_availmentstab a ON a.id = vt.availment_id
+         WHERE vt.voucher_id = ?
+         ORDER BY vt.transaction_date DESC, vt.id DESC`,
         [voucherId]
       );
     } catch (error) {
@@ -229,6 +231,7 @@ router.get('/:id/transactions', adminAuth, adminRights([1, 2, 3]), async (req, r
         reference: row.external_reference || (row.source_type === 'manual_availment' ? `ER-${row.availment_id}` : `VTX-${row.id}`),
         sourceType: row.source_type || 'member_checkout',
         availmentId: row.availment_id ? Number(row.availment_id) : null,
+        note: row.note || null,
       })),
     });
   } catch (error) {
@@ -261,6 +264,7 @@ router.post('/:id/availments', adminAuth, adminRights([1, 2, 3]), async (req, re
       availmentDate: req.body?.availmentDate,
       erNumber: req.body?.erNumber,
       items: req.body?.items,
+      note: req.body?.note,
       ...getVoucherActor(req),
     });
     res.status(201).json({ success: true, availment });
@@ -289,6 +293,7 @@ router.put('/availments/:availmentId', adminAuth, adminRights([1, 2, 3]), async 
       availmentDate: req.body?.availmentDate,
       erNumber: req.body?.erNumber,
       items: req.body?.items,
+      note: req.body?.note,
       ...getVoucherActor(req),
     });
     res.json({ success: true, availment });

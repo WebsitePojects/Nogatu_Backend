@@ -28,7 +28,7 @@ router.get('/', memberAuth, async (req, res) => {
  */
 router.post('/redeem', memberAuth, async (req, res) => {
   try {
-    const { voucherId, cashAmount, productKey, productCode, productName } = req.body;
+    const { voucherId, cashAmount, productKey, productCode, productName, quantity, note } = req.body;
     const parsedCashAmount = Number(cashAmount);
 
     if (!Number.isFinite(parsedCashAmount) || parsedCashAmount <= 0) {
@@ -49,6 +49,8 @@ router.post('/redeem', memberAuth, async (req, res) => {
       productKey,
       productCode,
       productName: safeProductName,
+      quantity,
+      note,
     });
     res.json({ success: true, ...result });
   } catch (err) {

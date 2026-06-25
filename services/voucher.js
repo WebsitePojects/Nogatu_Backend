@@ -72,6 +72,22 @@ function roundCurrency(value) {
   return Math.round(Number(value || 0) * 100) / 100;
 }
 
+// Product quantity is a positive integer. Clamp to [1, 100000] so a typo can never
+// overflow a money column or starve a voucher; the wallet/voucher checks downstream
+// are the real spend guard.
+function clampQuantity(value) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, 100000);
+}
+
+// Trim + bound a free-text note for storage (voucher_availmentstab.note VARCHAR(500)).
+function normalizeNote(value) {
+  const text = String(value == null ? '' : value).trim();
+  if (!text) return null;
+  return text.slice(0, 500);
+}
+
 function toIsoStringOrNull(value) {
   if (!value) return null;
   const parsed = new Date(value);
@@ -100,14 +116,30 @@ function normalizeVoucherAvailmentItems(rawItems = []) {
     const description = selectedProduct
       ? selectedProduct.name
       : String(rawItem?.description || rawItem?.label || rawItem?.item || '').trim();
-    const manualAmount = roundCurrency(rawItem?.amount);
-    const amount = selectedProduct
-      ? (
-          Number.isFinite(manualAmount) && manualAmount > 0
-            ? manualAmount
-            : roundCurrency(selectedProduct.price)
-        )
-      : manualAmount;
+
+    const quantity = clampQuantity(rawItem?.quantity ?? 1);
+
+    // Resolve a per-UNIT price, then derive the LINE TOTAL = unit_amount × quantity.
+    // Field priority:
+    //   1. explicit `unitAmount` (new clients send this),
+    //   2. legacy `amount` — historically the LINE TOTAL at an implicit quantity of 1,
+    //      so it equals the unit price; honoring it keeps every existing caller exact,
+    //   3. catalog price for a recognized product,
+    //   4. 0 → dropped below.
+    const explicitUnit = roundCurrency(rawItem?.unitAmount);
+    const explicitAmount = roundCurrency(rawItem?.amount);
+    let unitAmount;
+    if (explicitUnit > 0) {
+      unitAmount = explicitUnit;
+    } else if (explicitAmount > 0) {
+      unitAmount = explicitAmount;
+    } else if (selectedProduct) {
+      unitAmount = roundCurrency(selectedProduct.price);
+    } else {
+      unitAmount = 0;
+    }
+
+    const amount = roundCurrency(unitAmount * quantity);
     if (!description || !Number.isFinite(amount) || amount <= 0) {
       continue;
     }
@@ -115,6 +147,8 @@ function normalizeVoucherAvailmentItems(rawItems = []) {
     normalizedItems.push({
       lineNo: normalizedItems.length + 1,
       description,
+      quantity,
+      unitAmount,
       amount,
       ...(selectedProduct ? {
         productCode: Number(selectedProduct.code),
@@ -380,6 +414,17 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
   const selectedVoucherId = Number(voucherId || 0);
   const cashPaid = Number(cashAmount);
   const selectedProduct = normalizeVoucherProductSelection(options);
+  const quantity = clampQuantity(options.quantity ?? 1);
+  const note = normalizeNote(options.note);
+  // Money authority: for a recognized catalog product the charge is computed
+  // SERVER-SIDE as price × quantity — the client-sent cashAmount is never trusted
+  // for product purchases (only legacy non-product top-ups still use it). This lets
+  // a member spend a whole voucher on one product by raising the quantity.
+  const productCharge = selectedProduct ? roundCurrency(Number(selectedProduct.price) * quantity) : null;
+  const charge = productCharge != null ? productCharge : cashPaid;
+  if (!Number.isFinite(charge) || charge <= 0) {
+    throw new Error('Checkout amount must be greater than 0');
+  }
   const lockKey = `nogatu_income_calc_${memberUid}`;
 
   const conn = await pool.getConnection();
@@ -446,19 +491,19 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     );
 
     const currentWalletBalance = Number(walletRows[0]?.ttlcashbalance || 0);
-    if (cashPaid > currentWalletBalance) {
+    if (charge > currentWalletBalance) {
       throw new Error('Insufficient wallet balance for this checkout');
     }
 
-    // Buy 1 Take 1: voucher deduction must fully match the wallet cash paid.
-    if (remaining < cashPaid) {
-      throw new Error('Voucher balance must match the wallet amount for this product request');
+    // Buy 1 Take 1: voucher deduction must fully match the wallet cash paid (charge).
+    if (remaining < charge) {
+      throw new Error('Voucher balance is not enough for this product quantity');
     }
-    const voucherDeduction = cashPaid;
+    const voucherDeduction = charge;
 
     const newBalance = remaining - voucherDeduction;
     const newStatus = newBalance <= 0 ? 3 : 1;
-    const newWalletBalance = currentWalletBalance - cashPaid;
+    const newWalletBalance = currentWalletBalance - charge;
     const firstUseDays = Number(USED_VOUCHER_EXPIRY_DAYS[Number(voucher.package_type || 0)] || 0);
     const startsFirstUseWindow = !voucher.first_used_at && voucherDeduction > 0 && firstUseDays > 0;
 
@@ -489,19 +534,20 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       `INSERT INTO voucher_transactionstab
         (uid, voucher_id, cash_paid, voucher_used, total_value, transaction_date, source_type, external_reference)
        VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(), 'voucher_product_request', ?)`,
-      [memberUid, resolvedVoucherId, cashPaid, voucherDeduction, cashPaid + voucherDeduction, requestReference]
+      [memberUid, resolvedVoucherId, charge, voucherDeduction, charge + voucherDeduction, requestReference]
     );
 
     if (selectedProduct) {
       const [availmentResult] = await conn.query(
         `INSERT INTO voucher_availmentstab
-          (voucher_id, uid, er_number, availment_date, total_amount, transaction_id, request_source, claim_status)
-         VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, ?, 'member', 'requested')`,
+          (voucher_id, uid, er_number, availment_date, total_amount, note, transaction_id, request_source, claim_status)
+         VALUES (?, ?, ?, UTC_TIMESTAMP(), ?, ?, ?, 'member', 'requested')`,
         [
           resolvedVoucherId,
           memberUid,
           requestReference,
           voucherDeduction,
+          note,
           Number(transactionResult.insertId || 0),
         ]
       );
@@ -509,6 +555,8 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
       await replaceVoucherAvailmentItems(conn, availmentId, [{
         lineNo: 1,
         description: selectedProduct.name,
+        quantity,
+        unitAmount: roundCurrency(selectedProduct.price),
         amount: voucherDeduction,
         productCode: selectedProduct.code,
         productKey: selectedProduct.voucherKey,
@@ -533,13 +581,15 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     const safeProductName = String(options?.productName || '').trim();
     return {
       voucherId: resolvedVoucherId,
-      cashPaid,
+      cashPaid: charge,
       voucherDeducted: voucherDeduction,
-      totalProductValue: cashPaid + voucherDeduction,
+      totalProductValue: charge + voucherDeduction,
       remainingBalance: newBalance,
       walletBalance: newWalletBalance,
       fullyUsed: newStatus === 3,
       productType: selectedProduct?.code || null,
+      ...(selectedProduct ? { quantity } : {}),
+      ...(note ? { note } : {}),
       ...(safeProductName ? { productName: safeProductName } : {}),
     };
   } catch (err) {
@@ -566,12 +616,14 @@ async function getVoucherTransactions(uid) {
   await ensureVoucherTxTable();
 
   const [rows] = await pool.query(
-    `SELECT id, uid, voucher_id, cash_paid, voucher_used, total_value,
-            source_type, availment_id, external_reference,
-            DATE_FORMAT(transaction_date, '%Y-%m-%d %H:%i') as transaction_date
-     FROM voucher_transactionstab
-     WHERE uid = ?
-     ORDER BY id DESC
+    `SELECT vt.id, vt.uid, vt.voucher_id, vt.cash_paid, vt.voucher_used, vt.total_value,
+            vt.source_type, vt.availment_id, vt.external_reference,
+            a.note,
+            DATE_FORMAT(vt.transaction_date, '%Y-%m-%d %H:%i') as transaction_date
+     FROM voucher_transactionstab vt
+     LEFT JOIN voucher_availmentstab a ON a.id = vt.availment_id
+     WHERE vt.uid = ?
+     ORDER BY vt.id DESC
      LIMIT 100`,
     [uid]
   );
@@ -603,15 +655,23 @@ function assertVoucherManualAvailmentAllowed(voucher, { allowFullyUsed = false }
 async function replaceVoucherAvailmentItems(conn, availmentId, items) {
   await conn.query('DELETE FROM voucher_availment_itemstab WHERE availment_id = ?', [availmentId]);
   for (const item of items) {
+    const quantity = clampQuantity(item.quantity ?? 1);
+    // unit_amount = explicit unit, else derive from the line total so amount stays
+    // the money-of-record (unit_amount × quantity === amount).
+    const unitAmount = roundCurrency(
+      item.unitAmount != null ? item.unitAmount : (Number(item.amount || 0) / quantity)
+    );
     await conn.query(
-      `INSERT INTO voucher_availment_itemstab (availment_id, line_no, product_code, product_key, item_label, amount)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO voucher_availment_itemstab (availment_id, line_no, product_code, product_key, item_label, quantity, unit_amount, amount)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         availmentId,
         item.lineNo,
         item.productCode || null,
         item.productKey || null,
         item.description,
+        quantity,
+        unitAmount,
         item.amount,
       ]
     );
@@ -631,7 +691,7 @@ async function getVoucherAvailmentItemsByAvailmentIds(conn, availmentIds = []) {
 
   const placeholders = cleanIds.map(() => '?').join(',');
   const [rows] = await conn.query(
-    `SELECT availment_id, line_no, product_code, product_key, item_label, amount
+    `SELECT availment_id, line_no, product_code, product_key, item_label, quantity, unit_amount, amount
      FROM voucher_availment_itemstab
      WHERE availment_id IN (${placeholders})
      ORDER BY availment_id ASC, line_no ASC, id ASC`,
@@ -642,10 +702,14 @@ async function getVoucherAvailmentItemsByAvailmentIds(conn, availmentIds = []) {
   for (const row of rows) {
     const availmentId = Number(row.availment_id || 0);
     if (!itemMap.has(availmentId)) itemMap.set(availmentId, []);
+    const quantity = clampQuantity(row.quantity ?? 1);
+    const amount = Number(row.amount || 0);
     itemMap.get(availmentId).push({
       lineNo: Number(row.line_no || 0),
       description: row.item_label,
-      amount: Number(row.amount || 0),
+      quantity,
+      unitAmount: row.unit_amount != null ? Number(row.unit_amount) : roundCurrency(amount / quantity),
+      amount,
       productCode: row.product_code ? Number(row.product_code) : null,
       productKey: row.product_key || null,
     });
@@ -662,6 +726,7 @@ function formatVoucherAvailmentRow(row, items = []) {
     erNumber: row.er_number,
     availmentDate: row.availment_date,
     totalAmount: Number(row.total_amount || 0),
+    note: row.note || null,
     requestSource: row.request_source || 'cashier',
     claimStatus: row.claim_status || 'requested',
     claimedAt: row.claimed_at || null,
@@ -681,7 +746,7 @@ async function fetchVoucherAvailmentRecord(conn, availmentId) {
   const [rows] = await conn.query(
     `SELECT a.id, a.voucher_id, a.uid, a.er_number,
             DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date,
-            a.total_amount, a.transaction_id, a.request_source, a.claim_status,
+            a.total_amount, a.note, a.transaction_id, a.request_source, a.claim_status,
             DATE_FORMAT(a.claimed_at, '%Y-%m-%d %H:%i') AS claimed_at,
             a.claimed_by_admin,
             a.created_by_admin, a.updated_by_admin,
@@ -709,7 +774,7 @@ async function getVoucherAvailments(voucherId) {
   const [rows] = await pool.query(
     `SELECT a.id, a.voucher_id, a.uid, a.er_number,
             DATE_FORMAT(a.availment_date, '%Y-%m-%d %H:%i') AS availment_date,
-            a.total_amount, a.transaction_id, a.request_source, a.claim_status,
+            a.total_amount, a.note, a.transaction_id, a.request_source, a.claim_status,
             DATE_FORMAT(a.claimed_at, '%Y-%m-%d %H:%i') AS claimed_at,
             a.claimed_by_admin,
             a.created_by_admin, a.updated_by_admin,
@@ -776,6 +841,7 @@ async function createManualVoucherAvailment({
   availmentDate,
   erNumber,
   items,
+  note,
   actorAdminId = null,
   actorAdmin = null,
   requestSource = 'cashier',
@@ -791,6 +857,8 @@ async function createManualVoucherAvailment({
   if (!safeErNumber) {
     throw new Error('ER number is required');
   }
+
+  const safeNote = normalizeNote(note);
 
   const normalized = normalizeVoucherAvailmentItems(items);
   if (normalized.items.length === 0) {
@@ -847,14 +915,15 @@ async function createManualVoucherAvailment({
 
     const [availmentResult] = await conn.query(
       `INSERT INTO voucher_availmentstab
-        (voucher_id, uid, er_number, availment_date, total_amount, request_source, claim_status, claimed_at, claimed_by_admin_id, claimed_by_admin, created_by_admin_id, created_by_admin, updated_by_admin_id, updated_by_admin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (voucher_id, uid, er_number, availment_date, total_amount, note, request_source, claim_status, claimed_at, claimed_by_admin_id, claimed_by_admin, created_by_admin_id, created_by_admin, updated_by_admin_id, updated_by_admin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         safeVoucherId,
         Number(voucher.uid || 0),
         safeErNumber,
         safeAvailmentDate,
         normalized.totalAmount,
+        safeNote,
         String(requestSource || 'cashier').trim() || 'cashier',
         claimState.claimStatus,
         toDateOrNull(claimState.claimedAt),
@@ -1049,6 +1118,7 @@ async function updateManualVoucherAvailment({
   availmentDate,
   erNumber,
   items,
+  note,
   actorAdminId = null,
   actorAdmin = null,
 }) {
@@ -1063,6 +1133,10 @@ async function updateManualVoucherAvailment({
   if (!safeErNumber) {
     throw new Error('ER number is required');
   }
+
+  // note === undefined → caller did not send the field → keep the existing note.
+  const noteProvided = note !== undefined;
+  const safeNote = noteProvided ? normalizeNote(note) : null;
 
   const normalized = normalizeVoucherAvailmentItems(items);
   if (normalized.items.length === 0) {
@@ -1132,6 +1206,7 @@ async function updateManualVoucherAvailment({
           SET er_number = ?,
               availment_date = ?,
               total_amount = ?,
+              ${noteProvided ? 'note = ?,' : ''}
               updated_by_admin_id = ?,
               updated_by_admin = ?
         WHERE id = ? LIMIT 1`,
@@ -1139,6 +1214,7 @@ async function updateManualVoucherAvailment({
         safeErNumber,
         safeAvailmentDate,
         normalized.totalAmount,
+        ...(noteProvided ? [safeNote] : []),
         actorAdminId,
         actorAdmin,
         safeAvailmentId,
