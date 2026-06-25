@@ -302,6 +302,7 @@ app.use('/api/admin', readonlyGuard);
 app.use('/api/admin/auth', require('./routes/admin/auth'));
 app.use('/api/admin/dashboard', require('./routes/admin/dashboard'));
 app.use('/api/admin/accounts', require('./routes/admin/accounts'));
+app.use('/api/admin/access-accounts', require('./routes/admin/accessAccounts'));
 app.use('/api/admin/codes', require('./routes/admin/codes'));
 app.use('/api/admin/encashment', require('./routes/admin/encashment'));
 app.use('/api/admin/redeem', require('./routes/admin/redeem'));

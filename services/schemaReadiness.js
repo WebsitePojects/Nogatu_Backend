@@ -216,11 +216,14 @@ const SCHEMA_REQUIREMENTS = {
         claim_status: { typeIncludes: 'varchar(32)' },
         claimed_at: {},
         claimed_by_admin: { typeIncludes: 'varchar(120)' },
+        note: { typeIncludes: 'varchar(500)' },
       },
       voucher_availment_itemstab: {
         item_label: { typeIncludes: 'varchar(255)' },
         product_code: {},
         product_key: { typeIncludes: 'varchar(32)' },
+        quantity: {},
+        unit_amount: {},
       },
       voucher_availment_audittab: {
         action_type: { typeIncludes: 'varchar(32)' },

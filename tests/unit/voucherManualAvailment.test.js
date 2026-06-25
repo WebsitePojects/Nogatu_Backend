@@ -89,11 +89,28 @@ test('manual voucher availment totals all ER items from valid lines only', () =>
   ]);
 
   assert.deepEqual(normalized.items, [
-    { lineNo: 1, description: 'Signature Facial', amount: 1500 },
-    { lineNo: 2, description: 'Wellness kit', amount: 2500.5 },
-    { lineNo: 3, description: 'Body sculpting', amount: 3000 },
+    { lineNo: 1, description: 'Signature Facial', quantity: 1, unitAmount: 1500, amount: 1500 },
+    { lineNo: 2, description: 'Wellness kit', quantity: 1, unitAmount: 2500.5, amount: 2500.5 },
+    { lineNo: 3, description: 'Body sculpting', quantity: 1, unitAmount: 3000, amount: 3000 },
   ]);
   assert.equal(normalized.totalAmount, 7000.5);
+});
+
+test('voucher availment quantity multiplies the unit price into the line total', () => {
+  const normalized = normalizeVoucherAvailmentItems([
+    { productKey: 'bkc', quantity: 10 },              // 250 catalog price × 10
+    { description: 'Custom', unitAmount: 120, quantity: 3 },
+    { productKey: 'bl', quantity: 0 },                 // clamps to 1 → 850
+    { productKey: 'bl', quantity: -5 },                // clamps to 1 → 850
+  ]);
+
+  assert.deepEqual(normalized.items, [
+    { lineNo: 1, description: 'Nogatu Black Coffee', quantity: 10, unitAmount: 250, amount: 2500, productCode: 108, productKey: 'bkc' },
+    { lineNo: 2, description: 'Custom', quantity: 3, unitAmount: 120, amount: 360 },
+    { lineNo: 3, description: 'Nogatu Barley Juice', quantity: 1, unitAmount: 850, amount: 850, productCode: 100, productKey: 'bl' },
+    { lineNo: 4, description: 'Nogatu Barley Juice', quantity: 1, unitAmount: 850, amount: 850, productCode: 100, productKey: 'bl' },
+  ]);
+  assert.equal(normalized.totalAmount, 4560);
 });
 
 test('manual voucher availment product dropdown defaults to the raw product price but allows manual override', () => {
@@ -106,6 +123,8 @@ test('manual voucher availment product dropdown defaults to the raw product pric
     {
       lineNo: 1,
       description: 'Vitamin C with Collagen & Glutathione',
+      quantity: 1,
+      unitAmount: 500,
       amount: 500,
       productCode: 102,
       productKey: 'glc',
@@ -113,6 +132,8 @@ test('manual voucher availment product dropdown defaults to the raw product pric
     {
       lineNo: 2,
       description: 'Nogatu Coffee Mix',
+      quantity: 1,
+      unitAmount: 400,
       amount: 400,
       productCode: 103,
       productKey: 'cm',
