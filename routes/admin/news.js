@@ -181,6 +181,7 @@ router.get('/', async (req, res) => {
 
 // POST /api/admin/news
 router.post('/', handleUpload, async (req, res) => {
+  let uploadedUrl = null;
   try {
     const { title, content, type = 'news', image_url = null } = req.body;
     const isPublished = toBool(req.body?.is_published, true);
@@ -204,7 +205,7 @@ router.post('/', handleUpload, async (req, res) => {
       return res.status(400).json({ error: 'Content is too long (max 8000 characters)' });
     }
 
-    const uploadedUrl = await uploadToCloudinary(req.file);
+    uploadedUrl = await uploadToCloudinary(req.file);
     const mediaUrl = uploadedUrl || normalizeImageUrl(image_url);
 
     const [result] = await pool.query(
@@ -216,6 +217,9 @@ router.post('/', handleUpload, async (req, res) => {
 
     res.json({ success: true, id: result.insertId, image_url: mediaUrl });
   } catch (err) {
+    // Orphan cleanup: the file reached Cloudinary but the row never saved (e.g. the
+    // create failed at the DB). Remove the just-uploaded asset so it can't linger forever.
+    if (uploadedUrl) deleteFromCloudinary(uploadedUrl).catch(() => {});
     console.error('[Admin/News] POST error:', err.message);
     if (err.code === 'UPLOAD_NOT_CONFIGURED' || String(err.message || '').includes('Image URL must start')) {
       return res.status(400).json({ error: err.message });
@@ -226,6 +230,7 @@ router.post('/', handleUpload, async (req, res) => {
 
 // PUT /api/admin/news/:id
 router.put('/:id', handleUpload, async (req, res) => {
+  let newUploadedUrl = null;
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) {
@@ -259,19 +264,18 @@ router.put('/:id', handleUpload, async (req, res) => {
     const oldMediaUrl = existing?.image_url || null;
 
     let mediaUrl;
+    let oldToDelete = null; // delete the replaced/cleared asset only AFTER the row updates
     if (req.file) {
-      // New file uploaded — upload it, then delete old Cloudinary asset
-      const uploadedUrl = await uploadToCloudinary(req.file);
-      mediaUrl = uploadedUrl;
+      newUploadedUrl = await uploadToCloudinary(req.file);
+      mediaUrl = newUploadedUrl;
       if (oldMediaUrl && oldMediaUrl !== mediaUrl) {
-        await deleteFromCloudinary(oldMediaUrl);
+        oldToDelete = oldMediaUrl;
       }
     } else if (image_url !== undefined) {
       // image_url field explicitly sent — respect it (could be empty to clear media)
       const requestedUrl = normalizeImageUrl(image_url);
       if (!requestedUrl && oldMediaUrl) {
-        // Clearing media — delete old Cloudinary asset
-        await deleteFromCloudinary(oldMediaUrl);
+        oldToDelete = oldMediaUrl;
       }
       mediaUrl = requestedUrl;
     } else {
@@ -284,8 +288,14 @@ router.put('/:id', handleUpload, async (req, res) => {
       [normalizedTitle, normalizedContent, type || 'news', mediaUrl, isPublished ? 1 : 0, id]
     );
 
+    // Row is safely updated — now remove the old asset (non-blocking). Deferring this
+    // until after the UPDATE means a failed update never destroys the live asset.
+    if (oldToDelete) deleteFromCloudinary(oldToDelete).catch(() => {});
+
     res.json({ success: true, image_url: mediaUrl });
   } catch (err) {
+    // Orphan cleanup: a new file uploaded but the update failed → delete the new asset.
+    if (newUploadedUrl) deleteFromCloudinary(newUploadedUrl).catch(() => {});
     console.error('[Admin/News] PUT error:', err.message);
     if (err.code === 'UPLOAD_NOT_CONFIGURED' || String(err.message || '').includes('Image URL must start')) {
       return res.status(400).json({ error: err.message });
