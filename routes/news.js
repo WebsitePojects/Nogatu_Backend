@@ -28,7 +28,7 @@ router.get('/', async (req, res) => {
     await ensureTable();
     const { type, limit = 50, offset = 0 } = req.query;
 
-    let sql = 'SELECT id, title, content, type, image_url, created_at FROM newstab WHERE is_published = 1';
+    let sql = 'SELECT id, title, content, type, image_url, media_filename, created_at FROM newstab WHERE is_published = 1';
     const params = [];
 
     if (type && ['news', 'announcement', 'promo', 'memo'].includes(type)) {
