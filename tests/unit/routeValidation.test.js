@@ -303,53 +303,10 @@ test('wallet summary totalIncome sums credited income streams without double-cou
   assert.equal(res.body.cashBalance, 2000);
 });
 
-test('wallet encashment preview returns 422 when TIN is missing', async () => {
-  const tinError = new Error('TIN is required before encashment. Please complete your account profile first.');
-  tinError.code = 'TIN_REQUIRED_FOR_ENCASHMENT';
-  tinError.statusCode = 422;
-
-  const router = loadWalletRouter({
-    assertTinPresentForEncashment: async () => { throw tinError; },
-  });
-  const handlers = getRouteHandlers(router, 'post', '/preview-encash');
-  const req = {
-    body: { amount: 1000 },
-    session: { uid: 44, currentaccttype: 30 },
-  };
-  const res = createResponse();
-
-  await runHandlers(handlers, req, res);
-
-  assert.equal(res.statusCode, 422);
-  assert.deepEqual(res.body, {
-    error: 'TIN is required before encashment. Please complete your account profile first.',
-    code: 'TIN_REQUIRED_FOR_ENCASHMENT',
-  });
-});
-
-test('wallet encashment submit returns 422 when TIN is missing', async () => {
-  const tinError = new Error('TIN is required before encashment. Please complete your account profile first.');
-  tinError.code = 'TIN_REQUIRED_FOR_ENCASHMENT';
-  tinError.statusCode = 422;
-
-  const router = loadWalletRouter({
-    assertTinPresentForEncashment: async () => { throw tinError; },
-  });
-  const handlers = getRouteHandlers(router, 'post', '/encash');
-  const req = {
-    body: { amount: 1000 },
-    session: { uid: 44, currentaccttype: 30 },
-  };
-  const res = createResponse();
-
-  await runHandlers(handlers, req, res);
-
-  assert.equal(res.statusCode, 422);
-  assert.deepEqual(res.body, {
-    error: 'TIN is required before encashment. Please complete your account profile first.',
-    code: 'TIN_REQUIRED_FOR_ENCASHMENT',
-  });
-});
+// NOTE: the "TIN required before encashment" gate was REMOVED by business decision
+// (2026-06-11 — encashment is allowed without a TIN). The two tests that asserted a
+// 422 TIN_REQUIRED response were therefore validating deleted behavior and have been
+// removed. The wallet route no longer imports assertTinPresentForEncashment.
 
 test('admin account status route accepts frozen as a first-class account status', async () => {
   const connection = {
