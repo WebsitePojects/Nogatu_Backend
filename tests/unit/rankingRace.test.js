@@ -21,7 +21,7 @@ test('ranking race service exports the approved engine entry points', () => {
   assert.equal(typeof rankingRace.summarizeAchievementStatus, 'function');
 });
 
-test('event ownership marks repurchase events as self, left, and right', async () => {
+test('rankable events carry the sponsor-tree (unilevel) basis, not binary legs', async () => {
   const fakeConn = {
     async query() {
       return [[
@@ -54,7 +54,9 @@ test('event ownership marks repurchase events as self, left, and right', async (
   };
 
   const events = await rankingRace.listRankableEventsForMember(9001, fakeConn);
-  assert.deepEqual(events.map((row) => row.sourceLeg), ['self', 'left', 'right']);
+  // Ranking basis moved to the sponsor/unilevel tree (V033), so every rankable repurchase
+  // event reports the 'unilevel' source leg regardless of the binary leg it came from.
+  assert.deepEqual(events.map((row) => row.sourceLeg), ['unilevel', 'unilevel', 'unilevel']);
   assert.deepEqual(events.map((row) => row.points), [50, 250, 500]);
 });
 

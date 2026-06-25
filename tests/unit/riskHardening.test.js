@@ -144,6 +144,8 @@ function loadCalculateAndStoreIncome({
   checkLastMaintenance,
   checkUnilevelTransDate,
   getUnilevel,
+  hasUnilevelCreditedThisMonth = async () => false,
+  updateIncomeTransDate = async () => {},
   insertIncome,
   getEffectiveAccountState,
   getPackagePolicy,
@@ -170,6 +172,8 @@ function loadCalculateAndStoreIncome({
       getUnilevel,
       checkLastMaintenance,
       checkUnilevelTransDate,
+      hasUnilevelCreditedThisMonth,
+      updateIncomeTransDate,
     },
     [path.join(repoRoot, 'services', 'income', 'insertIncome.js')]: {
       insertIncome,
@@ -203,6 +207,10 @@ test('calculateAndStoreIncome keeps payout persistence on the lock connection', 
       }
       return [[{ ttlincome1: 10, ttlcashbalance: 35 }]];
     },
+    // C1 fix: the credit is wrapped in a transaction on the lock connection.
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
     release() {
       this.released = true;
     },

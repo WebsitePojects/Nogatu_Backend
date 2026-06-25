@@ -12,7 +12,7 @@ const {
 } = require('../../services/ranking');
 
 test('ranking basis label is repurchase points', () => {
-  assert.equal(RANKING_BASIS_LABEL, 'Repurchase points');
+  assert.equal(RANKING_BASIS_LABEL, 'Repurchase points (sponsor tree)');
 });
 
 test('ranking basis sums repurchase incentivepoints1 values', () => {

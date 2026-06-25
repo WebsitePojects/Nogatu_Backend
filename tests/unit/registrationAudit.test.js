@@ -57,7 +57,8 @@ test('appendActivationCodeUsage records structured code lifecycle events', async
     processKey: 'code:test:1',
   });
 
-  assert.match(calls[0].sql, /INSERT INTO activation_code_usagetab/i);
+  // Insert is idempotent (INSERT IGNORE) so a re-run can't dup-key the usage row.
+  assert.match(calls[0].sql, /INSERT(\s+IGNORE)?\s+INTO activation_code_usagetab/i);
   assert.equal(calls[0].params[0], 'PD1234567890');
   assert.equal(calls[0].params[2], 'registration-used');
   assert.equal(calls[0].params[8], 3003);
