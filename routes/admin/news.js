@@ -6,8 +6,24 @@ const { adminAuth, adminRights } = require('../../middleware/auth');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
 const { cloudinary } = require('../../utils/cloudinary');
 
-const IMAGE_MAX_BYTES = 5 * 1024 * 1024;   // 5 MB
-const VIDEO_MAX_BYTES = 100 * 1024 * 1024; // 100 MB
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;    // 5 MB
+const VIDEO_MAX_BYTES = 100 * 1024 * 1024;  // 100 MB
+const DOC_MAX_BYTES = 15 * 1024 * 1024;     // 15 MB (PDF memos / documents)
+
+// Document mimetypes accepted for memos (PDF + common office docs).
+const DOC_MIMES = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+
+function isDocFile(file) {
+  return DOC_MIMES.has(file?.mimetype) || /\.(pdf|docx?|pptx?|xlsx?)$/i.test(file?.originalname || '');
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -15,8 +31,8 @@ const upload = multer({
   fileFilter: (_req, file, cb) => {
     const isImage = file.mimetype?.startsWith('image/');
     const isVideo = file.mimetype?.startsWith('video/');
-    if (!isImage && !isVideo) {
-      return cb(new Error('Only image or video files are allowed'));
+    if (!isImage && !isVideo && !isDocFile(file)) {
+      return cb(new Error('Only image, video, or document (PDF) files are allowed'));
     }
     cb(null, true);
   },
@@ -30,6 +46,9 @@ function handleUpload(req, res, next) {
         const isImage = req.file.mimetype?.startsWith('image/');
         if (isImage && req.file.size > IMAGE_MAX_BYTES) {
           return res.status(400).json({ error: 'Image exceeds 5 MB file size limit' });
+        }
+        if (isDocFile(req.file) && req.file.size > DOC_MAX_BYTES) {
+          return res.status(400).json({ error: 'Document exceeds 15 MB file size limit' });
         }
       }
       return next();
@@ -66,20 +85,36 @@ function toBool(value, fallback = true) {
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
 }
 
-// Extract Cloudinary public_id from a secure_url
+// Resource type of a Cloudinary asset, inferred from its delivery URL.
+function cloudinaryResourceType(url) {
+  if (url.includes('/video/upload/')) return 'video';
+  if (url.includes('/raw/upload/')) return 'raw';
+  return 'image';
+}
+
+// Extract Cloudinary public_id from a stored secure_url.
+// secure_url shape: https://res.cloudinary.com/{cloud}/{type}/upload/v{ver}/{folder}/{name}.{ext}
+// IMPORTANT: the public_id INCLUDES the folder path (e.g. nogatu/news/abc). The previous
+// pattern used a greedy `(?:[^/]+\/)*` that ate the folder segments, so destroy() was called
+// with a folderless id and silently no-op'd — leaving orphaned assets. Capture everything
+// after the optional version, and strip the extension only for image/video (raw keeps it).
 function extractCloudinaryPublicId(url) {
   if (!url || typeof url !== 'string') return null;
   if (!url.includes('res.cloudinary.com')) return null;
-  // https://res.cloudinary.com/{cloud}/{type}/upload/[transform/]v{ver}/{public_id}.{ext}
-  const match = url.match(/\/upload\/(?:[^/]+\/)*(?:v\d+\/)?(.+)\.[^.]+$/);
-  return match ? match[1] : null;
+  const match = url.match(/\/upload\/(?:v\d+\/)?(.+)$/);
+  if (!match) return null;
+  let publicId = match[1];
+  if (cloudinaryResourceType(url) !== 'raw') {
+    publicId = publicId.replace(/\.[^./]+$/, ''); // drop extension for image/video
+  }
+  return publicId;
 }
 
 async function deleteFromCloudinary(mediaUrl) {
   if (!cloudinary || !mediaUrl) return;
   const publicId = extractCloudinaryPublicId(mediaUrl);
   if (!publicId) return;
-  const resourceType = mediaUrl.includes('/video/') ? 'video' : 'image';
+  const resourceType = cloudinaryResourceType(mediaUrl);
   try {
     await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
   } catch (err) {
@@ -97,12 +132,16 @@ async function uploadToCloudinary(file) {
   }
 
   const isVideo = file.mimetype?.startsWith('video/');
+  const isDocument = isDocFile(file);
+  // 'auto' lets Cloudinary classify documents: PDFs deliver as image (page render +
+  // downloadable), office docs land as raw. Images/videos keep their explicit type.
+  const resourceType = isVideo ? 'video' : isDocument ? 'auto' : 'image';
 
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       {
         folder: 'nogatu/news',
-        resource_type: isVideo ? 'video' : 'image',
+        resource_type: resourceType,
       },
       (err, result) => {
         if (err) return reject(err);
@@ -148,11 +187,15 @@ router.post('/', handleUpload, async (req, res) => {
     const normalizedTitle = String(title || '').trim();
     const normalizedContent = String(content || '').trim();
 
-    if (!normalizedTitle || !normalizedContent) {
-      return res.status(400).json({ error: 'Title and content are required' });
-    }
     if (!['news', 'announcement', 'promo', 'memo'].includes(type)) {
       return res.status(400).json({ error: 'Invalid type' });
+    }
+    if (!normalizedTitle) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    // Memos can be a document/announcement with no body text; every other type needs content.
+    if (type !== 'memo' && !normalizedContent) {
+      return res.status(400).json({ error: 'Content is required' });
     }
     if (normalizedTitle.length > 255) {
       return res.status(400).json({ error: 'Title is too long (max 255 characters)' });
@@ -192,11 +235,15 @@ router.put('/:id', handleUpload, async (req, res) => {
     const normalizedTitle = String(title || '').trim();
     const normalizedContent = String(content || '').trim();
 
-    if (!normalizedTitle || !normalizedContent) {
-      return res.status(400).json({ error: 'Title and content are required' });
-    }
-    if (!['news', 'announcement', 'promo', 'memo'].includes(type || 'news')) {
+    const effectiveType = type || 'news';
+    if (!['news', 'announcement', 'promo', 'memo'].includes(effectiveType)) {
       return res.status(400).json({ error: 'Invalid type' });
+    }
+    if (!normalizedTitle) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+    if (effectiveType !== 'memo' && !normalizedContent) {
+      return res.status(400).json({ error: 'Content is required' });
     }
     if (normalizedTitle.length > 255) {
       return res.status(400).json({ error: 'Title is too long (max 255 characters)' });
