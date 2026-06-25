@@ -324,7 +324,8 @@ router.get('/referral/:token', async (req, res) => {
     if (slug) {
       const [slugRows] = await pool.query(
         `SELECT u.uid AS sponsor_uid, u.public_uid AS sponsor_public_uid, u.referral_slug,
-                m.username AS sponsor_username
+                m.username AS sponsor_username,
+                TRIM(CONCAT(COALESCE(m.firstname,''),' ',COALESCE(m.lastname,''))) AS sponsor_fullname
          FROM usertab u
          INNER JOIN memberstab m ON m.uid = u.uid
          WHERE u.referral_slug = ?
@@ -340,6 +341,7 @@ router.get('/referral/:token', async (req, res) => {
             sponsor_uid: slugRows[0].sponsor_uid,
             sponsor_public_uid: slugRows[0].sponsor_public_uid,
             sponsor_username: slugRows[0].sponsor_username,
+            sponsor_fullname: (slugRows[0].sponsor_fullname || '').trim() || slugRows[0].sponsor_username,
             reusable: true,
             placement_uid: placement.placementUid,
             position: placement.position,
@@ -351,7 +353,8 @@ router.get('/referral/:token', async (req, res) => {
 
     await ensureReferralInvitesTable();
     const [rows] = await pool.query(
-      `SELECT ri.token, ri.sponsor_uid, ri.placement_uid, ri.position, m.username AS sponsor_username
+      `SELECT ri.token, ri.sponsor_uid, ri.placement_uid, ri.position, m.username AS sponsor_username,
+              TRIM(CONCAT(COALESCE(m.firstname,''),' ',COALESCE(m.lastname,''))) AS sponsor_fullname
        FROM referral_invitestab ri
        INNER JOIN memberstab m ON m.uid = ri.sponsor_uid
        WHERE ri.token = ? AND ri.active = 1 LIMIT 1`,
