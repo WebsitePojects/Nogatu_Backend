@@ -297,6 +297,8 @@ app.use('/api/applications', require('./routes/applications').router);
 // Admin routes
 // readonlyGuard blocks all non-GET requests for accounts with role='readonly'
 const { readonlyGuard } = require('./middleware/auth');
+app.use('/api/external', require('./routes/external'));
+
 app.use('/api/admin', readonlyGuard);
 
 app.use('/api/admin/auth', require('./routes/admin/auth'));
