@@ -1,5 +1,5 @@
 const { pool } = require('../config/database');
-const { listRankableEventsForMember } = require('./rankingRace');
+const { listRankableEventsForMember, toEpoch } = require('./rankingRace');
 const { getRankProgress, getRankDefinitions } = require('./ranking');
 
 function toNumber(value) {
@@ -47,9 +47,18 @@ async function getRankingExplanation(uid) {
     const grossRankablePoints = toNumber(progress.grossRankablePoints);
     const consumedPoints = toNumber(progress.consumedPoints);
     const remainingRankablePoints = toNumber(progress.remainingRankablePoints);
-    const sortedEvents = [...rankableEvents].sort((a, b) => String(a.sourceEventTs || '').localeCompare(String(b.sourceEventTs || '')));
-    const firstEventTs = sortedEvents[0]?.sourceEventTs || null;
-    const lastEventTs = sortedEvents.at(-1)?.sourceEventTs || null;
+    // repurchasetab.transdate is nullable, so a legacy row could carry points with no
+    // date. Min/max ONLY over dated events — a single shared sort-fallback can't be
+    // "undated sorts last" for both ends at once (that would make an undated row look
+    // like the LAST event here while looking like the FIRST if fallback went the other
+    // way). Undated rows simply don't count toward either extreme.
+    const datedEvents = rankableEvents.filter((e) => e.sourceEventTs != null);
+    const firstEventTs = datedEvents.length
+      ? datedEvents.reduce((min, e) => (toEpoch(e.sourceEventTs) < toEpoch(min.sourceEventTs) ? e : min)).sourceEventTs
+      : null;
+    const lastEventTs = datedEvents.length
+      ? datedEvents.reduce((max, e) => (toEpoch(e.sourceEventTs) > toEpoch(max.sourceEventTs) ? e : max)).sourceEventTs
+      : null;
     const rankDefinitionMap = new Map(rankDefinitions.map((definition) => [String(definition.rank_code || '').toLowerCase(), definition]));
 
     const nextRanks = rankDefinitions.map((rank) => ({

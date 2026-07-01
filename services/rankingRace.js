@@ -23,9 +23,24 @@ function toNumber(value) {
   return Number(value || 0);
 }
 
+// mysql2 returns DATETIME columns as JS Date objects (no dateStrings config), so
+// String(date).localeCompare(...) compares "Wed Jun 24 2026..." style output —
+// day-name-first, not chronological. Compare epoch millis instead.
+// `repurchasetab.transdate` is a nullable column, so a legacy-imported row could carry
+// points with no recorded date. Default fallback (0 = epoch start) matches this file's
+// own pre-existing behavior for that edge case (the old '' string fallback also sorted
+// first ascending) — callers that want "unknown sorts last" (oldest-first consumption
+// order should prefer confirmed-dated events over guessing on an undated one) pass
+// Number.MAX_SAFE_INTEGER explicitly instead of relying on the default.
+function toEpoch(value, fallback = 0) {
+  if (value == null) return fallback;
+  const t = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(t) ? t : fallback;
+}
+
 function sortRankableEvents(events = []) {
   return [...events].sort((a, b) => {
-    const tsCompare = String(a.sourceEventTs || '').localeCompare(String(b.sourceEventTs || ''));
+    const tsCompare = toEpoch(a.sourceEventTs, Number.MAX_SAFE_INTEGER) - toEpoch(b.sourceEventTs, Number.MAX_SAFE_INTEGER);
     if (tsCompare !== 0) return tsCompare;
 
     const idCompare = toNumber(a.sourceEventId) - toNumber(b.sourceEventId);
@@ -400,6 +415,7 @@ module.exports = {
   listRankableEventsForMember,
   listAllContributingEventsForMember,
   sortRankableEvents,
+  toEpoch,
   consumePointsForRank,
   computeRankAwardsFromEvents,
   computeDisplayBasis,

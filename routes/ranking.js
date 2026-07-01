@@ -8,7 +8,7 @@ const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { getRankProgress } = require('../services/ranking');
 const { getRankingExplanation } = require('../services/rankingTransparency');
-const { listRankableEventsForMember, listAllContributingEventsForMember } = require('../services/rankingRace');
+const { listRankableEventsForMember, listAllContributingEventsForMember, toEpoch } = require('../services/rankingRace');
 
 /**
  * GET /api/ranking
@@ -53,7 +53,7 @@ router.get('/events', memberAuth, async (req, res) => {
       ? await listAllContributingEventsForMember(uid)
       : await listRankableEventsForMember(uid);
     const sorted = [...events].sort((a, b) =>
-      String(b.sourceEventTs || '').localeCompare(String(a.sourceEventTs || ''))
+      toEpoch(b.sourceEventTs) - toEpoch(a.sourceEventTs)
       || Number(b.sourceEventId || 0) - Number(a.sourceEventId || 0));
 
     const total = sorted.length;
