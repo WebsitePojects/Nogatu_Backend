@@ -113,6 +113,16 @@ function toMysqlDateTime(value) {
   return date.toISOString().slice(0, 19).replace('T', ' ');
 }
 
+// mysql2 returns DATETIME columns as JS Date objects, so String(date) produces
+// "Wed Jun 24 2026..." (day-name-first) rather than a chronological string —
+// localeCompare on that is NOT date order. Use epoch millis for tiebreak sorts.
+// Missing dates sort LAST (treated as far future), matching the '9999-12-31' SQL fallback.
+function dateSortValue(value) {
+  if (value == null) return Number.MAX_SAFE_INTEGER;
+  const t = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
+}
+
 function rankColor(rank) {
   return RANK_COLORS[toNumber(rank)] || RANK_COLORS[0];
 }
@@ -1324,9 +1334,7 @@ async function getAllRankings(page = 1, perPage = 30) {
     const totalA = toNumber(a.consumedPoints) + toNumber(a.remainingRankablePoints);
     const totalB = toNumber(b.consumedPoints) + toNumber(b.remainingRankablePoints);
     if (totalB !== totalA) return totalB - totalA;
-    const dateA = String(a.qualifiedDate || '9999-12-31 23:59:59');
-    const dateB = String(b.qualifiedDate || '9999-12-31 23:59:59');
-    const dateCompare = dateA.localeCompare(dateB);
+    const dateCompare = dateSortValue(a.qualifiedDate) - dateSortValue(b.qualifiedDate);
     if (dateCompare !== 0) return dateCompare;
     return toNumber(a.uid) - toNumber(b.uid);
   });
@@ -1521,6 +1529,8 @@ async function processIncentive(uid, options = {}) {
 
 module.exports = {
   ensureRankingTable,
+  toMysqlDateTime,
+  dateSortValue,
   getRankDefinitions,
   getLatestPairingSnapshot,
   getCurrentRank,

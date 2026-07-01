@@ -6,7 +6,7 @@ const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { getAllRankings, processIncentive } = require('../../services/ranking');
-const { listRankableEventsForMember, listAllContributingEventsForMember } = require('../../services/rankingRace');
+const { listRankableEventsForMember, listAllContributingEventsForMember, toEpoch } = require('../../services/rankingRace');
 
 /**
  * GET /api/admin/rankings?page=1
@@ -69,7 +69,7 @@ router.get('/:uid/events', adminAuth, adminRights([1, 3]), async (req, res) => {
       ? await listAllContributingEventsForMember(uid)
       : await listRankableEventsForMember(uid);
     const sorted = [...events].sort((a, b) =>
-      String(b.sourceEventTs || '').localeCompare(String(a.sourceEventTs || ''))
+      toEpoch(b.sourceEventTs) - toEpoch(a.sourceEventTs)
       || Number(b.sourceEventId || 0) - Number(a.sourceEventId || 0));
 
     const total = sorted.length;

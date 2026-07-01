@@ -8,6 +8,7 @@ const { pool } = require('../config/database');
 const {
   getAllRankings,
   getRankProgress,
+  toMysqlDateTime,
 } = require('../services/ranking');
 const { loadExcludedSet } = require('../services/rankExclusions');
 
@@ -31,7 +32,14 @@ router.get('/', memberAuth, async (req, res) => {
     const userConsumed = Number(userProgress.consumedPoints || 0);
     const userRank = Number(userProgress.currentRank || 0);
     const userTotal = userConsumed + userRemaining;
-    const userAwardedAt = String(userProgress.qualifiedDate || '9999-12-31 23:59:59');
+    // mysql2 returns DATETIME columns as JS Date objects. String(dateObj) produces
+    // "Wed Jun 24 2026 00:00:00 GMT+0800 (...)" — NOT a value MySQL can parse back
+    // as a DATETIME literal, so the DATE_EXPR < ?/= ? comparisons below silently
+    // failed to match, undercounting/overcounting members "ahead" of the user and
+    // making this card disagree with the list's own position (e.g. #3 card vs #2
+    // list for the same member). Format with the same writer used to persist these
+    // columns (toMysqlDateTime) so the bound param is a real 'YYYY-MM-DD HH:MM:SS'.
+    const userAwardedAt = toMysqlDateTime(userProgress.qualifiedDate) || '9999-12-31 23:59:59';
 
     // The "your standing" position MUST mirror getAllRankings exactly, or the card and
     // the list disagree (e.g. #6 card vs #3 list). That ordering is: rank DESC, then
