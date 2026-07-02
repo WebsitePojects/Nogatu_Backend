@@ -99,8 +99,8 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
         'EXISTS (SELECT 1 FROM activation_code_usagetab acu WHERE acu.to_uid = v.uid AND acu.code LIKE ?)',
         `EXISTS (
            SELECT 1 FROM activation_code_usagetab acu
-           JOIN codestab cs ON cs.code = acu.code
-           WHERE acu.to_uid = v.uid AND CAST(cs.id AS CHAR) LIKE ?
+           LEFT JOIN codestab cs ON cs.code = acu.code
+           WHERE acu.to_uid = v.uid AND CAST(COALESCE(acu.code_row_id, cs.id) AS CHAR) LIKE ?
          )`,
       ];
       const searchParams = [pattern, pattern, pattern];
@@ -128,7 +128,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               (SELECT acu.code FROM activation_code_usagetab acu
                  WHERE acu.to_uid = v.uid
                  ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code,
-              (SELECT cs.id FROM activation_code_usagetab acu
+              (SELECT COALESCE(acu.code_row_id, cs.id) FROM activation_code_usagetab acu
                  LEFT JOIN codestab cs ON cs.code = acu.code
                  WHERE acu.to_uid = v.uid
                  ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code_id,
