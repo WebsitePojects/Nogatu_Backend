@@ -90,14 +90,20 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
 
     if (search) {
       // Cashier-centric trace: match by the ACTIVATION CODE the cashier distributed (any code
-      // the voucher owner used — codestab.code), or by username. The code is what the cashier
-      // tracks; the internal voucher id/ER is not part of their workflow.
+      // the voucher owner used — codestab.code), the underlying Code ID (codestab.id), or by
+      // username. The code/Code ID is what the cashier tracks; the internal voucher id/ER is
+      // not part of their workflow.
       const pattern = `%${search}%`;
       const ors = [
         'm.username LIKE ?',
         'EXISTS (SELECT 1 FROM activation_code_usagetab acu WHERE acu.to_uid = v.uid AND acu.code LIKE ?)',
+        `EXISTS (
+           SELECT 1 FROM activation_code_usagetab acu
+           JOIN codestab cs ON cs.code = acu.code
+           WHERE acu.to_uid = v.uid AND CAST(cs.id AS CHAR) LIKE ?
+         )`,
       ];
-      const searchParams = [pattern, pattern];
+      const searchParams = [pattern, pattern, pattern];
       filters.push(`(${ors.join(' OR ')})`);
       params.push(...searchParams);
     }
@@ -122,6 +128,10 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               (SELECT acu.code FROM activation_code_usagetab acu
                  WHERE acu.to_uid = v.uid
                  ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code,
+              (SELECT cs.id FROM activation_code_usagetab acu
+                 LEFT JOIN codestab cs ON cs.code = acu.code
+                 WHERE acu.to_uid = v.uid
+                 ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code_id,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
        LEFT JOIN memberstab m ON m.uid = v.uid
@@ -146,6 +156,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
         return {
           id: Number(row.id),
           code: row.source_code || null,
+          codeId: row.source_code_id != null ? Number(row.source_code_id) : null,
           uid: Number(row.uid),
           username: row.username,
           fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,
