@@ -47,7 +47,7 @@ function summarizeLeadershipTraceability(rows = []) {
   };
 }
 
-async function collectLeadershipTraceability(parentUid, level, conn, results) {
+async function collectLeadershipTraceability(parentUid, level, conn, results, visited = new Set([toNumber(parentUid)])) {
   if (level > 5) return;
 
   const [rows] = await conn.query(
@@ -71,6 +71,13 @@ async function collectLeadershipTraceability(parentUid, level, conn, results) {
   );
 
   for (const row of rows) {
+    // Cycle guard + dedupe: seeded with the root uid so a self-referencing drefid (or any
+    // drefid cycle looping back to an already-processed node) cannot be walked/counted twice.
+    // A node has exactly ONE drefid parent in a valid tree, so this is a no-op on real data.
+    const childUid = toNumber(row.uid);
+    if (visited.has(childUid)) continue;
+    visited.add(childUid);
+
     results.push({
       uid: toNumber(row.uid),
       username: row.username || null,
@@ -80,7 +87,7 @@ async function collectLeadershipTraceability(parentUid, level, conn, results) {
       directReferralCount: toNumber(row.directReferralCount),
     });
 
-    await collectLeadershipTraceability(row.uid, level + 1, conn, results);
+    await collectLeadershipTraceability(row.uid, level + 1, conn, results, visited);
   }
 }
 
