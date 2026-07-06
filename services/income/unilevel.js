@@ -66,6 +66,63 @@ async function getTotalPoints(uid) {
   return getTotalPointsForRange(uid, start, end, 'unilevel');
 }
 
+const IN_CLAUSE_CHUNK_SIZE = 1000;
+
+function chunkArray(values, size = IN_CLAUSE_CHUNK_SIZE) {
+  const chunks = [];
+  for (let i = 0; i < values.length; i += size) {
+    chunks.push(values.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Batched equivalent of getTotalPointsForRange for MANY uids in one round trip (one
+ * GROUP BY query instead of N single-uid queries). Preserves the exact same
+ * producttype/date-range/bucket filter semantics AND the same ER_BAD_FIELD_ERROR ->
+ * unbucketed fallback for pre-V036 environments that getTotalPointsForRange has.
+ * Returns Map<uid, points>; a uid with no matching repurchase rows is simply absent
+ * from the map (callers must default missing uids to 0, same as the single-uid helper
+ * does internally via `Number(rows[0]?.ttlpoints || 0)`).
+ */
+async function getTotalPointsForRangeBatch(uids, start, end, bucket = null) {
+  const numericUids = uids.map(Number).filter((u) => Number.isFinite(u) && u > 0);
+  if (numericUids.length === 0) return new Map();
+
+  const run = async (useBucket) => {
+    const placeholders = buildInClause(numericUids);
+    const bucketSql = useBucket ? 'AND maintenance_bucket = ?' : '';
+    const params = useBucket
+      ? [...numericUids, start, end, bucket]
+      : [...numericUids, start, end];
+    const [rows] = await pool.query(
+      `SELECT uid, SUM(incentivepoints1) as ttlpoints
+       FROM repurchasetab
+       WHERE uid IN (${placeholders})
+         AND DATE_FORMAT(transdate, '%Y-%m-%d') >= ?
+         AND DATE_FORMAT(transdate, '%Y-%m-%d') <= ?
+         AND producttype >= 100
+         ${bucketSql}
+       GROUP BY uid`,
+      params
+    );
+    const map = new Map();
+    for (const row of rows) {
+      map.set(Number(row.uid), Number(row.ttlpoints || 0));
+    }
+    return map;
+  };
+
+  if (!bucket) return run(false);
+  // Deploy-order safety: same pre-V036 fallback as getTotalPointsForRange.
+  try {
+    return await run(true);
+  } catch (err) {
+    if (err.code === 'ER_BAD_FIELD_ERROR') return run(false);
+    throw err;
+  }
+}
+
 /**
  * Check if user has met monthly maintenance requirement
  * Mirrors PHP chk_lastmaintenance()
@@ -176,8 +233,14 @@ function compressQualifyingLevels(qualifyingActualLevelsSorted, maxReach) {
  * Recursively collect downline product points per ACTUAL level (depth). Compression
  * is applied afterward in calculateUnilevelForWindow. Scans to MAX_UNILEVEL_SCAN_DEPTH
  * so deep-but-qualifying levels are not missed.
+ *
+ * `visited` is a cycle guard + dedupe set, seeded with the root's own uid by default so a
+ * drefid cycle that loops back to the root (or to any already-processed node) cannot be
+ * re-walked / re-counted. A node has exactly ONE drefid parent in a valid tree, so on real
+ * (acyclic) data this set can never remove a legitimate node — every uid is naturally visited
+ * at most once already. It only changes behavior for corrupt/cyclic drefid data.
  */
-async function calculateUnilevel(parent, level, state, getPointsForUid) {
+async function calculateUnilevel(parent, level, state, getPointsForUid, visited = new Set([Number(parent)])) {
   if (level > MAX_UNILEVEL_SCAN_DEPTH) return;
 
   const [rows] = await pool.query(
@@ -186,12 +249,106 @@ async function calculateUnilevel(parent, level, state, getPointsForUid) {
   );
 
   for (const row of rows) {
+    const childUid = Number(row.uid);
+    if (visited.has(childUid)) continue;
+    visited.add(childUid);
+
     const uidPurchases = Number(await getPointsForUid(row.uid) || 0);
     if (uidPurchases > 0) {
       state.pointsByLevel[level] = (state.pointsByLevel[level] || 0) + uidPurchases;
     }
-    await calculateUnilevel(row.uid, level + 1, state, getPointsForUid);
+    await calculateUnilevel(row.uid, level + 1, state, getPointsForUid, visited);
   }
+}
+
+/**
+ * BATCHED, level-by-level BFS replacement for the per-node recursive calculateUnilevel scan —
+ * used ONLY by the display-only projection path (getProjectedCurrentMonthUnilevel), which is
+ * invoked on EVERY dashboard/wallet page load. Issues O(depth) queries instead of O(nodes)
+ * queries: one `usertab` drefid-IN query + one `repurchasetab` uid-IN/GROUP-BY query per level
+ * (each chunked at IN_CLAUSE_CHUNK_SIZE). Reproduces calculateUnilevel's math bit-for-bit —
+ * per-ACTUAL-level point totals, scanned to MAX_UNILEVEL_SCAN_DEPTH — with the same visited-uid
+ * cycle guard as calculateUnilevel. Settlement (`calculateUnilevelForWindow` / `getUnilevel`) is
+ * completely untouched by this function; it still uses the per-node recursion above.
+ */
+async function calculateUnilevelPointsByLevelBatched(rootUid, start, end) {
+  const pointsByLevel = {};
+  const visited = new Set([Number(rootUid)]);
+  let parents = [Number(rootUid)];
+
+  for (let level = 1; level <= MAX_UNILEVEL_SCAN_DEPTH && parents.length > 0; level += 1) {
+    // 1. Fetch this level's children — one usertab query per parent-id chunk.
+    const childRows = [];
+    for (const parentChunk of chunkArray(parents)) {
+      const placeholders = buildInClause(parentChunk);
+      const [rows] = await pool.query(
+        `SELECT uid, drefid FROM usertab WHERE drefid IN (${placeholders})`,
+        parentChunk
+      );
+      childRows.push(...rows);
+    }
+
+    // Cycle guard + dedupe: a uid already seen (this level or an earlier one) cannot be a
+    // legitimate NEW downline in a valid tree — skip it, exactly like calculateUnilevel does.
+    const levelUids = [];
+    for (const row of childRows) {
+      const childUid = Number(row.uid);
+      if (!childUid || visited.has(childUid)) continue;
+      visited.add(childUid);
+      levelUids.push(childUid);
+    }
+
+    if (levelUids.length === 0) {
+      parents = [];
+      continue;
+    }
+
+    // 2. Fetch repurchase points for this level's uids — one repurchasetab query per uid chunk.
+    for (const uidChunk of chunkArray(levelUids)) {
+      const pointsMap = await getTotalPointsForRangeBatch(uidChunk, start, end, 'unilevel');
+      for (const childUid of uidChunk) {
+        const points = Number(pointsMap.get(childUid) || 0);
+        if (points > 0) {
+          pointsByLevel[level] = (pointsByLevel[level] || 0) + points;
+        }
+      }
+    }
+
+    parents = levelUids;
+  }
+
+  return pointsByLevel;
+}
+
+/**
+ * Batched replacement for calculateUnilevelForWindow, used ONLY by the projection path.
+ * Same math: fetch package policy -> maxReach, batched per-actual-level point totals,
+ * qualifying levels sorted by depth -> compressQualifyingLevels -> sum points x rate.
+ */
+async function calculateUnilevelProjection(uid, start, end) {
+  if (!start || !end) return 0;
+
+  const [packageRows] = await pool.query(
+    'SELECT currentaccttype FROM usertab WHERE uid = ? LIMIT 1',
+    [uid]
+  );
+  const packagePolicy = getPackagePolicy(packageRows[0]?.currentaccttype || 0);
+  const maxReach = Number(packagePolicy.unilevelReach || 0) || 0;
+  if (maxReach <= 0) return 0;
+
+  const pointsByLevel = await calculateUnilevelPointsByLevelBatched(uid, start, end);
+
+  const qualifying = Object.keys(pointsByLevel)
+    .map(Number)
+    .filter((lvl) => pointsByLevel[lvl] > 0)
+    .sort((a, b) => a - b);
+  const compMap = compressQualifyingLevels(qualifying, maxReach);
+
+  let total = 0;
+  for (const [actualLevel, { rate }] of compMap) {
+    total += Number(pointsByLevel[actualLevel] || 0) * rate;
+  }
+  return total;
 }
 
 async function calculateUnilevelForWindow(uid, options = {}) {
@@ -269,13 +426,14 @@ async function getUnilevel(uid) {
 }
 
 async function getProjectedCurrentMonthUnilevel(uid) {
+  // Display-only projection, called on every dashboard/wallet load — uses the batched
+  // level-by-level scan (calculateUnilevelProjection) instead of the per-node recursive
+  // calculateUnilevelForWindow, to avoid O(downline size) sequential queries per page view.
+  // requireMaintenance/preventDuplicateCredit are irrelevant here (this never credits money);
+  // calculateUnilevelProjection reproduces exactly what calculateUnilevelForWindow computed
+  // for this call when both those flags were false.
   const { start, end } = currentMonthRange();
-  return calculateUnilevelForWindow(uid, {
-    start,
-    end,
-    requireMaintenance: false,
-    preventDuplicateCredit: false,
-  });
+  return calculateUnilevelProjection(uid, start, end);
 }
 
 function getUnilevelRateForLevel(level) {
@@ -415,4 +573,11 @@ module.exports = {
   getUnilevelRateForLevel,
   getTotalPointsForRange,
   addUnilevelPointsToLevelBucket,
+  // Exported additionally for direct unit testing (no behavior change to any existing caller):
+  calculateUnilevel,
+  calculateUnilevelForWindow,
+  calculateUnilevelPointsByLevelBatched,
+  calculateUnilevelProjection,
+  getTotalPointsForRangeBatch,
+  compressQualifyingLevels,
 };
