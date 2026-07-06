@@ -293,6 +293,18 @@ async function main() {
         // eslint-disable-next-line no-await-in-loop
         const after = await calculateAndStoreIncome(uid, accttype);
 
+        // Corruption/tamper canary: the engine is monotonic (ttlincomeN = ttlincomeN + delta,
+        // delta >= 0), so an authoritative total DECREASING across an engine call is impossible
+        // through any legitimate path. Alert loudly; never mask it in the summary.
+        for (const field of INCOME_FIELDS) {
+          const dropped = Number(after?.[field] || 0) - Number(before?.[field] || 0);
+          if (dropped < -0.005) {
+            console.error(
+              `[income-sweep] !!! NEGATIVE DELTA uid=${uid} ${field}: ${Number(before?.[field] || 0)} -> ${Number(after?.[field] || 0)} — monotonic total went DOWN, investigate immediately`
+            );
+          }
+        }
+
         const { anyCredited, deltas } = diffCredited(before, after || {});
         if (anyCredited) {
           stats.credited += 1;
