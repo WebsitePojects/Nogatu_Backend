@@ -91,7 +91,7 @@ async function main() {
       // (CI collation) case; the explicit TRIM(username) = ? is a belt-and-braces
       // catch for stored values whose spaces are interior/odd.
       const [rows] = await conn.query(
-        `SELECT uid, username, CHAR_LENGTH(username) AS ulen, codeid
+        `SELECT uid, username, CHAR_LENGTH(username) AS ulen
          FROM memberstab
          WHERE username = ? OR TRIM(username) = ?`,
         [name, name]
