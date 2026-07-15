@@ -39,8 +39,9 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 /**
  * Shared WHERE builder for the code list/count/export. All conditions use the
  * `c.` alias (codestab AS c), so every caller must alias codestab as c.
- * Filters: q (code LIKE), owner (holder username LIKE), dateFrom/dateTo
- * (c.dategen window, inclusive, validated as YYYY-MM-DD to reject junk).
+ * Filters: q (code LIKE; an all-digit q ALSO matches the numeric Code ID
+ * exactly), owner (holder username LIKE), dateFrom/dateTo (c.dategen window,
+ * inclusive, validated as YYYY-MM-DD to reject junk).
  * Cashier (rights=2) is still capped at codestatus <= 1.
  */
 function buildCodeFilter(req, adminRight) {
@@ -51,7 +52,16 @@ function buildCodeFilter(req, adminRight) {
   const dateFrom = (req.query.dateFrom || '').trim();
   const dateTo = (req.query.dateTo || '').trim();
 
-  if (q) { conds.push('c.code LIKE ?'); params.push(`%${q}%`); }
+  if (q) {
+    if (/^\d+$/.test(q)) {
+      // Digits-only: management searches by the table's "Code ID" number too.
+      conds.push('(c.code LIKE ? OR c.id = ?)');
+      params.push(`%${q}%`, Number(q));
+    } else {
+      conds.push('c.code LIKE ?');
+      params.push(`%${q}%`);
+    }
+  }
   if (owner) {
     conds.push('c.uid IN (SELECT uid FROM memberstab WHERE username LIKE ?)');
     params.push(`%${owner}%`);
