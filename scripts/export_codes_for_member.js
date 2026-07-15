@@ -152,8 +152,12 @@ async function main() {
       const f = flagsByCode.get(r.code);
       const held = targetUid != null && r.uid === targetUid;
       let relation;
-      if (held) relation = (r.processid === username ? 'held+generated' : 'held');
-      else if (f && Number(f.used_by_her)) relation = 'used';
+      // "used" wins over "held": a code she consumed for her own repurchase/
+      // upgrade stays in her name (uid unchanged) but reads better as used.
+      // Codes she merely holds that a downline registered with are NOT
+      // used_by_her (registration_uid is the downline), so they stay "held".
+      if (f && Number(f.used_by_her)) relation = 'used';
+      else if (held) relation = (r.processid === username ? 'held+generated' : 'held');
       else if (f && Number(f.moved_by_her)) relation = 'transferred_out';
       else if (f && Number(f.received_by_her)) relation = 'received';
       else if (r.processid === username) relation = 'generated_by';
