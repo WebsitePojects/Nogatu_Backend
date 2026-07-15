@@ -25,6 +25,9 @@ const CODE_COLUMNS = [
 // reconciles the row 1:1 with the member's Code History screen).
 const RELATION_COLUMN = { header: 'Relation', key: 'relation', width: 16 };
 const SENT_TO_COLUMN = { header: 'Member Sent To', key: 'sentTo', width: 18 };
+// Date of the code's latest usage event (transfer/registration/repurchase) —
+// distinct from Date Generated, which is when the admin created the code.
+const LAST_ACTIVITY_COLUMN = { header: 'Last Activity', key: 'lastActivity', width: 20 };
 
 function applyHeaderStyle(ws, colCount) {
   const header = ws.getRow(1);
@@ -45,9 +48,10 @@ function buildCodesWorkbook(rows = [], opts = {}) {
   wb.creator = 'NOGATU Alliance Admin';
   wb.created = new Date();
   const ws = wb.addWorksheet(opts.sheetName || 'Activation Codes');
-  // Relation + Member Sent To, when present, sit right after the row number.
+  // Relation + Member Sent To sit right after the row number; Last Activity
+  // goes at the end after Date Generated.
   const columns = opts.withRelation
-    ? [CODE_COLUMNS[0], RELATION_COLUMN, SENT_TO_COLUMN, ...CODE_COLUMNS.slice(1)]
+    ? [CODE_COLUMNS[0], RELATION_COLUMN, SENT_TO_COLUMN, ...CODE_COLUMNS.slice(1), LAST_ACTIVITY_COLUMN]
     : CODE_COLUMNS;
   ws.columns = columns;
   rows.forEach((r) => ws.addRow(r));
