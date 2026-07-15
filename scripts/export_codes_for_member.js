@@ -19,12 +19,11 @@ const path = require('path');
 const mysql = require('mysql2/promise');
 const { loadBackendEnv, getDbConfig } = require('./env');
 const { buildCodesWorkbook } = require('../services/xlsxExport');
+// Authoritative package + maintenance-product names (10-60 packages,
+// 100-109 repurchase products) so product codes read e.g. "Vitamin C with
+// Zinc & Mangosteen", never "Type 106".
+const { PRODUCT_TYPES } = require('../utils/helpers');
 
-// Package/product-type names (mirror of utils/helpers PRODUCT_TYPES for the
-// entry packages; anything else falls back to "Type <n>").
-const PRODUCT_NAMES = {
-  10: 'Bronze', 20: 'Silver', 30: 'Gold', 40: 'Platinum', 50: 'Garnet', 60: 'Diamond',
-};
 const STATUS = { 0: 'Not Released', 1: 'Released', 2: 'Used' };
 
 function parseArgs(argv) {
@@ -105,7 +104,7 @@ async function main() {
         relation,
         codeId: r.id,
         code: r.code,
-        pkg: PRODUCT_NAMES[r.producttype] || `Type ${r.producttype}`,
+        pkg: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
         status: STATUS[r.codestatus] || r.codestatus,
         holderUsername: r.holder_username || '',
         holderName: r.holder_name || '',
