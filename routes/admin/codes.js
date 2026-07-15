@@ -16,6 +16,7 @@ const {
   buildSectionedCsv,
   sendCsv,
 } = require('../../services/csvExport');
+const { buildCodesWorkbook } = require('../../services/xlsxExport');
 
 async function tableExists(tableName) {
   const [rows] = await pool.query('SHOW TABLES LIKE ?', [tableName]);
@@ -31,6 +32,44 @@ function firstRowByCode(rows, codeField = 'code') {
     }
   }
   return map;
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Shared WHERE builder for the code list/count/export. All conditions use the
+ * `c.` alias (codestab AS c), so every caller must alias codestab as c.
+ * Filters: q (code LIKE; an all-digit q ALSO matches the numeric Code ID
+ * exactly), owner (holder username LIKE), dateFrom/dateTo (c.dategen window,
+ * inclusive, validated as YYYY-MM-DD to reject junk).
+ * Cashier (rights=2) is still capped at codestatus <= 1.
+ */
+function buildCodeFilter(req, adminRight) {
+  const conds = [adminRight === 2 ? 'c.codestatus <= 1' : 'c.codestatus <= 2'];
+  const params = [];
+  const q = (req.query.q || '').trim();
+  const owner = (req.query.owner || '').trim();
+  const dateFrom = (req.query.dateFrom || '').trim();
+  const dateTo = (req.query.dateTo || '').trim();
+
+  if (q) {
+    if (/^\d+$/.test(q)) {
+      // Digits-only: management searches by the table's "Code ID" number too.
+      conds.push('(c.code LIKE ? OR c.id = ?)');
+      params.push(`%${q}%`, Number(q));
+    } else {
+      conds.push('c.code LIKE ?');
+      params.push(`%${q}%`);
+    }
+  }
+  if (owner) {
+    conds.push('c.uid IN (SELECT uid FROM memberstab WHERE username LIKE ?)');
+    params.push(`%${owner}%`);
+  }
+  if (ISO_DATE.test(dateFrom)) { conds.push('c.dategen >= ?'); params.push(`${dateFrom} 00:00:00`); }
+  if (ISO_DATE.test(dateTo)) { conds.push('c.dategen < DATE_ADD(?, INTERVAL 1 DAY)'); params.push(dateTo); }
+
+  return { whereSql: `WHERE ${conds.join(' AND ')}`, params };
 }
 
 /**
@@ -74,20 +113,13 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const page = Math.max(1, Number(req.query.page) || 1);
     const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 40));
     const offset = (page - 1) * perPage;
-    const q = (req.query.q || '').trim();
 
-    // Cashier (rights=2) can manage transfer/release-ready codes only.
-    let whereSql = adminRight === 2 ? 'WHERE c.codestatus <= 1' : 'WHERE c.codestatus <= 2';
-    let countWhereSql = adminRight === 2 ? 'WHERE codestatus <= 1' : 'WHERE codestatus <= 2';
-    const whereParams = [];
-    if (q) {
-      whereSql += ' AND c.code LIKE ?';
-      countWhereSql += ' AND code LIKE ?';
-      whereParams.push(`%${q}%`);
-    }
+    // Cashier (rights=2) capped at codestatus <= 1; shared filter adds the
+    // optional q / owner / dateFrom / dateTo conditions.
+    const { whereSql, params: whereParams } = buildCodeFilter(req, adminRight);
 
     const [countRows] = await pool.query(
-      `SELECT COUNT(*) as total FROM codestab ${countWhereSql}`,
+      `SELECT COUNT(*) as total FROM codestab c ${whereSql}`,
       whereParams
     );
     const total = Number(countRows[0].total);
@@ -224,6 +256,74 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   } catch (err) {
     console.error('[Admin Codes] List error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/codes/export
+ * Export ALL codes matching the current filters (q / owner / dateFrom / dateTo)
+ * as an Excel-openable CSV — not just the visible page. Read-only.
+ */
+router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const adminRight = Number(req.session.adminrights || 0);
+    const { whereSql, params } = buildCodeFilter(req, adminRight);
+    const MAX_ROWS = 50000;
+
+    const [rows] = await pool.query(
+      `SELECT c.id, c.code, c.producttype, c.codestatus, c.processid,
+              DATE_FORMAT(c.dategen, '%Y-%m-%d %H:%i') AS dategen,
+              m.username AS owner_username,
+              TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS owner_fullname
+       FROM codestab c
+       LEFT JOIN memberstab m ON m.uid = c.uid
+       ${whereSql}
+       ORDER BY c.dategen DESC, c.id DESC
+       LIMIT ?`,
+      [...params, MAX_ROWS]
+    );
+
+    const statusLabel = (s) => (s === 0 ? 'Not Released' : s === 1 ? 'Released' : 'Used');
+    const owner = (req.query.owner || '').trim().replace(/[^A-Za-z0-9_-]/g, '') || 'all';
+    const filename = `activation-codes-${owner}`;
+
+    // CSV kept as an explicit fallback; default is a real .xlsx with fixed
+    // column widths so dates/names don't overlap or show "########" in Excel.
+    if (String(req.query.format || '').toLowerCase() === 'csv') {
+      const csvRows = rows.map((r, i) => ({
+        '#': i + 1,
+        'Code ID': r.id,
+        'Activation Code': r.code,
+        'Package': PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
+        'Status': statusLabel(r.codestatus),
+        'Holder Username': r.owner_username || '',
+        'Holder Name': (r.owner_fullname || '').trim(),
+        'Generated By': r.processid || '',
+        'Date Generated': r.dategen || '',
+      }));
+      sendCsv(res, filename, buildSectionedCsv([{ rows: csvRows }]));
+      return;
+    }
+
+    const xlsxRows = rows.map((r, i) => ({
+      idx: i + 1,
+      codeId: r.id,
+      code: r.code,
+      pkg: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
+      status: statusLabel(r.codestatus),
+      holderUsername: r.owner_username || '',
+      holderName: (r.owner_fullname || '').trim(),
+      generatedBy: r.processid || '',
+      dategen: r.dategen || '',
+    }));
+    const wb = buildCodesWorkbook(xlsxRows, { sheetName: 'Activation Codes' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('[Admin Codes] Export error:', err);
+    res.status(500).json({ error: 'Failed to export activation codes' });
   }
 });
 

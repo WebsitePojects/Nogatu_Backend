@@ -270,6 +270,27 @@ const loginLimiter = rateLimit({
 app.use('/api/auth/login', loginLimiter);
 app.use('/api/admin/auth/login', loginLimiter);
 
+// Stricter limit for password-reset requests: each hit can create a reset
+// token and dispatch an email, so this must not be spammable (mail bombing /
+// token-table flooding).
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many password reset requests. Please try again after 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/auth/forgot-password', forgotPasswordLimiter);
+// The reset endpoint authenticates purely by token — cap guessing/DoS attempts.
+const resetPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many password reset attempts. Please try again after 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/auth/reset-password', resetPasswordLimiter);
+
 // ─── API Routes ──────────────────────────────────────────────
 // Member routes
 app.use('/api/auth', require('./routes/auth'));

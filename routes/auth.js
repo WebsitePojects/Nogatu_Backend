@@ -10,6 +10,7 @@ const { pool } = require('../config/database');
 const { getAccountTypeName } = require('../utils/helpers');
 const { writeAuditLog } = require('../services/audit');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
+const { sendPasswordResetEmail } = require('../services/mailer');
 
 function normalizeLegacyUsername(value) {
   return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
@@ -207,8 +208,26 @@ router.post('/forgot-password', async (req, res) => {
         afterState: { username: member.username },
       });
 
-      // Email provider wiring is environment-specific. In development we return
-      // the token so the local reset flow can be tested without a mail gateway.
+      // Deliver the reset link. Fire-and-forget: awaiting the SMTP roundtrip
+      // here would make responses measurably slower for existing accounts
+      // (timing-based enumeration) and stall the endpoint when SMTP is down.
+      // Mail failures are logged inside the mailer and never change the
+      // generic 200 response.
+      const clientUrl = String(process.env.CLIENT_URL || '').replace(/\/+$/, '');
+      if (!clientUrl) {
+        console.error('[Auth] CLIENT_URL missing — password reset email skipped');
+      } else {
+        sendPasswordResetEmail({
+          to: member.email,
+          firstname: member.firstname,
+          resetUrl: `${clientUrl}/portal/reset-password?token=${rawToken}`,
+        }).catch((err) => {
+          console.error('[Mailer] unexpected dispatch error:', err.message);
+        });
+      }
+
+      // In development we also return the token so the local reset flow can be
+      // tested without a mail gateway.
       if (process.env.NODE_ENV !== 'production') {
         return res.json({
           success: true,
