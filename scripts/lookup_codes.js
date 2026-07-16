@@ -72,36 +72,9 @@ function chunk(arr, size = CHUNK) {
   return out;
 }
 
-/**
- * Parse a legacy codehistorytab.history trail. Older codes predate
- * activation_code_usagetab, so this string is their ONLY trail source.
- *
- * TWO formats exist and they carry different semantics:
- *  1. Parenthesised (admin / legacy PHP): "(nogatuadmin)Ann050890 -> (Ann050890)Malou05"
- *     Each segment is self-contained "(actor)recipient"; hop 1 = segment 0.
- *  2. Plain (Node member transfer, routes/codes.js): "tabsqui->VernieS01"
- *     Segments are usernames: from -> to.
- * Returns the code's FIRST transfer (actor + recipient) plus the whole chain.
- */
-function parseLegacyTrail(history) {
-  if (!history) return null;
-  const raw = String(history).trim();
-  if (!raw) return null;
-  const segments = raw.split('->').map((s) => s.trim()).filter(Boolean);
-  if (segments.length === 0) return null;
-
-  if (raw.includes('(')) {
-    const seg0 = segments[0];
-    return {
-      actor: (seg0.match(/^\(([^)]+)\)/) || [])[1]?.trim() || null,
-      recipient: (seg0.match(/\)\s*(.+)$/) || [])[1]?.trim() || null,
-      full: raw,
-    };
-  }
-  return { actor: segments[0] || null, recipient: segments[1] || null, full: raw };
-}
-
-const sameUser = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+// Legacy trail parsing is shared with export_codes_for_member.js — see
+// services/codeTrail.js for the two stored history formats.
+const { parseLegacyTrail, sameUser } = require('../services/codeTrail');
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
