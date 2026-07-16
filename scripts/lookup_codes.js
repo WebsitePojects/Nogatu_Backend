@@ -72,6 +72,37 @@ function chunk(arr, size = CHUNK) {
   return out;
 }
 
+/**
+ * Parse a legacy codehistorytab.history trail. Older codes predate
+ * activation_code_usagetab, so this string is their ONLY trail source.
+ *
+ * TWO formats exist and they carry different semantics:
+ *  1. Parenthesised (admin / legacy PHP): "(nogatuadmin)Ann050890 -> (Ann050890)Malou05"
+ *     Each segment is self-contained "(actor)recipient"; hop 1 = segment 0.
+ *  2. Plain (Node member transfer, routes/codes.js): "tabsqui->VernieS01"
+ *     Segments are usernames: from -> to.
+ * Returns the code's FIRST transfer (actor + recipient) plus the whole chain.
+ */
+function parseLegacyTrail(history) {
+  if (!history) return null;
+  const raw = String(history).trim();
+  if (!raw) return null;
+  const segments = raw.split('->').map((s) => s.trim()).filter(Boolean);
+  if (segments.length === 0) return null;
+
+  if (raw.includes('(')) {
+    const seg0 = segments[0];
+    return {
+      actor: (seg0.match(/^\(([^)]+)\)/) || [])[1]?.trim() || null,
+      recipient: (seg0.match(/\)\s*(.+)$/) || [])[1]?.trim() || null,
+      full: raw,
+    };
+  }
+  return { actor: segments[0] || null, recipient: segments[1] || null, full: raw };
+}
+
+const sameUser = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help || (opts.ids.length === 0 && !opts.generatedBy && !opts.initialTo)) {
@@ -106,7 +137,7 @@ async function main() {
       );
       const candCodes = cand.map((r) => r.code);
       // Keep only those whose EARLIEST transfer recipient is this member.
-      initialToCodes = [];
+      const found = new Set();
       for (const part of chunk(candCodes)) {
         if (part.length === 0) continue;
         const [firsts] = await conn.query(
@@ -120,9 +151,24 @@ async function main() {
            ) f ON f.code = a.code AND f.first_id = a.id`,
           [...TRANSFER_EVENTS, ...part]
         );
-        for (const f of firsts) if (Number(f.to_uid) === Number(targetUid)) initialToCodes.push(f.code);
+        for (const f of firsts) if (Number(f.to_uid) === Number(targetUid)) found.add(f.code);
       }
-      console.log(`Codes whose FIRST transfer went to "${opts.initialTo}": ${initialToCodes.length}`);
+      const fromEvents = found.size;
+
+      // LEGACY: codes predating activation_code_usagetab keep their trail only in
+      // codehistorytab.history — "(nogatuadmin)tabsqui -> (tabsqui)someoneelse".
+      // Broad LIKE then exact first-segment parse (LIKE alone would match a member
+      // appearing anywhere later in the chain).
+      const [legacyCand] = await conn.query(
+        'SELECT code, history FROM codehistorytab WHERE history LIKE ?',
+        [`%${mem[0].username}%`]
+      );
+      for (const r of legacyCand) {
+        const t = parseLegacyTrail(r.history);
+        if (t && sameUser(t.recipient, mem[0].username)) found.add(r.code);
+      }
+      initialToCodes = [...found];
+      console.log(`Codes whose FIRST transfer went to "${opts.initialTo}": ${initialToCodes.length} (events: ${fromEvents}, legacy trail: ${initialToCodes.length - fromEvents})`);
       if (initialToCodes.length === 0) { console.log('Nothing written.'); return; }
     }
 
@@ -153,6 +199,7 @@ async function main() {
     const codes = rows.map((r) => r.code);
     const firstByCode = new Map();
     const lastByCode = new Map();
+    const legacyByCode = new Map();
     for (const part of chunk(codes)) {
       const ph = part.map(() => '?').join(',');
       const [firsts] = await conn.query(
@@ -180,26 +227,51 @@ async function main() {
         part
       );
       for (const l of lasts) lastByCode.set(l.code, l.last_at);
+
+      // Legacy trail + transfer date for codes with no usage events.
+      const [legacy] = await conn.query(
+        `SELECT code, history, DATE_FORMAT(datetransfer,'%Y-%m-%d %H:%i') AS datetransfer
+         FROM codehistorytab WHERE code IN (${ph})
+         ORDER BY datetransfer DESC, id DESC`,
+        part
+      );
+      for (const l of legacy) {
+        if (!legacyByCode.has(l.code)) legacyByCode.set(l.code, l);
+      }
     }
 
+    let legacyUsed = 0;
+    let noTrail = 0;
     const xrows = rows.map((r, i) => {
       const f = firstByCode.get(r.code);
-      const initialBy = f ? (f.actor_admin || f.actor_member || '') : '';
-      const initialTo = f ? (f.to_username || '') : '';
+      const lg = parseLegacyTrail(legacyByCode.get(r.code)?.history);
+      // Node-era events win; fall back to the legacy trail string for older codes.
+      let initialBy = f ? (f.actor_admin || f.actor_member || '') : '';
+      let initialTo = f ? (f.to_username || '') : '';
+      let trail = initialBy && initialTo ? `(${initialBy})${initialTo}` : '';
+      if (!initialTo && lg) {
+        initialBy = lg.actor || '';
+        initialTo = lg.recipient || '';
+        trail = lg.full;
+        legacyUsed += 1;
+      } else if (lg && lg.full) {
+        trail = lg.full; // legacy string carries the whole chain, not just hop 1
+      }
+      if (!initialTo) noTrail += 1;
       return {
         idx: i + 1,
         codeId: r.id,
         code: r.code,
         pkg: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
         status: STATUS[r.codestatus] || r.codestatus,
-        trail: initialBy && initialTo ? `(${initialBy})${initialTo}` : '',
+        trail,
         initialTo,
         initialBy,
         holderUsername: r.holder_username || '',
         holderName: r.holder_name || '',
         generatedBy: r.processid || '',
         dategen: r.dategen || '',
-        lastActivity: lastByCode.get(r.code) || '',
+        lastActivity: lastByCode.get(r.code) || legacyByCode.get(r.code)?.datetransfer || '',
       };
     });
 
@@ -219,6 +291,7 @@ async function main() {
 
     console.log('-------------------------------------------------------------');
     console.log(`Matched: ${rows.length}`);
+    console.log(`Trail source: events ${rows.length - legacyUsed - noTrail} | legacy codehistorytab ${legacyUsed} | NO TRAIL FOUND ${noTrail}`);
     if (opts.ids.length > 0) {
       const found = new Set(rows.map((r) => r.id));
       const missing = opts.ids.filter((id) => !found.has(id));
