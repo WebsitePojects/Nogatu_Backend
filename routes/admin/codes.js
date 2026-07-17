@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
+const { idempotent } = require('../../middleware/idempotency');
 const { generateCodes } = require('../../services/codeGeneration');
 const { PRODUCT_TYPES } = require('../../utils/helpers');
 const { sanitizeAlphaNum } = require('../../utils/helpers');
@@ -452,7 +453,7 @@ router.post('/release', adminAuth, adminRights([1, 3]), async (req, res) => {
  * POST /api/admin/codes/transfer
  * Transfer codes to member account
  */
-router.post('/transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
+router.post('/transfer', adminAuth, adminRights([1, 3]), idempotent('admin.codes.transfer'), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const { targetUsername, codes: selectedCodes } = req.body;

@@ -6,6 +6,7 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
+const { idempotent } = require('../middleware/idempotency');
 const { pool } = require('../config/database');
 const registrationService = require('../services/registration');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
@@ -377,7 +378,7 @@ router.get('/referral/:token', async (req, res) => {
   }
 });
 
-router.post('/public-register', async (req, res) => {
+router.post('/public-register', idempotent('registration.public'), async (req, res) => {
   try {
     await ensureReferralInvitesTable();
     const {
@@ -552,7 +553,7 @@ router.post('/public-register', async (req, res) => {
  * POST /api/registration/register
  * Full account registration
  */
-router.post('/register', memberAuth, async (req, res) => {
+router.post('/register', memberAuth, idempotent('registration.member'), async (req, res) => {
   try {
     const {
       activationCode, placementUid, username, password,

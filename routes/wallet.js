@@ -5,6 +5,7 @@
 const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
+const { idempotent } = require('../middleware/idempotency');
 const { pool } = require('../config/database');
 const { calculateAndStoreIncome } = require('../services/income/calculateAndStoreIncome');
 const { insertEncashment, getEncashmentPreview } = require('../services/income/insertIncome');
@@ -137,7 +138,7 @@ router.post('/preview-encash', memberAuth, async (req, res) => {
  * POST /api/wallet/encash
  * Process encashment
  */
-router.post('/encash', memberAuth, async (req, res) => {
+router.post('/encash', memberAuth, idempotent('wallet.encash'), async (req, res) => {
   try {
     const uid = req.session.uid;
     const amount = Number(req.body.amount);

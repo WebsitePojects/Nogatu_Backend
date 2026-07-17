@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
+const { idempotent } = require('../middleware/idempotency');
 const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES, CODE_PREFIXES, currentMonthRange } = require('../utils/helpers');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
@@ -120,7 +121,7 @@ router.get('/resolve-member', memberAuth, async (req, res) => {
  * POST /api/codes/transfer
  * Transfer codes to another member
  */
-router.post('/transfer', memberAuth, async (req, res) => {
+router.post('/transfer', memberAuth, idempotent('codes.transfer'), async (req, res) => {
   try {
     const uid = req.session.uid;
     const { targetUsername, codes: selectedCodes } = req.body;
@@ -195,7 +196,7 @@ router.post('/transfer', memberAuth, async (req, res) => {
  * POST /api/codes/upgrade
  * Upgrade account using activation code
  */
-router.post('/upgrade', memberAuth, async (req, res) => {
+router.post('/upgrade', memberAuth, idempotent('codes.upgrade'), async (req, res) => {
   let conn;
   try {
     const uid = req.session.uid;
@@ -377,7 +378,7 @@ router.post('/upgrade', memberAuth, async (req, res) => {
  * POST /api/codes/maintenance
  * Activate maintenance code (repurchase)
  */
-router.post('/maintenance', memberAuth, async (req, res) => {
+router.post('/maintenance', memberAuth, idempotent('codes.maintenance'), async (req, res) => {
   let conn;
   try {
     const uid = req.session.uid;
