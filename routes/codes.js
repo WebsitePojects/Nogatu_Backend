@@ -151,11 +151,13 @@ router.post('/transfer', memberAuth, async (req, res) => {
       );
       if (codeRows.length === 0) continue;
 
-      // Transfer code
-      await pool.query(
-        'UPDATE codestab SET uid = ? WHERE code = ? LIMIT 1',
-        [targetUid, code]
+      // Transfer code — atomic claim: only moves if still owned by sender and unused,
+      // so a double-tap or a concurrent use/transfer of the same code can't win twice.
+      const [transferResult] = await pool.query(
+        'UPDATE codestab SET uid = ? WHERE code = ? AND uid = ? AND codestatus = 1 LIMIT 1',
+        [targetUid, code, uid]
       );
+      if (transferResult.affectedRows !== 1) continue;
 
       // Log to codehistorytab
       const history = `${req.session.username}->${targetSanitized}`;
@@ -238,8 +240,8 @@ router.post('/upgrade', memberAuth, async (req, res) => {
 
     // Update code status
     const [useResult] = await conn.query(
-      "UPDATE codestab SET dateused = NOW(), codestatus = 2, uid = ? WHERE code = ? LIMIT 1",
-      [uid, code]
+      "UPDATE codestab SET dateused = NOW(), codestatus = 2, uid = ? WHERE code = ? AND uid = ? AND codestatus = 1 LIMIT 1",
+      [uid, code, uid]
     );
     if (useResult.affectedRows !== 1) {
       await conn.rollback();
@@ -428,7 +430,7 @@ router.post('/maintenance', memberAuth, async (req, res) => {
 
     // Update code status to used
     const [useResult] = await conn.query(
-      "UPDATE codestab SET dateused = NOW(), codestatus = 2 WHERE code = ? AND uid = ? LIMIT 1",
+      "UPDATE codestab SET dateused = NOW(), codestatus = 2 WHERE code = ? AND uid = ? AND codestatus = 1 LIMIT 1",
       [code, uid]
     );
     if (useResult.affectedRows !== 1) {

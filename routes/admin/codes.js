@@ -478,10 +478,13 @@ router.post('/transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
       );
       if (codeRows.length === 0) continue;
 
-      await pool.query(
-        'UPDATE codestab SET uid = ? WHERE code = ? LIMIT 1',
+      // Atomic claim: re-assert the same status predicate the SELECT used so a
+      // double-submit or concurrent member action can't transfer a consumed code.
+      const [transferResult] = await pool.query(
+        `UPDATE codestab SET uid = ? WHERE code = ? AND ${codeWhere} LIMIT 1`,
         [targetUid, code]
       );
+      if (transferResult.affectedRows !== 1) continue;
 
       const history = `(${req.session.adminid}).${targetSanitized}`;
       await pool.query(
