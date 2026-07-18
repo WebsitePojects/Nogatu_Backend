@@ -149,7 +149,43 @@ router.get('/binary/flat', adminAuth, adminRights([1, 3]), async (req, res) => {
     const rootUid = await resolveRootUid(req.query.root || req.query.id, req.query.username);
     if (!rootUid) return res.status(400).json({ error: 'Username, account ID, public UID, or referral slug required' });
     const nodes = await getSubtreeFlat(rootUid, 'binary');
-    res.json({ rootUid, treeType: 'binary', count: nodes.length, version: treeVersion(nodes), nodes });
+    // The searched account's OWN sponsor (drefid) — subtree nodes can't carry it
+    // (the root's parentUid is nulled), so the admin UI needs it here. Read-only.
+    const [[sponsorRow]] = await pool.query(
+      `SELECT m.uid, m.username,
+              TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS fullname
+         FROM usertab u
+         JOIN memberstab m ON m.uid = u.drefid
+        WHERE u.uid = ? LIMIT 1`,
+      [rootUid]
+    );
+    const rootSponsor = sponsorRow
+      ? { uid: Number(sponsorRow.uid), username: sponsorRow.username, fullname: (sponsorRow.fullname || '').trim() || null }
+      : null;
+    // The root's BINARY parent (refid) — lets the admin UI navigate upward, tree
+    // by tree, until the top of the whole structure. Read-only.
+    const [[uplineRow]] = await pool.query(
+      `SELECT m.uid, m.username,
+              TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS fullname
+         FROM usertab u
+         JOIN memberstab m ON m.uid = u.refid
+        WHERE u.uid = ? LIMIT 1`,
+      [rootUid]
+    );
+    const rootUpline = uplineRow
+      ? { uid: Number(uplineRow.uid), username: uplineRow.username, fullname: (uplineRow.fullname || '').trim() || null }
+      : null;
+    // Both uids are folded into the version so warm client caches (which predate
+    // these fields, or a re-placement/re-sponsorship) swap in the fresh payload.
+    res.json({
+      rootUid,
+      treeType: 'binary',
+      count: nodes.length,
+      version: `${treeVersion(nodes)}-s${rootSponsor ? rootSponsor.uid : 0}-p${rootUpline ? rootUpline.uid : 0}`,
+      nodes,
+      rootSponsor,
+      rootUpline,
+    });
   } catch (error) {
     console.error('[Admin Genealogy] Binary flat error:', error);
     res.status(500).json({ error: 'Internal server error' });
