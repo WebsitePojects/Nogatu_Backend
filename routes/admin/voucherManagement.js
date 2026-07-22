@@ -106,6 +106,14 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
          )`,
       ];
       const searchParams = [pattern, pattern, pattern];
+      // Digits or "VCH-000123" (the voucher's displayed code, derived from its PK):
+      // match the voucher id directly — primary-key lookup, instant. The detail page
+      // searches the list by this exact digit string.
+      const idMatch = search.match(/^(?:VCH-?)?0*(\d{1,10})$/i);
+      if (idMatch) {
+        ors.push('v.id = ?');
+        searchParams.push(Number(idMatch[1]));
+      }
       filters.push(`(${ors.join(' OR ')})`);
       params.push(...searchParams);
     }
