@@ -93,29 +93,64 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
       // the voucher owner used — codestab.code), the underlying Code ID (codestab.id), or by
       // username. The code/Code ID is what the cashier tracks; the internal voucher id/ER is
       // not part of their workflow.
+      //
+      // Perf: resolve matching voucher owners FIRST via small bounded indexed queries, then
+      // filter vouchers by a literal uid list. Never leave LIKE subqueries inside the voucher
+      // query — the optimizer can degrade them to per-outer-row execution (the minutes-long
+      // prod search). Fuzzy match only where cheap and useful (username / code contains);
+      // Code ID and the VCH voucher id are exact indexed point lookups.
       const pattern = `%${search}%`;
-      // Resolve matching recipients ONCE via a semi-join, not correlated per-voucher-row
-      // EXISTS probes — those re-scanned the whole usage table for every voucher row in
-      // BOTH the COUNT and page queries, which is why searches took minutes on prod.
-      const ors = [
-        'm.username LIKE ?',
-        `v.uid IN (
-           SELECT acu.to_uid FROM activation_code_usagetab acu
-           LEFT JOIN codestab cs ON cs.code = acu.code
-           WHERE acu.code LIKE ? OR CAST(COALESCE(acu.code_row_id, cs.id) AS CHAR) LIKE ?
-         )`,
-      ];
-      const searchParams = [pattern, pattern, pattern];
-      // Digits or "VCH-000123" (the voucher's displayed code, derived from its PK):
-      // match the voucher id directly — primary-key lookup, instant. The detail page
-      // searches the list by this exact digit string.
+      const matchedUids = new Set();
+
+      const [usernameRows] = await pool.query(
+        'SELECT uid FROM memberstab WHERE username LIKE ? LIMIT 1000',
+        [pattern]
+      );
+      for (const row of usernameRows) matchedUids.add(Number(row.uid));
+
+      const [codeRows] = await pool.query(
+        `SELECT DISTINCT to_uid FROM activation_code_usagetab
+          WHERE code LIKE ? AND to_uid IS NOT NULL
+          LIMIT 1000`,
+        [pattern]
+      );
+      for (const row of codeRows) matchedUids.add(Number(row.to_uid));
+
+      // Digits or "VCH-000123": exact Code ID (usage code_row_id / codestab PK) plus the
+      // voucher's own displayed VCH id (voucherstab PK).
       const idMatch = search.match(/^(?:VCH-?)?0*(\d{1,10})$/i);
-      if (idMatch) {
-        ors.push('v.id = ?');
-        searchParams.push(Number(idMatch[1]));
+      const numericId = idMatch ? Number(idMatch[1]) : null;
+      if (numericId !== null) {
+        const [idRows] = await pool.query(
+          `SELECT DISTINCT acu.to_uid
+             FROM activation_code_usagetab acu
+            WHERE acu.to_uid IS NOT NULL
+              AND (acu.code_row_id = ?
+                   OR acu.code IN (SELECT code FROM codestab WHERE id = ?))
+            LIMIT 1000`,
+          [numericId, numericId]
+        );
+        for (const row of idRows) matchedUids.add(Number(row.to_uid));
       }
-      filters.push(`(${ors.join(' OR ')})`);
-      params.push(...searchParams);
+
+      const ors = [];
+      const searchParams = [];
+      if (matchedUids.size > 0) {
+        const uidList = [...matchedUids];
+        ors.push(`v.uid IN (${uidList.map(() => '?').join(',')})`);
+        searchParams.push(...uidList);
+      }
+      if (numericId !== null) {
+        ors.push('v.id = ?');
+        searchParams.push(numericId);
+      }
+      if (ors.length === 0) {
+        // Nothing matches — keep the count/page queries trivially false instead of scanning.
+        filters.push('1 = 0');
+      } else {
+        filters.push(`(${ors.join(' OR ')})`);
+        params.push(...searchParams);
+      }
     }
 
     const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
