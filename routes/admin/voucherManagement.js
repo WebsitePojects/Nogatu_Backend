@@ -94,13 +94,15 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
       // username. The code/Code ID is what the cashier tracks; the internal voucher id/ER is
       // not part of their workflow.
       const pattern = `%${search}%`;
+      // Resolve matching recipients ONCE via a semi-join, not correlated per-voucher-row
+      // EXISTS probes — those re-scanned the whole usage table for every voucher row in
+      // BOTH the COUNT and page queries, which is why searches took minutes on prod.
       const ors = [
         'm.username LIKE ?',
-        'EXISTS (SELECT 1 FROM activation_code_usagetab acu WHERE acu.to_uid = v.uid AND acu.code LIKE ?)',
-        `EXISTS (
-           SELECT 1 FROM activation_code_usagetab acu
+        `v.uid IN (
+           SELECT acu.to_uid FROM activation_code_usagetab acu
            LEFT JOIN codestab cs ON cs.code = acu.code
-           WHERE acu.to_uid = v.uid AND CAST(COALESCE(acu.code_row_id, cs.id) AS CHAR) LIKE ?
+           WHERE acu.code LIKE ? OR CAST(COALESCE(acu.code_row_id, cs.id) AS CHAR) LIKE ?
          )`,
       ];
       const searchParams = [pattern, pattern, pattern];
