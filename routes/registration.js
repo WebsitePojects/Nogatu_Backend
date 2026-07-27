@@ -72,6 +72,80 @@ async function buildPlacementPreview(sponsorUid, conn = pool) {
   };
 }
 
+// Error codes the registration SERVICE layer (services/registration.js) stamps on
+// thrown Errors — these already carry a specific, non-technical message + a `field`
+// safe to show the encoder verbatim. Anything else (a raw MySQL driver code like
+// ER_DUP_ENTRY/ER_LOCK_DEADLOCK, or a truly unexpected exception with no `.code` at
+// all) is NOT safe to surface as-is — falls back to a generic message so we never
+// leak a stack trace or raw SQL text to the client (see money-integrity.md).
+const REGISTRATION_KNOWN_ERROR_CODES = new Set([
+  'DUPLICATE_ACCOUNT',
+  'USERNAME_TAKEN',
+  'EMAIL_TAKEN',
+  'MISSING_FIELD',
+  'INVALID_TIN',
+  'INVALID_EMAIL',
+  'PLACEMENT_LOCKED',
+  'INVALID_PLACEMENT',
+  'PLACEMENT_TAKEN',
+  'INVALID_CODE',
+  'CODE_ALREADY_USED',
+  'REGISTRATION_BUSY',
+]);
+
+const REGISTRATION_GENERIC_ERROR_MESSAGE =
+  'Registration could not be completed. Please review your details and try again, or contact support if the problem continues.';
+
+/**
+ * Build the pop-up-ready error body for a registration failure.
+ * Known codes (from services/registration.js) pass their specific message/field
+ * straight through. Unknown errors (DB errors, anything uncoded) get a generic,
+ * non-leaking message — never `err.message` from an unrecognized error, per the
+ * "fail closed" rule (never trust an unclassified error to be safe to display).
+ */
+function buildRegistrationErrorPayload(err) {
+  const code = err && err.code;
+  const isKnown = REGISTRATION_KNOWN_ERROR_CODES.has(code);
+
+  const payload = {
+    error: isKnown ? err.message : REGISTRATION_GENERIC_ERROR_MESSAGE,
+    errorCode: isKnown ? code : 'REGISTRATION_FAILED',
+    field: isKnown ? (err.field || null) : null,
+    popup: true,
+  };
+
+  // SECURITY: duplicatePolicy carries ONLY the matched member's username + which
+  // rule matched — never matchedUid/matchedName/tin/email/phone/address/dob. Those
+  // stay server-side in err.details for the audit log (writeDuplicateRegistrationAudit)
+  // only; an encoder must never be able to harvest another member's PII by probing
+  // the registration form with guessed names/TINs.
+  if (code === 'DUPLICATE_ACCOUNT') {
+    payload.duplicatePolicy = {
+      blocked: true,
+      rule: (err.details && err.details.rule) || null,
+      matchedUsername: (err.details && err.details.matchedUsername) || null,
+    };
+  }
+
+  return payload;
+}
+
+/**
+ * Log a registration failure at the right severity: unexpected/system errors
+ * (unrecognized `.code`, e.g. a raw MySQL driver code) go to console.error so they
+ * show up in monitoring; normal user-input/business-rule rejections (known codes,
+ * or a plain Error with no code at all) go to console.warn so they don't pollute
+ * the PM2 error stream with routine "TIN already registered" style rejections.
+ */
+function logRegistrationError(label, err) {
+  const isKnown = REGISTRATION_KNOWN_ERROR_CODES.has(err && err.code);
+  if (!isKnown && err && err.code) {
+    console.error(`[Registration] ${label} error:`, err);
+  } else if (!isKnown) {
+    console.warn(`[Registration] ${label} rejected:`, err && err.message);
+  }
+}
+
 async function writeDuplicateRegistrationAudit(req, sponsorUid, details, attemptedIdentity) {
   await writeAuditLog({
     req,
@@ -515,7 +589,7 @@ router.post('/public-register', idempotent('registration.public'), async (req, r
 
     res.json(result);
   } catch (err) {
-    console.error('[Registration] Public registration error:', err);
+    logRegistrationError('Public registration', err);
     if (err.code === 'DUPLICATE_ACCOUNT') {
       await writeDuplicateRegistrationAudit(req, Number(req.body?.sponsorUid || 0), err.details, {
         firstname: req.body?.firstname,
@@ -527,25 +601,8 @@ router.post('/public-register', idempotent('registration.public'), async (req, r
         dob: req.body?.dob,
         address: req.body?.address,
       });
-      return res.status(400).json({
-        error: err.message,
-        errorCode: 'DUPLICATE_ACCOUNT',
-        popup: true,
-        duplicatePolicy: {
-          blocked: true,
-          reason: err.details?.reason || 'name-plus-strong-signal-match',
-        },
-      });
     }
-    if (err.code === 'USERNAME_TAKEN') {
-      return res.status(400).json({
-        error: err.message,
-        errorCode: err.code,
-        popup: true,
-        field: 'username',
-      });
-    }
-    res.status(400).json({ error: err.message });
+    res.status(400).json(buildRegistrationErrorPayload(err));
   }
 });
 
@@ -617,14 +674,10 @@ router.post('/register', memberAuth, idempotent('registration.member'), async (r
     res.json(result);
   } catch (err) {
     // Only write to error.log for unexpected system errors (e.g. DB failures).
-    // User-input validation rejections (plain Error, no code) and known business
-    // rule codes go to warn so they don't pollute the PM2 error stream.
-    const isKnownCode = err.code === 'DUPLICATE_ACCOUNT' || err.code === 'USERNAME_TAKEN';
-    if (!isKnownCode && err.code) {
-      console.error('[Registration] Error:', err);
-    } else if (!isKnownCode) {
-      console.warn('[Registration] Rejected:', err.message);
-    }
+    // User-input validation rejections (known business-rule codes from
+    // services/registration.js) and plain, uncoded Errors go to warn so they
+    // don't pollute the PM2 error stream.
+    logRegistrationError('Registration', err);
     if (err.code === 'DUPLICATE_ACCOUNT') {
       await writeDuplicateRegistrationAudit(req, Number(req.session.uid), err.details, {
         firstname: req.body?.firstname,
@@ -636,25 +689,8 @@ router.post('/register', memberAuth, idempotent('registration.member'), async (r
         dob: req.body?.dob,
         address: req.body?.address,
       });
-      return res.status(400).json({
-        error: err.message,
-        errorCode: 'DUPLICATE_ACCOUNT',
-        popup: true,
-        duplicatePolicy: {
-          blocked: true,
-          reason: err.details?.reason || 'name-plus-strong-signal-match',
-        },
-      });
     }
-    if (err.code === 'USERNAME_TAKEN') {
-      return res.status(400).json({
-        error: err.message,
-        errorCode: err.code,
-        popup: true,
-        field: 'username',
-      });
-    }
-    res.status(400).json({ error: err.message });
+    res.status(400).json(buildRegistrationErrorPayload(err));
   }
 });
 

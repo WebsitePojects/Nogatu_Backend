@@ -11,7 +11,13 @@ const { normalizeTin, isValidTin, isZeroTin } = require('../utils/tin');
 const { issueVoucher } = require('./voucher');
 const { createPublicId, createReferralSlug, createProcessKey } = require('../utils/security');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
-const { evaluateDuplicateIdentity, normalizeContactNo, normalizeDob } = require('./identityIntegrity');
+const {
+  evaluateDuplicateIdentity,
+  normalizeContactNo,
+  normalizeDob,
+  normalizeIdentityName,
+  normalizeTinValue,
+} = require('./identityIntegrity');
 const { appendPlacementAudit, appendActivationCodeUsage } = require('./registrationAudit');
 const { getPlacementPolicyForSponsor } = require('./binaryPlacementPolicy');
 const { recommendPlacementForSponsor } = require('./placementRecommendation');
@@ -25,26 +31,84 @@ async function ensureMemberTinColumn() {
   memberTinColumnReady = true;
 }
 
-function createDuplicateRegistrationError(details) {
-  const error = new Error('This registration matches an existing account record and cannot proceed.');
-  error.code = 'DUPLICATE_ACCOUNT';
-  error.details = details;
+/**
+ * Structured registration error factory.
+ * Stamps `.code` / `.field` / `.details` on a plain Error so routes/registration.js
+ * can build a specific, actionable pop-up message (which field is wrong + why)
+ * instead of a bare `{ error: message }`. `field` should be a client form-field
+ * name (e.g. 'tin', 'username', 'address') or null when the error isn't tied to
+ * one specific input.
+ */
+function createRegistrationError({ code, message, field = null, details = null }) {
+  const error = new Error(message);
+  error.code = code;
+  error.field = field;
+  if (details !== null) {
+    error.details = details;
+  }
   return error;
+}
+
+/**
+ * Build a specific, non-technical duplicate-account message from the pinned
+ * evaluateDuplicateIdentity() result shape:
+ *   { allowed:false, matchedUid, matchedUsername, matchedName, matchedSignals,
+ *     rule: 'tin'|'name_exact'|'name_switched'|'name_similar_dob', reason }
+ * SECURITY: only ever reference matchedUsername in the message — never the
+ * matched member's uid/name/tin/email/phone/address/dob (those stay server-side
+ * in error.details for the audit log only; see money-integrity.md).
+ */
+function createDuplicateRegistrationError(details) {
+  const rule = details && details.rule;
+  const matchedUsername = (details && details.matchedUsername) || null;
+
+  let message;
+  switch (rule) {
+    case 'tin':
+      message = matchedUsername
+        ? `This TIN is already registered to member ${matchedUsername}. One account per person is allowed. Please verify the TIN.`
+        : 'This TIN is already registered to another member. One account per person is allowed. Please verify the TIN.';
+      break;
+    case 'name_exact':
+      message = matchedUsername
+        ? `A member with this exact name is already registered (${matchedUsername}). One account per person is allowed.`
+        : 'A member with this exact name is already registered. One account per person is allowed.';
+      break;
+    case 'name_switched':
+      message = matchedUsername
+        ? `This name is already registered as ${matchedUsername} with the first and last name in the other order. One account per person is allowed. Please check if this is the same person.`
+        : 'This name is already registered with the first and last name in the other order. One account per person is allowed. Please check if this is the same person.';
+      break;
+    case 'name_similar_dob':
+      message = matchedUsername
+        ? `A member with a very similar name AND the same birthday is already registered (${matchedUsername}). One account per person is allowed. Please verify this is not the same person.`
+        : 'A member with a very similar name AND the same birthday is already registered. One account per person is allowed. Please verify this is not the same person.';
+      break;
+    default:
+      message = 'This registration matches an existing account record and cannot proceed.';
+  }
+
+  return createRegistrationError({
+    code: 'DUPLICATE_ACCOUNT',
+    message,
+    field: rule === 'tin' ? 'tin' : null,
+    details,
+  });
 }
 
 function createPlacementBusyError(message = 'This placement is busy right now. Please try again.') {
-  const error = new Error(message);
-  error.code = 'PLACEMENT_LOCKED';
-  return error;
+  return createRegistrationError({ code: 'PLACEMENT_LOCKED', message, field: null });
 }
 
 function createUsernameTakenError(username) {
-  const error = new Error('Username already exists. Please choose another username.');
-  error.code = 'USERNAME_TAKEN';
-  error.details = {
-    username: sanitizeAlphaNum(username),
-  };
-  return error;
+  return createRegistrationError({
+    code: 'USERNAME_TAKEN',
+    message: 'Username already exists. Please choose another username.',
+    field: 'username',
+    details: {
+      username: sanitizeAlphaNum(username),
+    },
+  });
 }
 
 async function acquirePlacementLock(conn, lockKey, requestId) {
@@ -82,13 +146,63 @@ async function acquireRegistrationAdvisoryLocks(conn, lockKeys = []) {
   for (const rawKey of lockKeys) {
     const lockKey = String(rawKey || '').trim();
     if (!lockKey) continue;
-    const [rows] = await conn.query('SELECT GET_LOCK(?, 30) AS lockState', [lockKey]);
-    if (Number(rows[0]?.lockState || 0) !== 1) {
-      throw new Error('Registration is busy right now. Please try again.');
+    let lockState = 0;
+    try {
+      const [rows] = await conn.query('SELECT GET_LOCK(?, 30) AS lockState', [lockKey]);
+      lockState = Number(rows[0]?.lockState || 0);
+    } catch (error) {
+      // Release whatever we already hold before propagating — GET_LOCK is
+      // SESSION-scoped, so a lock left behind on a pooled connection would
+      // outlive this request and block every later registration using the
+      // same key.
+      await releaseRegistrationAdvisoryLocks(conn, acquired);
+      throw error;
+    }
+    if (lockState !== 1) {
+      await releaseRegistrationAdvisoryLocks(conn, acquired);
+      throw createRegistrationError({
+        code: 'REGISTRATION_BUSY',
+        field: null,
+        message: 'Registration is busy right now. Please try again.',
+      });
     }
     acquired.push(lockKey);
   }
   return acquired;
+}
+
+/**
+ * Lock keys that serialize the one-account-policy duplicate check with the
+ * insert that follows it.
+ *
+ * WHY: evaluateDuplicateIdentity() is a SELECT, and a concurrent registration
+ * that has not COMMITTED yet is invisible to it. Without a lock, two
+ * same-identity registrations submitted at the same moment BOTH pass the check
+ * and BOTH insert -- the same check-then-act race as the ELENA54 multi-tap
+ * incident, just on registration instead of code consumption.
+ *
+ * Keyed on the SORTED name fingerprint, so a switched-order resubmission
+ * ("Ronnie Porras" / "Porras Ronnie") maps to the SAME key and is serialized,
+ * plus the TIN when usable. These cover the deterministic rules R1/R2/R3.
+ *
+ * KNOWN RESIDUAL: R4 (fuzzy-similar name + same DOB) cannot be reduced to an
+ * exact lock key, so two *differently spelled* similar names raced against each
+ * other could still both pass. That requires two different encoders submitting
+ * two different spellings in the same instant; the realistic case -- one person
+ * double-submitting, which yields an identical or switched name -- IS covered.
+ */
+function buildIdentityLockKeys({ firstname, lastname, middlename, tin }) {
+  const keys = [];
+  const identity = normalizeIdentityName({ firstname, lastname, middlename });
+  if (identity.bareFingerprint) {
+    keys.push(`registration:identity:${identity.bareFingerprint}:${identity.suffix || ''}`);
+  }
+  const normalizedTin = normalizeTinValue(tin);
+  if (normalizedTin && !isZeroTin(normalizedTin)) {
+    keys.push(`registration:tin:${normalizedTin}`);
+  }
+  // Sorted so every caller acquires these in one deterministic order.
+  return keys.sort();
 }
 
 async function releaseRegistrationAdvisoryLocks(conn, lockKeys = []) {
@@ -424,7 +538,18 @@ async function consumeActivationCodeForRegistration(conn, { activationCode }) {
      LIMIT 1`,
     [activationCode]
   );
-  if (codeRows.length === 0) throw new Error('Invalid or used activation code');
+  if (codeRows.length === 0) {
+    // No row satisfied code + available (codestatus=1) + registerable producttype —
+    // could be a typo, an already-used code, or a maintenance/repurchase-only code.
+    // We can't cheaply distinguish those without another query, so keep the exact
+    // historical message (tested in registrationCodeConsumption.test.js) and just
+    // stamp code/field so the FE can highlight the activation code input.
+    throw createRegistrationError({
+      code: 'INVALID_CODE',
+      field: 'activationCode',
+      message: 'Invalid or used activation code',
+    });
+  }
   const codeData = codeRows[0];
 
   const [updateResult] = await conn.query(
@@ -436,7 +561,15 @@ async function consumeActivationCodeForRegistration(conn, { activationCode }) {
   );
 
   if (Number(updateResult?.affectedRows || 0) !== 1) {
-    throw new Error('Invalid or used activation code');
+    // We already confirmed codestatus=1 above in THIS same transaction, so
+    // affectedRows=0 here means another concurrent request consumed the code
+    // between our SELECT and UPDATE (see [[lessons]] 2026-07-17 multi-tap race
+    // note) — a genuine "just got used" race, not merely "not found".
+    throw createRegistrationError({
+      code: 'CODE_ALREADY_USED',
+      field: 'activationCode',
+      message: 'Invalid or used activation code',
+    });
   }
 
   return codeData;
@@ -469,14 +602,36 @@ async function registerMember({
     const normalizedUsername = sanitizeAlphaNum(username);
 
     if (!normalizedAddress) {
-      throw new Error('Address is required.');
+      throw createRegistrationError({
+        code: 'MISSING_FIELD',
+        field: 'address',
+        message: 'Address is required.',
+      });
     }
     if (normalizedTin && !isZeroTin(normalizedTin) && !isValidTin(normalizedTin)) {
-      throw new Error('Invalid TIN format');
+      throw createRegistrationError({
+        code: 'INVALID_TIN',
+        field: 'tin',
+        message: 'Invalid TIN format',
+      });
     }
     if (normalizedEmail && !isValidEmail(normalizedEmail)) {
-      throw new Error('A valid email address is required.');
+      throw createRegistrationError({
+        code: 'INVALID_EMAIL',
+        field: 'email',
+        message: 'A valid email address is required.',
+      });
     }
+
+    // Take the identity lock BEFORE the duplicate check so the check and the
+    // insert that follows are serialized against a concurrent same-identity
+    // registration (see buildIdentityLockKeys). Acquired FIRST, ahead of every
+    // other registration lock, so the global acquisition order is consistent
+    // and these can never deadlock against the code/username/sponsor locks.
+    advisoryLocks = await acquireRegistrationAdvisoryLocks(
+      conn,
+      buildIdentityLockKeys({ firstname, lastname, middlename, tin: normalizedTin })
+    );
 
     const duplicateResult = await evaluateDuplicateIdentity({
       firstname,
@@ -497,12 +652,14 @@ async function registerMember({
     let finalPlacementPolicy = placementPolicy;
     const requestedPositionValue = requestedPosition == null ? Number(position) : Number(requestedPosition);
 
-    advisoryLocks = await acquireRegistrationAdvisoryLocks(conn, [
+    // NOTE: concat, never reassign — reassigning here would drop the identity
+    // lock keys acquired above from the release list and leak those locks.
+    advisoryLocks = advisoryLocks.concat(await acquireRegistrationAdvisoryLocks(conn, [
       `registration:code:${String(activationCode || '').trim().toLowerCase()}`,
       `registration:username:${String(username || '').trim().toLowerCase()}`,
       referralToken ? `registration:referral:${String(referralToken).trim().toLowerCase()}` : '',
       `registration:sponsor:${Number(sponsorUid || 0)}`,
-    ]);
+    ]));
 
     const livePlacementPolicy = await getPlacementPolicyForSponsor(Number(sponsorUid), conn);
     finalPlacementPolicy = livePlacementPolicy;
@@ -513,7 +670,11 @@ async function registerMember({
     }
 
     if (!finalPlacementUid || ![1, 2].includes(finalPosition)) {
-      throw new Error('Invalid placement selection');
+      throw createRegistrationError({
+        code: 'INVALID_PLACEMENT',
+        field: 'placementUid',
+        message: 'Invalid placement selection',
+      });
     }
 
     lockKeys.push(`placement:${finalPlacementUid}:${finalPosition}`);
@@ -536,14 +697,26 @@ async function registerMember({
         'SELECT uid FROM memberstab WHERE email = ? LIMIT 1',
         [normalizedEmail]
       );
-      if (existingEmail.length > 0) throw new Error('Email address is already being used by another account');
+      if (existingEmail.length > 0) {
+        throw createRegistrationError({
+          code: 'EMAIL_TAKEN',
+          field: 'email',
+          message: 'Email address is already being used by another account',
+        });
+      }
     }
 
     const [placementCheck] = await conn.query(
       'SELECT uid FROM usertab WHERE refid = ? AND position = ?',
       [finalPlacementUid, finalPosition]
     );
-    if (placementCheck.length > 0) throw new Error('Placement position already taken');
+    if (placementCheck.length > 0) {
+      throw createRegistrationError({
+        code: 'PLACEMENT_TAKEN',
+        field: 'placementUid',
+        message: 'Placement position already taken',
+      });
+    }
 
     const newUid = await generateUID();
     const newCountId = await getNextCountId();

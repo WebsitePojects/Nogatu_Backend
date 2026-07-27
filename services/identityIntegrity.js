@@ -171,64 +171,216 @@ function matchedSignalsForCandidate(input, candidate) {
   return matched;
 }
 
+/**
+ * One-account-policy duplicate gate. The ONLY function the registration flow
+ * calls to decide whether a new registrant collides with an existing member.
+ *
+ * Rules (management-specified, exactly these four, no more):
+ *   R1 TIN              - normalized TINs equal, both non-empty, neither a "zero TIN".
+ *   R2 EXACT NAME        - normalized first+last equal in the SAME order (unchanged
+ *                          from the pre-existing behavior: plain cleaned strings,
+ *                          NOT suffix-stripped, so "Cruz Jr" != "Cruz").
+ *   R3 SWITCHED NAME      - the same two name tokens with order swapped, detected via
+ *                          normalizeIdentityName()'s sorted `bareFingerprint`. Guarded
+ *                          with an explicit suffix match (see below) even though the
+ *                          spec's minimum ask didn't call it out, because
+ *                          bareFingerprint strips the suffix off the "last" token
+ *                          before sorting -- without the guard, "John Cruz Jr" and
+ *                          "Cruz John" (no suffix) would collide on bareFingerprint
+ *                          alone. isCloseNameMatch() already carries this exact guard
+ *                          for fuzzy matches; R3 mirrors it for consistency.
+ *   R4 SIMILAR NAME + DOB  - isCloseNameMatch() true AND both DOBs non-empty and equal.
+ *                          Fuzzy similarity ALONE never blocks (see isCloseNameMatch's
+ *                          own suffix + threshold guards) -- only in combination with a
+ *                          matching DOB, so unrelated common names (two "Maria Santos")
+ *                          are not falsely blocked.
+ *
+ * Every other signal (email, contact number, address) is informational only
+ * (see matchedSignalsForCandidate) and never gates registration on its own --
+ * confirmed shared-phone-number groups (families/teams registering under one
+ * leader's number) must not be blocked.
+ */
 async function evaluateDuplicateIdentity(input, conn = pool) {
   const normalizedTin = normalizeTinValue(input.tin);
-  const inputFirst = normalizeNameKey(input.firstname);
-  const inputLast = normalizeNameKey(input.lastname);
-  const inputNameKey = [inputFirst, inputLast].filter(Boolean).join('|');
+  const tinIsUsable = Boolean(normalizedTin) && !isZeroTin(normalizedTin);
 
-  if (!normalizedTin && !inputNameKey) {
-    return {
-      allowed: true,
-      matchedUid: null,
-      normalizedName: inputNameKey,
-      matchedSignals: [],
-      reason: 'empty-name',
-    };
+  const inputFirstRaw = String(input.firstname || '').trim();
+  const inputLastRaw = String(input.lastname || '').trim();
+  const inputDob = normalizeDob(input.dob);
+  const dobIsUsable = Boolean(inputDob);
+
+  // R2 uses the ORIGINAL plain-cleaned (non-suffix-stripped) key, preserving
+  // exact pre-existing behavior. R3/R4 use normalizeIdentityName's richer,
+  // suffix-aware fingerprint/comparable fields.
+  const inputFirstKey = normalizeNameKey(input.firstname);
+  const inputLastKey = normalizeNameKey(input.lastname);
+  const inputNameKey = [inputFirstKey, inputLastKey].filter(Boolean).join('|');
+
+  const inputIdentity = normalizeIdentityName({
+    firstname: input.firstname,
+    lastname: input.lastname,
+    middlename: input.middlename,
+  });
+
+  // Optional, purely additive, opt-in safety valve: if a caller ever reuses
+  // this gate for an EDIT flow (not today's registration call site, which
+  // never passes it), `excludeUid` prevents a member from colliding with
+  // their own existing row. Absent (the current behavior), it is a no-op.
+  const excludeUid = input.excludeUid != null ? Number(input.excludeUid) : null;
+
+  const notBlocked = (reason) => ({
+    allowed: true,
+    matchedUid: null,
+    matchedUsername: null,
+    matchedName: null,
+    normalizedName: inputNameKey,
+    matchedSignals: [],
+    rule: null,
+    reason,
+  });
+
+  // --- Candidate narrowing --------------------------------------------------
+  // Provably complete for R1-R4 (SQL only narrows; JS below is the precise,
+  // authoritative comparison):
+  //   - R1 needs rows sharing the tin                          -> `tin = ?`
+  //   - R2 and R3 both need rows where EITHER name column equals EITHER input
+  //     name token: checking both columns (firstname, lastname) against both
+  //     tokens (input first, input last) is exactly what catches a switched
+  //     registration, since the switched candidate's firstname equals the
+  //     input's lastname (and vice versa)          -> `firstname/lastname IN (token1, token2)`
+  //   - R4 additionally REQUIRES an equal dob (not just a similar name), so
+  //     every row R4 could possibly fire on already has a matching dob, and
+  //     is therefore already pulled in by the dob arm below. A fuzzy-similar
+  //     name with a DIFFERENT (or empty) dob can never satisfy R4, so it
+  //     needs no arm of its own                     -> `dob = ?`
+  // Each arm is skipped when its own input is empty/unusable; if ALL arms
+  // are empty, nothing in memberstab could possibly trip R1-R4, so we return
+  // allowed:true without touching the DB at all.
+  const conditions = [];
+  const params = [];
+
+  if (tinIsUsable) {
+    conditions.push('tin = ?');
+    params.push(normalizedTin);
+  }
+  if (dobIsUsable) {
+    conditions.push('dob = ?');
+    params.push(String(input.dob).trim());
+  }
+  const nameTokens = [inputFirstRaw, inputLastRaw].filter(Boolean);
+  if (nameTokens.length > 0) {
+    // LOWER() on both sides so a case-differing legacy row (e.g. stored in a
+    // case-sensitive collation) isn't silently dropped by the narrowing step
+    // -- this can only make the candidate set LARGER, never smaller.
+    const firstPlaceholders = nameTokens.map(() => 'LOWER(?)').join(', ');
+    const lastPlaceholders = nameTokens.map(() => 'LOWER(?)').join(', ');
+    conditions.push(`LOWER(firstname) IN (${firstPlaceholders})`);
+    params.push(...nameTokens);
+    conditions.push(`LOWER(lastname) IN (${lastPlaceholders})`);
+    params.push(...nameTokens);
+  }
+
+  if (conditions.length === 0) {
+    return notBlocked('empty-input');
+  }
+
+  let whereClause = conditions.join(' OR ');
+  if (excludeUid != null && Number.isFinite(excludeUid) && excludeUid > 0) {
+    whereClause = `(${whereClause}) AND uid <> ?`;
+    params.push(excludeUid);
   }
 
   const [rows] = await conn.query(
-    `SELECT uid, firstname, lastname, middlename, tin, email, contactnos, dob, address
-       FROM memberstab`
+    `SELECT uid, username, firstname, lastname, middlename, tin, email, contactnos, dob, address
+       FROM memberstab
+      WHERE ${whereClause}`,
+    params
   );
 
   for (const row of rows) {
+    if (excludeUid != null && Number(row.uid) === excludeUid) continue;
+
     const existingTin = normalizeTinValue(row.tin);
-    const existingFirst = normalizeNameKey(row.firstname);
-    const existingLast = normalizeNameKey(row.lastname);
-    const existingNameKey = [existingFirst, existingLast].filter(Boolean).join('|');
-    const matchedSignals = [];
+    const existingFirstKey = normalizeNameKey(row.firstname);
+    const existingLastKey = normalizeNameKey(row.lastname);
+    const existingNameKey = [existingFirstKey, existingLastKey].filter(Boolean).join('|');
 
-    if (normalizedTin && !isZeroTin(normalizedTin) && existingTin && !isZeroTin(existingTin) && normalizedTin === existingTin) {
-      matchedSignals.push('tin');
-    }
+    const existingIdentity = normalizeIdentityName({
+      firstname: row.firstname,
+      lastname: row.lastname,
+      middlename: row.middlename,
+    });
 
-    if (inputNameKey && existingNameKey && inputNameKey === existingNameKey) {
-      matchedSignals.push('firstname_lastname');
-    }
+    // R1
+    const tinMatches = tinIsUsable
+      && Boolean(existingTin) && !isZeroTin(existingTin)
+      && normalizedTin === existingTin;
 
-    if (matchedSignals.length > 0) {
-      return {
-        allowed: false,
-        matchedUid: Number(row.uid || 0),
-        normalizedName: inputNameKey,
-        matchedSignals,
-        reason: matchedSignals.includes('tin') && matchedSignals.includes('firstname_lastname')
-          ? 'tin-and-firstname-lastname-match'
-          : matchedSignals.includes('tin')
-            ? 'tin-match'
-            : 'firstname-lastname-match',
-      };
-    }
+    // R2 - unchanged from today: plain order-sensitive key equality.
+    const exactNameMatches = Boolean(inputNameKey)
+      && Boolean(existingNameKey)
+      && inputNameKey === existingNameKey;
+
+    // R3 - same two tokens, order swapped. Guarded on suffix equality (see
+    // the function-level comment) so a Jr/Sr pair can't collide here either.
+    const switchedNameMatches = !exactNameMatches
+      && Boolean(inputIdentity.bareFingerprint)
+      && inputIdentity.bareFingerprint === existingIdentity.bareFingerprint
+      && inputIdentity.suffix === existingIdentity.suffix;
+
+    // dob signal, independent of which rule (if any) ends up firing.
+    const existingDob = normalizeDob(row.dob);
+    const dobMatches = dobIsUsable && Boolean(existingDob) && inputDob === existingDob;
+
+    // R4 - fuzzy name similarity, only evaluated/reported when it isn't
+    // already an exact or switched match, combined with a real dob match.
+    const similarNameMatches = !exactNameMatches
+      && !switchedNameMatches
+      && isCloseNameMatch(inputIdentity, existingIdentity);
+
+    let rule = null;
+    if (tinMatches) rule = 'tin';
+    else if (exactNameMatches) rule = 'name_exact';
+    else if (switchedNameMatches) rule = 'name_switched';
+    else if (similarNameMatches && dobMatches) rule = 'name_similar_dob';
+
+    if (!rule) continue;
+
+    const signalFlags = {
+      tin: tinMatches,
+      name_exact: exactNameMatches,
+      name_switched: switchedNameMatches,
+      name_similar: similarNameMatches,
+      dob: dobMatches,
+    };
+    const matchedSignals = ['tin', 'name_exact', 'name_switched', 'name_similar', 'dob']
+      .filter((key) => signalFlags[key]);
+
+    const matchedName = [row.firstname, row.lastname]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+      .join(' ') || null;
+
+    const reasonByRule = {
+      tin: 'tin-match',
+      name_exact: 'name-exact-match',
+      name_switched: 'name-switched-match',
+      name_similar_dob: 'name-similar-dob-match',
+    };
+
+    return {
+      allowed: false,
+      matchedUid: Number(row.uid || 0),
+      matchedUsername: row.username != null ? String(row.username) : null,
+      matchedName,
+      normalizedName: inputNameKey,
+      matchedSignals,
+      rule,
+      reason: reasonByRule[rule],
+    };
   }
 
-  return {
-    allowed: true,
-    matchedUid: null,
-    normalizedName: inputNameKey,
-    matchedSignals: [],
-    reason: 'no-duplicate-match',
-  };
+  return notBlocked('no-duplicate-match');
 }
 
 module.exports = {
