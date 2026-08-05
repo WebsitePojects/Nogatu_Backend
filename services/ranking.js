@@ -1411,7 +1411,15 @@ async function processIncentive(uid, options = {}) {
     let beginningBalance = 0;
     let endingBalance    = 0;
 
-    if (cashIncentive > 0) {
+    // Rank incentives are handed over as PHYSICAL CASH outside this system, so
+    // fulfilling an achievement must NOT touch the e-wallet — crediting here on
+    // top of the cash handover would pay the member twice. Wallet crediting is
+    // therefore opt-in and fails closed: no caller passes creditWallet, so the
+    // admin "release" action only records the handover. Do not flip this default.
+    const shouldCreditWallet = options.creditWallet === true;
+    const walletCredited     = cashIncentive > 0 && shouldCreditWallet;
+
+    if (walletCredited) {
       const [walletRows] = await conn.query(
         'SELECT ttlcashbalance FROM payouttotaltab WHERE uid = ? LIMIT 1 FOR UPDATE', [memberUid]
       );
@@ -1455,19 +1463,27 @@ async function processIncentive(uid, options = {}) {
       }
     }
 
-    await conn.query(
+    // Compare-and-swap: re-assert the consumed-state predicate in the UPDATE itself so
+    // the transition can only ever happen once, even if the row moved out of
+    // pending_fulfillment after the SELECT. affectedRows !== 1 means we lost the claim.
+    const [fulfillResult] = await conn.query(
       `UPDATE rank_achievementstab
           SET status = 'fulfilled', fulfilled_at = NOW(),
               admin_fulfilled_by = ?, fulfillment_notes = ?
-        WHERE achievement_uid = ?`,
+        WHERE achievement_uid = ? AND status = 'pending_fulfillment'`,
       [
         Number(options.adminUid) || null,
-        cashIncentive > 0
+        walletCredited
           ? `Released ranking bonus cash via ${processKey}`
-          : 'Marked fulfilled without cash incentive.',
+          : `Marked fulfilled — incentive handed over outside the e-wallet (no wallet credit). Ref ${processKey}`,
         pending.achievement_uid,
       ]
     );
+
+    if (fulfillResult.affectedRows !== 1) {
+      await conn.rollback();
+      return { success: false, error: 'This ranking incentive was already fulfilled.' };
+    }
 
     const [pendingCountRows] = await conn.query(
       `SELECT COUNT(*) AS total FROM rank_achievementstab
@@ -1493,7 +1509,7 @@ async function processIncentive(uid, options = {}) {
       targetId:  pending.achievement_uid,
       afterState: {
         rankCode: pending.rank_code, rankName: pending.rank_name,
-        cashIncentive, beginningBalance, endingBalance,
+        cashIncentive, walletCredited, beginningBalance, endingBalance,
         processKey, pendingCountAfter: pendingCount,
       },
     });
@@ -1502,6 +1518,7 @@ async function processIncentive(uid, options = {}) {
       memberUid,
       rankCode:      pending.rank_code,
       cashIncentive,
+      walletCredited,
       beginningBalance,
       endingBalance,
       pendingCountAfter: pendingCount,
@@ -1513,6 +1530,7 @@ async function processIncentive(uid, options = {}) {
       rankCode:        pending.rank_code,
       rankName:        pending.rank_name,
       cashIncentive,
+      walletCredited,
       beginningBalance,
       endingBalance,
       processKey,

@@ -26,7 +26,11 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
 /**
  * PUT /api/admin/rankings/:uid/process
- * Mark incentive as claimed
+ * Mark the next pending rank achievement as fulfilled.
+ *
+ * Rank incentives are handed over as PHYSICAL CASH outside this system, so this
+ * records the handover only — it does NOT credit the member's e-wallet. Crediting
+ * here on top of the cash handover would pay the member twice.
  */
 router.put('/:uid/process', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
@@ -38,7 +42,7 @@ router.put('/:uid/process', adminAuth, adminRights([1, 3]), async (req, res) => 
     if (result.success) {
       res.json({
         success: true,
-        message: 'Next pending ranking bonus claim released',
+        message: 'Rank achievement marked as fulfilled (no e-wallet credit — incentive is handed over separately)',
         ...result,
       });
     } else {
