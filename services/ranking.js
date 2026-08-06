@@ -14,7 +14,8 @@ const { nowMySQL, getAccountTypeName } = require('../utils/helpers');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { writeAuditLog } = require('./audit');
 const { getPackagePolicy, listPackagePolicies } = require('./packagePolicy');
-const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
+const { SCHEMA_REQUIREMENTS, assertSchemaReadyOnce } = require('./schemaReadiness');
+const { withDeadlockRetry } = require('../utils/dbRetry');
 const {
   listRankableEventsForMember,
   computeRankAwardsFromEvents,
@@ -160,9 +161,16 @@ function normalizeRankDefinitions(definitionRows = []) {
   }));
 }
 
+// Counter-seed only needs to run once per process (INSERT IGNORE is idempotent
+// even if a race lets two callers slip through before this flag is set).
+let rankingCounterSeeded = false;
+
 async function ensureRankingTable(conn = pool) {
-  await assertSchemaRequirements(SCHEMA_REQUIREMENTS.RANKING, 'Ranking', conn);
-  await conn.query('INSERT IGNORE INTO rank_sequence_countertab (id, next_sequence) VALUES (1, 1)');
+  await assertSchemaReadyOnce('RANKING', SCHEMA_REQUIREMENTS.RANKING, 'Ranking', conn);
+  if (!rankingCounterSeeded) {
+    await conn.query('INSERT IGNORE INTO rank_sequence_countertab (id, next_sequence) VALUES (1, 1)');
+    rankingCounterSeeded = true;
+  }
 }
 
 async function ensureRankingInfra() {
@@ -996,7 +1004,7 @@ async function refreshMemberRankSnapshot(uid) {
   const memberUid = toNumber(uid);
   if (memberRefreshPromises.has(memberUid)) return memberRefreshPromises.get(memberUid);
 
-  const refreshPromise = (async () => {
+  const refreshPromise = withDeadlockRetry(async () => {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -1009,7 +1017,7 @@ async function refreshMemberRankSnapshot(uid) {
     } finally {
       conn.release();
     }
-  })();
+  }, { label: `ranking.refreshMemberRankSnapshot(${memberUid})` });
 
   memberRefreshPromises.set(memberUid, refreshPromise);
   try {

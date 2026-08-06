@@ -22,10 +22,32 @@ const POLL_MS = 15000;
 const MAX_ATTEMPTS = 5;
 const ORPHAN_TTL_HOURS = 6;
 const SWEEP_INTERVAL_MIN = 60;
+const LEASE_TTL_MINUTES = 15; // must comfortably exceed a real sweep's runtime
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000; // at most once per hour
+const PRUNE_RETENTION_DAYS = 30;
 
 const handlers = {
   support_orphan_sweep: handleOrphanSweep,
 };
+
+let lastPruneAt = 0;
+
+// Safely describe any thrown value for logging. Cloudinary rejects with plain
+// objects, not Error instances, so `err.message` is silently `undefined` —
+// this is what made a real production failure invisible in the logs.
+function describeError(err) {
+  if (err instanceof Error) {
+    const code = err.code ? ` (code: ${err.code})` : '';
+    return `${err.message || err.name || 'Error'}${code}`;
+  }
+  if (err === null || err === undefined) return String(err);
+  if (typeof err === 'string') return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
 
 async function enqueue(jobKey, jobType, payload = {}, delaySeconds = 0) {
   await pool.query(
@@ -34,6 +56,50 @@ async function enqueue(jobKey, jobType, payload = {}, delaySeconds = 0) {
      ON DUPLICATE KEY UPDATE id = id`,
     [jobKey, jobType, JSON.stringify(payload || {}), Math.max(0, delaySeconds)]
   );
+}
+
+// Reclaim rows stuck in 'processing' because the worker that leased them died
+// mid-job (deploy, restart, crash). Nothing else ever surfaces these — without
+// this they sit forever: never retried, never failed. The sweep is idempotent
+// (deleting an already-deleted Cloudinary asset is a no-op), so an over-eager
+// reclaim is not destructive; the 15-minute window must not be shortened.
+async function reclaimStaleLeases() {
+  const [res] = await pool.query(
+    `UPDATE job_queuetab
+        SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'queued' END,
+            available_at = CASE WHEN attempts >= ? THEN available_at ELSE NOW(6) END,
+            last_error = CASE WHEN attempts >= ? THEN ? ELSE last_error END,
+            locked_at = NULL,
+            locked_by = NULL
+      WHERE status = 'processing' AND locked_at < NOW(6) - INTERVAL ? MINUTE`,
+    [
+      MAX_ATTEMPTS,
+      MAX_ATTEMPTS,
+      MAX_ATTEMPTS,
+      'lease expired: worker did not report back within the reclaim window',
+      LEASE_TTL_MINUTES,
+    ]
+  );
+  if (res.affectedRows) {
+    console.log(`[jobWorker] reclaimed ${res.affectedRows} stale processing row(s)`);
+  }
+}
+
+// Prune terminal (done/failed) rows older than PRUNE_RETENTION_DAYS so
+// job_queuetab doesn't grow forever from the hourly self-scheduled sweep.
+// Throttled to at most once per hour via the module-level lastPruneAt guard.
+async function pruneOldTerminalJobs() {
+  const now = Date.now();
+  if (now - lastPruneAt < PRUNE_INTERVAL_MS) return;
+  lastPruneAt = now;
+  const [res] = await pool.query(
+    `DELETE FROM job_queuetab
+      WHERE status IN ('done', 'failed') AND updated_at < DATE_SUB(NOW(6), INTERVAL ? DAY)`,
+    [PRUNE_RETENTION_DAYS]
+  );
+  if (res.affectedRows) {
+    console.log(`[jobWorker] pruned ${res.affectedRows} old terminal job row(s)`);
+  }
 }
 
 async function leaseOne() {
@@ -74,6 +140,16 @@ async function finish(id, ok, errMsg) {
 
 async function tick() {
   try {
+    await reclaimStaleLeases();
+  } catch (err) {
+    console.error('[jobWorker] reclaim error:', describeError(err));
+  }
+  try {
+    await pruneOldTerminalJobs();
+  } catch (err) {
+    console.error('[jobWorker] prune error:', describeError(err));
+  }
+  try {
     const job = await leaseOne();
     if (!job) return;
     const handler = handlers[job.job_type];
@@ -84,11 +160,11 @@ async function tick() {
       await handler(payload);
       await finish(job.id, true);
     } catch (err) {
-      console.error(`[jobWorker] ${job.job_type} failed:`, err.message);
-      await finish(job.id, false, err.message);
+      console.error(`[jobWorker] ${job.job_type} failed:`, describeError(err));
+      await finish(job.id, false, describeError(err));
     }
   } catch (err) {
-    console.error('[jobWorker] tick error:', err.message);
+    console.error('[jobWorker] tick error:', describeError(err));
   }
 }
 
@@ -116,7 +192,7 @@ async function handleOrphanSweep() {
           try {
             await cloudinary.uploader.destroy(r.public_id, { resource_type: r.resource_type || 'image' });
             deleted += 1;
-          } catch (e) { console.error('[jobWorker] destroy failed', r.public_id, e.message); }
+          } catch (e) { console.error('[jobWorker] destroy failed', r.public_id, describeError(e)); }
         }
       }
     }
@@ -136,4 +212,4 @@ function startWorker() {
   console.log('[jobWorker] started (job_queuetab poller)');
 }
 
-module.exports = { startWorker, enqueue };
+module.exports = { startWorker, enqueue, describeError };
