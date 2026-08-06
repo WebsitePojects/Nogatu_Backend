@@ -4,6 +4,22 @@ const assert = require('node:assert');
 const path = require('node:path');
 const fs = require('node:fs');
 
+// Stub config/database BEFORE loading the service, so the DEFAULT (no-conn) code
+// path — the one the route actually uses — is exercised for real. Every other test
+// injects a connection, which would hide a broken default parameter entirely.
+const dbPath = require.resolve('../../config/database');
+const defaultPoolCalls = [];
+require.cache[dbPath] = {
+  id: dbPath, filename: dbPath, loaded: true, exports: {
+    pool: {
+      async query(sql, params) {
+        defaultPoolCalls.push({ sql, params });
+        return [[{ uid: 428268, depth: 4 }]];
+      },
+    },
+  },
+};
+
 const { LEADERS, LEADER_BY_UID, findNearestLeader, findLeadersForMember } =
   require('../../services/leaders');
 
@@ -81,6 +97,25 @@ test('one tree can have a leader while the other has none', async () => {
   const { unilevel, binary } = await findLeadersForMember(777, conn);
   assert.strictEqual(unilevel.name, 'Jervy Latumbo');
   assert.strictEqual(binary, null);
+});
+
+// ── The path the route actually takes: called with NO connection argument ──
+// Regression guard: an earlier revision defaulted to a `pool` identifier that no
+// longer existed, so this threw ReferenceError on every real lookup while every
+// conn-injecting test stayed green.
+test('works when called WITHOUT a connection (the route’s real path)', async () => {
+  defaultPoolCalls.length = 0;
+  const { unilevel, binary } = await findLeadersForMember(999999);
+  assert.strictEqual(unilevel.name, 'Jervy Latumbo');
+  assert.strictEqual(binary.name, 'Jervy Latumbo');
+  assert.strictEqual(defaultPoolCalls.length, 2, 'must fall back to the shared pool for both trees');
+});
+
+test('findNearestLeader also works with no connection argument', async () => {
+  defaultPoolCalls.length = 0;
+  const got = await findNearestLeader(999999, 'chain drefid');
+  assert.strictEqual(got.uid, 428268);
+  assert.strictEqual(defaultPoolCalls.length, 1);
 });
 
 // ── Source guarantees: this feature must stay read-only ──

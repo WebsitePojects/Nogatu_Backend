@@ -79,7 +79,7 @@ async function findNearestLeader(memberUid, sql, conn = null) {
 /**
  * Both trees for one member: { unilevel, binary }, each either a leader or null.
  */
-async function findLeadersForMember(memberUid, conn = pool) {
+async function findLeadersForMember(memberUid, conn = null) {
   const [unilevel, binary] = await Promise.all([
     findNearestLeader(memberUid, SPONSOR_CHAIN_SQL, conn),
     findNearestLeader(memberUid, BINARY_CHAIN_SQL, conn),
