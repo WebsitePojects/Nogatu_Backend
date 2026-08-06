@@ -13,6 +13,7 @@ const { sanitizeAlphaNum } = require('../../utils/helpers');
 const { createProcessKey } = require('../../utils/security');
 const { appendActivationCodeUsage } = require('../../services/registrationAudit');
 const { listAdminActivationHistory } = require('../../services/codeHistory');
+const { findLeadersForMember } = require('../../services/leaders');
 const {
   buildSectionedCsv,
   sendCsv,
@@ -389,11 +390,23 @@ router.get('/lookup-account', adminAuth, adminRights([1, 3]), async (req, res) =
     }
 
     const row = rows[0];
+
+    // Nearest named leader above this member in EACH tree. Read-only; a lookup
+    // failure must never break the account tag itself, so it degrades to null.
+    let leaders = { unilevel: null, binary: null };
+    try {
+      leaders = await findLeadersForMember(row.uid);
+    } catch (leaderErr) {
+      console.error('[Admin Codes] Leader lookup failed:', leaderErr.message);
+    }
+
     res.json({
       account: {
         uid: row.uid,
         username: row.username,
         fullname: `${row.firstname} ${row.lastname}`.trim(),
+        unilevelLeader: leaders.unilevel,
+        binaryLeader: leaders.binary,
       },
     });
   } catch (err) {
