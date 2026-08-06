@@ -172,8 +172,13 @@ log "starting dump of ${DB_NAME}@${DB_HOST} -> ${OUT_FILE}"
 # correctly detected as a failure.
 set +e
 "${DUMP_CMD[@]}" | "$GZIP_BIN" > "$TMP_OUT"
-DUMP_EXIT=${PIPESTATUS[0]}
-GZIP_EXIT=${PIPESTATUS[1]}
+# Copy the WHOLE array in one go: PIPESTATUS is rebuilt by every command, including a simple
+# assignment, so reading ${PIPESTATUS[0]} into a variable first would leave a 1-element array
+# and make ${PIPESTATUS[1]} an unbound variable under `set -u` (this failed on the first real
+# run). Snapshot it, then index the copy.
+PIPE_STATUS=("${PIPESTATUS[@]}")
+DUMP_EXIT=${PIPE_STATUS[0]:-1}
+GZIP_EXIT=${PIPE_STATUS[1]:-1}
 set -e
 
 if [ "$DUMP_EXIT" -ne 0 ] || [ "$GZIP_EXIT" -ne 0 ]; then
