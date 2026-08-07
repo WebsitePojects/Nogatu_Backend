@@ -419,49 +419,63 @@ test('the grant validator + handler contain no UPDATE/DELETE against voucherstab
   assert.match(slice, /issuePackageVoucher/, 'must use the shared issue helper (INSERT only)');
 });
 
-// ── Upgraded-only policy ─────────────────────────────────────────────────
-// The manual grant exists to fix members whose PACKAGE changed without a
-// matching voucher. Measured on prod 2026-08-07, dropping this gate exposes
-// 7,176 pre-launch legacy members = ₱40,755,000 of redeemable value.
+// -- Grant policy (changed 2026-08-07 by the account owner) ---------------
+// An admin may grant a voucher to ANY member, upgraded or not. The only refusal
+// left is the DUPLICATE guard (already_has_voucher_for_current_tier), because
+// vouchers are additive per TIER. These tests pin that decision so the removed
+// upgraded-only gate is not silently reintroduced as a "fix".
+// Consequence, recorded deliberately: the grantable population is ~7,177 members
+// / PHP 40,755,000, bounded now only by MAX_GRANT_BATCH_SIZE and the UI total.
 
-test('a never-upgraded (legacy) member is refused with not_upgraded and NO voucher is issued', async () => {
+test('POLICY: a never-upgraded (legacy) member IS granted - no upgraded-only refusal', async () => {
   const scenarios = {
     // joinedTier === currentTier -> registered Bronze, still Bronze, never upgraded.
     601: { eligible: true, currentTier: 10, joinedTier: 10, amount: 2500 },
   };
   const { router, connectionsLog, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
   const handlers = getMatchingHandlers(router, 'post', '/grant');
-  const req = { body: { uids: [601] }, session: { adminid: 1 } };
   const res = createResponse();
 
-  await runHandlers(handlers, req, res);
+  await runHandlers(handlers, { body: { uids: [601] }, session: { adminid: 1 } }, res);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.granted, 0);
+  assert.equal(res.body.granted, 1);
   assert.deepEqual(res.body.results, [
-    { uid: 601, granted: false, reason: 'not_upgraded', amount: 2500 },
+    { uid: 601, granted: true, reason: 'eligible', amount: 2500 },
   ]);
-  // The money assertion: the issue helper must never have been reached.
-  assert.deepEqual(voucherServiceStub.issueCalls, []);
-  // connectionsLog entries ARE the event arrays (see makePoolStub).
-  assert.ok(connectionsLog[0].includes('rollback'), 'a refused uid must roll back, never commit');
-  assert.ok(!connectionsLog[0].includes('commit'));
+  assert.deepEqual(voucherServiceStub.issueCalls, [{ uid: 601, packageType: 10 }]);
+  assert.ok(connectionsLog[0].includes('commit'));
+  assert.ok(!/not_upgraded/.test(JSON.stringify(res.body)),
+    'the not_upgraded refusal must be gone from the grant route');
 });
 
-test('the upgraded-only refusal happens even though eligibility itself says eligible', async () => {
-  // Guards against someone "simplifying" the route by trusting eligible alone.
-  const scenarios = { 602: { eligible: true, reason: 'eligible', currentTier: 60, joinedTier: 60, amount: 150000 } };
-  const { router, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
+test('DUPLICATE GUARD stays: a member already holding a voucher for their CURRENT tier is refused', async () => {
+  // Not a policy gate - vouchers are additive per TIER, so a second voucher for a
+  // package the member already holds is duplicate value, not a grant.
+  const scenarios = {
+    602: {
+      eligible: false,
+      reason: 'already_has_voucher_for_current_tier',
+      currentTier: 60,
+      joinedTier: 10,
+      amount: 150000,
+    },
+  };
+  const { router, connectionsLog, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
   const handlers = getMatchingHandlers(router, 'post', '/grant');
   const res = createResponse();
 
   await runHandlers(handlers, { body: { uids: [602] }, session: { adminid: 1 } }, res);
 
-  assert.equal(res.body.results[0].reason, 'not_upgraded');
-  assert.deepEqual(voucherServiceStub.issueCalls, [], 'a Diamond legacy member must not receive ₱150,000');
+  assert.equal(res.body.granted, 0);
+  assert.equal(res.body.results[0].reason, 'already_has_voucher_for_current_tier');
+  assert.deepEqual(voucherServiceStub.issueCalls, [],
+    'must not issue a second PHP 150,000 Diamond voucher to the same member');
+  assert.ok(connectionsLog[0].includes('rollback'));
+  assert.ok(!connectionsLog[0].includes('commit'));
 });
 
-test('an upgraded member is still granted normally (the policy is not a blanket block)', async () => {
+test('an upgraded member is granted normally', async () => {
   const scenarios = { 603: { eligible: true, currentTier: 20, joinedTier: 10, amount: 5000 } };
   const { router, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
   const handlers = getMatchingHandlers(router, 'post', '/grant');
@@ -543,10 +557,19 @@ async function listWithView(view, opts = {}) {
   return { result, executor, where: executor.whereSql };
 }
 
-test('needs_voucher (default view) applies BOTH the upgraded predicate and the current-tier exclusion', async () => {
+test('needs_voucher (default view) excludes a current-tier voucher but is NOT upgraded-only', async () => {
+  // Policy 2026-08-07: any member may be granted, so the default view is "missing a
+  // voucher for their current package", not "upgraded AND missing".
   const { where } = await listWithView(undefined);
-  assert.ok(where.includes(UPGRADED_PREDICATE), 'must be upgraded-only');
   assert.match(where, CURRENT_TIER_NOT_EXISTS, 'must exclude an existing current-tier voucher');
+  assert.ok(!where.includes(UPGRADED_PREDICATE),
+    'the upgraded-only restriction was removed from grantability — it is a view choice now');
+});
+
+test('upgraded_needs_voucher narrows to the targeted backfill set (both predicates)', async () => {
+  const { where } = await listWithView('upgraded_needs_voucher');
+  assert.ok(where.includes(UPGRADED_PREDICATE), 'must narrow to members whose package changed');
+  assert.match(where, CURRENT_TIER_NOT_EXISTS, 'and who lack a current-tier voucher');
 });
 
 test('no_voucher view lists members with no voucher at all and is NOT upgraded-filtered', async () => {
@@ -573,29 +596,37 @@ test('all view and the cashier includeAll lookup apply no voucher/upgrade filter
     'includeAll is the cashier member+voucher lookup and must list every member');
 });
 
-test('an unrecognised view falls back to needs_voucher (fails closed, never to `all`)', async () => {
+test('an unrecognised view falls back to needs_voucher, never to `all`', async () => {
   for (const bogus of ['everyone', '', 'ALL; DROP', null, 42]) {
     const { where } = await listWithView(bogus);
-    assert.ok(where.includes(UPGRADED_PREDICATE),
-      `view=${JSON.stringify(bogus)} must fall back to the narrowest view`);
+    assert.match(where, CURRENT_TIER_NOT_EXISTS,
+      `view=${JSON.stringify(bogus)} must fall back to needs_voucher, not list everyone`);
   }
 });
 
-test('grantable mirrors the two POST /grant refusals, per row', async () => {
+test('grantable mirrors the ONLY POST /grant refusal: already has a voucher for the current tier', async () => {
   const dataRows = [
     { uid: 1, currentaccttype: 20, accttype: 10, username: 'upgraded', is_upgraded: 1, has_current_tier_voucher: 0 },
     { uid: 2, currentaccttype: 10, accttype: 10, username: 'legacy', is_upgraded: 0, has_current_tier_voucher: 0 },
     { uid: 3, currentaccttype: 20, accttype: 10, username: 'alreadyGranted', is_upgraded: 1, has_current_tier_voucher: 1 },
+    { uid: 4, currentaccttype: 10, accttype: 10, username: 'legacyAlreadyGranted', is_upgraded: 0, has_current_tier_voucher: 1 },
   ];
   const { result } = await listWithView('all', { dataRows });
   const byName = Object.fromEntries(result.users.map((u) => [u.username, u]));
 
   assert.equal(byName.upgraded.grantable, true);
   assert.equal(byName.upgraded.notGrantableReason, null);
-  assert.equal(byName.legacy.grantable, false);
-  assert.equal(byName.legacy.notGrantableReason, 'not_upgraded');
+
+  // POLICY 2026-08-07: never upgrading is NOT a refusal any more.
+  assert.equal(byName.legacy.grantable, true, 'a never-upgraded member is grantable');
+  assert.equal(byName.legacy.notGrantableReason, null);
+  assert.equal(byName.legacy.isUpgraded, false, 'but is still reported as not upgraded, for display');
+
+  // The one refusal that remains, and it is independent of upgrade status.
   assert.equal(byName.alreadyGranted.grantable, false);
   assert.equal(byName.alreadyGranted.notGrantableReason, 'already_has_voucher_for_current_tier');
+  assert.equal(byName.legacyAlreadyGranted.grantable, false);
+  assert.equal(byName.legacyAlreadyGranted.notGrantableReason, 'already_has_voucher_for_current_tier');
 });
 
 test('REGRESSION: an upgraded member holding a SPENT lower-tier voucher stays grantable', async () => {

@@ -577,27 +577,18 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), idempotent('admin.vouch
         continue;
       }
 
-      // UPGRADED-ONLY POLICY (mirrors the candidate-list predicate in
-      // services/voucher.js). The list is a convenience; THIS is the guard —
-      // `uids` is client-supplied, so without it any admin could POST arbitrary
-      // uids and issue vouchers to the ~7,100 pre-launch legacy members
-      // (₱40,755,000 measured on prod 2026-08-07). Fails closed: a member whose
-      // package never changed is refused with a named reason, never silently.
-      // Deliberately enforced here rather than inside isEligibleForPackageVoucher
-      // so the automatic upgrade grant is unaffected by this admin policy.
-      if (eligibility.currentTier === eligibility.joinedTier) {
-        await connection.rollback();
-        inTransaction = false;
-        skipped += 1;
-        results.push({
-          uid,
-          granted: false,
-          reason: 'not_upgraded',
-          amount: eligibility.amount ?? null,
-        });
-        continue;
-      }
-
+      // NOTE (policy, 2026-08-07): an upgraded-only refusal (`not_upgraded`) used to
+      // sit here. The account owner decided an admin may grant a voucher to ANY
+      // member, upgraded or not, so it was removed deliberately — do not
+      // reintroduce it as a "fix" without checking with them first.
+      //
+      // What that leaves as the only protection against a bulk over-issuance
+      // (~7,177 members / ₱40,755,000 of redeemable value on prod):
+      //   - MAX_GRANT_BATCH_SIZE on this route,
+      //   - the confirmation total shown in the UI before submit,
+      //   - `already_has_voucher_for_current_tier` from isEligibleForPackageVoucher,
+      //     which is the DUPLICATE guard (vouchers are additive per tier) and is NOT
+      //     a policy gate — it must stay.
       const insertedId = await issuePackageVoucher(connection, uid, eligibility.currentTier);
 
       if (!insertedId) {

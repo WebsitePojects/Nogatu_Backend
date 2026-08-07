@@ -1539,19 +1539,29 @@ async function getGrantEligibleMembers(page = 1, perPage = 30, search = '') {
 }
 
 /**
- * Which members the grant list DISPLAYS. This is a visibility filter only — it never
- * widens who may receive a voucher. Every row carries `grantable`, and POST /grant
- * re-checks the same two conditions under a row lock.
+ * Which members the grant list DISPLAYS. Visibility only.
  *
- *  needs_voucher — upgraded AND missing a voucher for the current tier (the only
- *                  view whose rows are grantable). Default.
- *  no_voucher    — holds no voucher row at all. Mostly the ~7,100 members who
- *                  predate the voucher feature (2026-06-10); view-only.
- *  has_voucher   — holds at least one voucher.
- *  all           — everyone. What `includeAll` (cashier lookup) maps to.
+ *  needs_voucher          — missing a voucher for their current package. Default.
+ *  upgraded_needs_voucher — the above, narrowed to members whose package changed
+ *                           (the targeted backfill set: 49 members / ₱770,000 on
+ *                           prod 2026-08-07).
+ *  no_voucher             — holds no voucher row at all.
+ *  has_voucher            — holds at least one voucher.
+ *  all                    — everyone. What `includeAll` (cashier lookup) maps to.
+ *
+ * POLICY (changed 2026-08-07 by the account owner): an admin may grant a voucher to
+ * ANY member, upgraded or not. The earlier upgraded-only restriction is gone from
+ * both this list and POST /grant. Consequence, stated so it is not rediscovered as a
+ * surprise: the grantable population is ~7,177 members / ₱40,755,000 of redeemable
+ * value, bounded now only by MAX_GRANT_BATCH_SIZE and the confirmation total.
+ *
+ * The ONE remaining refusal is `already_has_voucher_for_current_tier`. That is not a
+ * policy gate but the duplicate-value guard: vouchers are additive per TIER, so a
+ * second voucher for a package the member already holds is a duplicate, not a grant.
  */
 const VOUCHER_GRANT_VIEWS = {
   NEEDS_VOUCHER: 'needs_voucher',
+  UPGRADED_NEEDS_VOUCHER: 'upgraded_needs_voucher',
   NO_VOUCHER: 'no_voucher',
   HAS_VOUCHER: 'has_voucher',
   ALL: 'all',
@@ -1591,15 +1601,15 @@ async function listVoucherGrantCandidates({
   }
 
   if (safeView === VOUCHER_GRANT_VIEWS.NO_VOUCHER) {
-    // VIEW ONLY. Members holding no voucher row at all — overwhelmingly the ~7,100
-    // who predate the voucher feature (2026-06-10). They are shown so an admin can
-    // look someone up, and are returned with grantable=false / not_upgraded unless
-    // they also upgraded. Backfilling them is a business decision (₱40,755,000 on
-    // prod 2026-08-07), never an admin click.
+    // Members holding no voucher row at all — overwhelmingly the ~7,100 who predate
+    // the voucher feature (2026-06-10). Grantable like any other view.
     filters.push('NOT EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
   } else if (safeView === VOUCHER_GRANT_VIEWS.HAS_VOUCHER) {
     filters.push('EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
-  } else if (safeView === VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER) {
+  } else if (
+    safeView === VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER
+    || safeView === VOUCHER_GRANT_VIEWS.UPGRADED_NEEDS_VOUCHER
+  ) {
     // Vouchers are additive per package TIER (see isEligibleForPackageVoucher above),
     // not a one-time-ever grant. Excluding "has ANY voucher row" would hide members
     // who fully used an older-tier voucher and later upgraded (e.g. SeniorDelia:
@@ -1617,19 +1627,13 @@ async function listVoucherGrantCandidates({
        )`
     );
 
-    // UPGRADED-ONLY POLICY. This tool exists to fix members whose PACKAGE changed
-    // without a matching voucher. Without this predicate the list returns every
-    // member who predates the voucher feature (2026-06-10) — measured on prod
-    // 2026-08-07 at 7,177 rows / ₱40,755,000 of redeemable value — turning a
-    // select-all into an eight-figure issuance. Backfilling those legacy members
-    // is a business decision, not an admin click; it must never be reachable by
-    // paging through this list. MUST stay in lockstep with the `not_upgraded`
-    // refusal in POST /grant, or the list offers members the grant then refuses
-    // them. Applied only in the NEEDS_VOUCHER view — the other views are lookups
-    // (and `includeAll` is the cashier's member+voucher LOOKUP,
-    // VoucherGrant.jsx:68), where non-qualifying rows are shown but carry
-    // grantable=false rather than being hidden.
-    filters.push('u.currentaccttype <> u.accttype');
+    // Narrowing to members whose package CHANGED is now a view choice, not a
+    // permission rule (policy changed 2026-08-07 — see VOUCHER_GRANT_VIEWS). It
+    // isolates the targeted backfill set (49 members / ₱770,000 on prod) from the
+    // full ~7,177 who are missing a current-tier voucher.
+    if (safeView === VOUCHER_GRANT_VIEWS.UPGRADED_NEEDS_VOUCHER) {
+      filters.push('u.currentaccttype <> u.accttype');
+    }
   }
 
   const whereSql = `WHERE ${filters.join(' AND ')}`;
@@ -1701,14 +1705,15 @@ async function listVoucherGrantCandidates({
       const uid = Number(row.uid);
       const accttype = Number(row.currentaccttype || row.accttype || 0);
       const voucherRow = voucherRowsByUid.get(uid) || null;
-      // Mirrors POST /grant's two refusals, in the same order, so the UI's reason
-      // matches the server's. `grantable` is a UI affordance only — the route
-      // re-checks both conditions under a row lock and is the actual guard.
+      // Mirrors POST /grant's ONLY remaining refusal, so the UI's reason matches the
+      // server's. `grantable` is a UI affordance — the route re-checks under a row
+      // lock and is the actual guard. Upgrade status no longer affects grantability
+      // (policy changed 2026-08-07); `isUpgraded` is reported for display only.
       const isUpgraded = Boolean(Number(row.is_upgraded || 0));
       const hasCurrentTierVoucher = Boolean(Number(row.has_current_tier_voucher || 0));
-      const notGrantableReason = !isUpgraded
-        ? 'not_upgraded'
-        : (hasCurrentTierVoucher ? 'already_has_voucher_for_current_tier' : null);
+      const notGrantableReason = hasCurrentTierVoucher
+        ? 'already_has_voucher_for_current_tier'
+        : null;
       return {
         uid,
         isUpgraded,
