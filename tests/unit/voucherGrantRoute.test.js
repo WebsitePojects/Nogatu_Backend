@@ -94,6 +94,7 @@ function loadVoucherManagementRouter(options = {}) {
       buildVoucherExpiryLabel: () => 'Active',
       createManualVoucherAvailment: async () => ({}),
       getVoucherExpiryMode: () => 'unused',
+      resolveVoucherSources: async () => new Map(),
       getVoucherAvailmentById: async () => ({}),
       getVoucherAvailments,
       listVoucherGrantCandidates: async () => ({

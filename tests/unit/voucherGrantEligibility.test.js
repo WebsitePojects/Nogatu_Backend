@@ -644,3 +644,111 @@ test('REGRESSION: an upgraded member holding a SPENT lower-tier voucher stays gr
   assert.equal(row.grantable, true, 'and she must still be grantable for her NEW tier');
   assert.equal(row.notGrantableReason, null);
 });
+
+// -- Voucher provenance (resolveVoucherSources) ---------------------------
+// Every voucher must resolve to a source. A blank Code cell is ambiguous: "no code
+// was involved" and "we could not find the code" look identical and mean opposites.
+// activation_code_usagetab is NODE-ERA ONLY, so usertab.activationcode is the
+// primary registration source, not a fallback (lessons 2026-07-15).
+
+function makeSourceExecutor({ accounts = [], upgrades = [], codes = [], usage = [] } = {}) {
+  return {
+    async query(sql) {
+      if (/FROM usertab/i.test(sql)) return [accounts];
+      if (/FROM upgradetab/i.test(sql)) return [upgrades];
+      if (/FROM codestab/i.test(sql)) return [codes];
+      if (/FROM activation_code_usagetab/i.test(sql)) return [usage];
+      return [[]];
+    },
+  };
+}
+
+async function resolveWith(voucherRows, fixtures) {
+  const { resolveVoucherSources } = loadVoucherServiceForList();
+  return resolveVoucherSources(voucherRows, makeSourceExecutor(fixtures));
+}
+
+test('UPGRADE: a voucher whose tier matches an upgradetab row reports that upgrade code', async () => {
+  const got = await resolveWith(
+    [{ id: 1, uid: 500, package_type: 20 }],
+    {
+      accounts: [{ uid: 500, accttype: 10, activationcode: 'PDBRREG0001' }],
+      upgrades: [{ uid: 500, producttype: 20, codeid: 9001, code: 'PDSIUPG0001' }],
+    }
+  );
+  assert.deepEqual(got.get(1), {
+    source: 'upgrade', sourceLabel: 'Package upgrade', code: 'PDSIUPG0001', codeId: 9001,
+  });
+});
+
+test('REGISTRATION: a voucher at the JOINING tier reports usertab.activationcode, with no usage event', async () => {
+  // The legacy case that rendered blank before: no activation_code_usagetab row at all.
+  const got = await resolveWith(
+    [{ id: 2, uid: 501, package_type: 10 }],
+    {
+      accounts: [{ uid: 501, accttype: 10, activationcode: 'PDBRREG0002' }],
+      codes: [{ id: 7777, code: 'PDBRREG0002' }],
+      usage: [],
+    }
+  );
+  assert.deepEqual(got.get(2), {
+    source: 'registration', sourceLabel: 'Registration', code: 'PDBRREG0002', codeId: 7777,
+  });
+});
+
+test('ADMIN GRANT: no upgrade at that tier and not the joining tier -> admin_grant, never blank', async () => {
+  const got = await resolveWith(
+    [{ id: 3, uid: 502, package_type: 30 }],
+    {
+      accounts: [{ uid: 502, accttype: 10, activationcode: 'PDBRREG0003' }],
+      upgrades: [],
+      usage: [],
+    }
+  );
+  const row = got.get(3);
+  assert.equal(row.source, 'admin_grant');
+  assert.equal(row.sourceLabel, 'Admin grant');
+  assert.equal(row.code, null);
+});
+
+test('every voucher on the page resolves to a source — none left unresolved', async () => {
+  const vouchers = [
+    { id: 10, uid: 600, package_type: 20 },
+    { id: 11, uid: 601, package_type: 10 },
+    { id: 12, uid: 602, package_type: 60 },
+    { id: 13, uid: 603, package_type: 40 },
+  ];
+  const got = await resolveWith(vouchers, {
+    accounts: [
+      { uid: 600, accttype: 10, activationcode: 'A1' },
+      { uid: 601, accttype: 10, activationcode: 'B2' },
+      { uid: 602, accttype: 10, activationcode: null },
+      { uid: 603, accttype: 40, activationcode: '' },
+    ],
+    upgrades: [{ uid: 600, producttype: 20, codeid: 1, code: 'UPG1' }],
+    codes: [{ id: 5, code: 'B2' }],
+    usage: [{ to_uid: 602, code: 'LEGACY-EVENT', code_row_id: 42, event_type: 'registration' }],
+  });
+
+  assert.equal(got.size, vouchers.length, 'no voucher may be missing from the result');
+  for (const v of vouchers) {
+    const row = got.get(v.id);
+    assert.ok(row, `voucher ${v.id} must resolve`);
+    assert.ok(row.source && row.sourceLabel, `voucher ${v.id} must carry a source label`);
+  }
+  assert.equal(got.get(10).source, 'upgrade');
+  assert.equal(got.get(11).source, 'registration');
+  assert.equal(got.get(12).code, 'LEGACY-EVENT', 'Node-era usage event is used when usertab has no code');
+  // uid 603 joined at 40 but activationcode is '' -> no code recoverable -> admin_grant
+  assert.equal(got.get(13).source, 'admin_grant');
+});
+
+test('resolveVoucherSources works when called WITHOUT a connection (default path executes)', async () => {
+  // Standing rule from lessons 2026-08-06: a default dependency parameter needs one
+  // test that omits the argument, or a bad default throws only in production.
+  const { resolveVoucherSources } = loadVoucherServiceForList();
+  const empty = await resolveVoucherSources([]);
+  assert.equal(empty.size, 0);
+  const noUids = await resolveVoucherSources([{ id: 1, uid: null, package_type: 10 }]);
+  assert.equal(noUids.size, 0);
+});

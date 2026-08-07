@@ -13,6 +13,7 @@ const {
   isEligibleForPackageVoucher,
   issuePackageVoucher,
   listVoucherGrantCandidates,
+  resolveVoucherSources,
   markVoucherAvailmentClaimed,
   updateManualVoucherAvailment,
 } = require('../../services/voucher');
@@ -174,13 +175,6 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               DATE_FORMAT(v.expiry_date, '%Y-%m-%d %H:%i') AS expiry_at,
               DATE_FORMAT(v.first_used_at, '%Y-%m-%d %H:%i') AS first_used_at,
               DATE_FORMAT(v.use_expires_at, '%Y-%m-%d %H:%i') AS use_expires_at,
-              (SELECT acu.code FROM activation_code_usagetab acu
-                 WHERE acu.to_uid = v.uid
-                 ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code,
-              (SELECT COALESCE(acu.code_row_id, cs.id) FROM activation_code_usagetab acu
-                 LEFT JOIN codestab cs ON cs.code = acu.code
-                 WHERE acu.to_uid = v.uid
-                 ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code_id,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
        LEFT JOIN memberstab m ON m.uid = v.uid
@@ -199,13 +193,32 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
        FROM voucherstab`
     );
 
+    // Derived per page with a few bounded, uid-keyed queries (never correlated
+    // subqueries per row — that is what made this screen slow enough for management
+    // to report it). Guarantees every voucher reports a source, so the UI never has
+    // to render an ambiguous blank Code cell.
+    // FAIL SOFT: provenance is a display aid, not voucher data. If the lookup throws
+    // (missing/partial schema on an older DB, upgradetab unavailable, ...) the admin
+    // must still get their voucher list — degraded to "No record", never a 500.
+    let sourceByVoucherId = new Map();
+    try {
+      sourceByVoucherId = await resolveVoucherSources(rows);
+    } catch (sourceError) {
+      console.error('[Admin Voucher Management] Voucher source resolution failed:', sourceError.message);
+    }
+
     res.json({
       vouchers: rows.map((row) => {
         const expiryMode = getVoucherExpiryMode(row);
+        const origin = sourceByVoucherId.get(Number(row.id)) || {
+          source: 'unknown', sourceLabel: 'No record', code: null, codeId: null,
+        };
         return {
           id: Number(row.id),
-          code: row.source_code || null,
-          codeId: row.source_code_id != null ? Number(row.source_code_id) : null,
+          code: origin.code,
+          codeId: origin.codeId,
+          source: origin.source,
+          sourceLabel: origin.sourceLabel,
           uid: Number(row.uid),
           username: row.username,
           fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,

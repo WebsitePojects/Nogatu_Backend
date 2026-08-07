@@ -1568,6 +1568,157 @@ const VOUCHER_GRANT_VIEWS = {
 };
 const VOUCHER_GRANT_VIEW_VALUES = Object.values(VOUCHER_GRANT_VIEWS);
 
+/**
+ * Where a voucher came from. Every voucher resolves to exactly one of these — the
+ * admin list must never render a bare blank, because "no code was involved" and "we
+ * could not find the code" look identical to the reader and mean opposite things.
+ */
+const VOUCHER_SOURCES = {
+  REGISTRATION: 'registration',
+  UPGRADE: 'upgrade',
+  ADMIN_GRANT: 'admin_grant',
+  UNKNOWN: 'unknown',
+};
+
+const VOUCHER_SOURCE_LABELS = {
+  [VOUCHER_SOURCES.REGISTRATION]: 'Registration',
+  [VOUCHER_SOURCES.UPGRADE]: 'Package upgrade',
+  [VOUCHER_SOURCES.ADMIN_GRANT]: 'Admin grant',
+  [VOUCHER_SOURCES.UNKNOWN]: 'No record',
+};
+
+/**
+ * Resolve the activation code behind each voucher, for a PAGE of vouchers.
+ *
+ * A voucher carries no provenance column, so it is derived by matching the voucher's
+ * package_type to whatever moved the member to that package:
+ *   - upgradetab row with producttype = package_type  -> the upgrade code
+ *   - usertab.accttype = package_type                 -> the registration code
+ *   - a Node-era usage event                          -> that code
+ *   - nothing                                         -> admin grant (no code exists)
+ *
+ * `usertab.activationcode` is the primary registration source on purpose:
+ * activation_code_usagetab is NODE-ERA ONLY, so members who registered before it
+ * have zero events and any column built solely from it renders blank even though
+ * their code is on file (see lessons 2026-07-15).
+ *
+ * Prefetched with a few bounded queries keyed on the page's uids rather than
+ * correlated subqueries per row — the pattern that made Voucher Management search
+ * slow enough for management to report it (lessons 2026-07-22).
+ *
+ * @returns {Map<number, {source, sourceLabel, code, codeId}>} keyed by voucher id
+ */
+async function resolveVoucherSources(voucherRows, conn = null) {
+  // `pool` is the module's destructured binding (config/database). Do NOT write
+  // `conn = pool` as a default parameter — see lessons 2026-08-06, where exactly that
+  // threw ReferenceError on every real request while every test passed a conn.
+  const db = conn || pool;
+  const resolved = new Map();
+  if (!Array.isArray(voucherRows) || voucherRows.length === 0) return resolved;
+
+  const uids = [...new Set(voucherRows.map((r) => Number(r.uid)).filter(Boolean))];
+  if (uids.length === 0) return resolved;
+  const uidPlaceholders = uids.map(() => '?').join(',');
+
+  const [accountRows] = await db.query(
+    `SELECT uid, accttype, activationcode FROM usertab WHERE uid IN (${uidPlaceholders})`,
+    uids
+  );
+  const accountByUid = new Map(accountRows.map((r) => [Number(r.uid), r]));
+
+  const [upgradeRows] = await db.query(
+    `SELECT ut.uid, ut.producttype, ut.codeid, cs.code
+       FROM upgradetab ut
+       LEFT JOIN codestab cs ON cs.id = ut.codeid
+      WHERE ut.uid IN (${uidPlaceholders})`,
+    uids
+  );
+  // Keyed by uid+tier: an upgrade to tier T is what entitles the voucher for tier T.
+  const upgradeByUidTier = new Map();
+  for (const r of upgradeRows) {
+    upgradeByUidTier.set(`${Number(r.uid)}:${Number(r.producttype)}`, r);
+  }
+
+  const registrationCodes = [...new Set(
+    accountRows.map((r) => r.activationcode).filter((c) => typeof c === 'string' && c.trim() !== '')
+  )];
+  const codeIdByCode = new Map();
+  if (registrationCodes.length > 0) {
+    const [codeRows] = await db.query(
+      `SELECT id, code FROM codestab WHERE code IN (${registrationCodes.map(() => '?').join(',')})`,
+      registrationCodes
+    );
+    // Duplicate code strings exist in legacy data (7 on prod, all codestatus=2). Keep
+    // the first — the Code ID is a display aid here, never a money key.
+    for (const r of codeRows) {
+      if (!codeIdByCode.has(r.code)) codeIdByCode.set(r.code, Number(r.id));
+    }
+  }
+
+  const [usageRows] = await db.query(
+    `SELECT to_uid, code, code_row_id, event_type
+       FROM activation_code_usagetab
+      WHERE to_uid IN (${uidPlaceholders})
+      ORDER BY (event_type = 'registration') DESC, id ASC`,
+    uids
+  );
+  const usageByUid = new Map();
+  for (const r of usageRows) {
+    if (!usageByUid.has(Number(r.to_uid))) usageByUid.set(Number(r.to_uid), r);
+  }
+
+  for (const voucher of voucherRows) {
+    const uid = Number(voucher.uid);
+    const tier = Number(voucher.package_type);
+    const account = accountByUid.get(uid);
+
+    const upgrade = upgradeByUidTier.get(`${uid}:${tier}`);
+    if (upgrade && upgrade.code) {
+      resolved.set(Number(voucher.id), {
+        source: VOUCHER_SOURCES.UPGRADE,
+        sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.UPGRADE],
+        code: upgrade.code,
+        codeId: upgrade.codeid != null ? Number(upgrade.codeid) : null,
+      });
+      continue;
+    }
+
+    const joinedTier = Number(account?.accttype || 0);
+    const registrationCode = account?.activationcode || null;
+    if (joinedTier === tier && registrationCode) {
+      resolved.set(Number(voucher.id), {
+        source: VOUCHER_SOURCES.REGISTRATION,
+        sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.REGISTRATION],
+        code: registrationCode,
+        codeId: codeIdByCode.get(registrationCode) ?? null,
+      });
+      continue;
+    }
+
+    const usage = usageByUid.get(uid);
+    if (usage && usage.code) {
+      resolved.set(Number(voucher.id), {
+        source: VOUCHER_SOURCES.REGISTRATION,
+        sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.REGISTRATION],
+        code: usage.code,
+        codeId: usage.code_row_id != null ? Number(usage.code_row_id) : null,
+      });
+      continue;
+    }
+
+    // No code moved this member to this package — the voucher was issued by an admin.
+    // Reported explicitly so the UI shows "Admin grant" instead of an ambiguous blank.
+    resolved.set(Number(voucher.id), {
+      source: VOUCHER_SOURCES.ADMIN_GRANT,
+      sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.ADMIN_GRANT],
+      code: null,
+      codeId: null,
+    });
+  }
+
+  return resolved;
+}
+
 async function listVoucherGrantCandidates({
   page = 1,
   perPage = 30,
@@ -1783,6 +1934,9 @@ module.exports = {
   getGrantEligibleMembers,
   listVoucherGrantCandidates,
   VOUCHER_GRANT_VIEWS,
+  VOUCHER_SOURCES,
+  VOUCHER_SOURCE_LABELS,
+  resolveVoucherSources,
   ensureVoucherGrantTable,
   ensureVoucherTable,
   ensureVoucherTxTable,
