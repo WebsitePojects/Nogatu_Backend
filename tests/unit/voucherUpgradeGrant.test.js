@@ -105,7 +105,9 @@ test('hasVoucherForPackage: true regardless of status (1/2/3) and remaining_bala
 test('eligible when the member has NO voucher at all', async () => {
   const conn = makeConn({ account: { currentaccttype: 20, accttype: 10 }, vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 42);
-  assert.deepStrictEqual(result, { eligible: true, reason: 'eligible', currentTier: 20, amount: 5000 });
+  assert.deepStrictEqual(result, {
+    eligible: true, reason: 'eligible', currentTier: 20, joinedTier: 10, amount: 5000,
+  });
 });
 
 test('SeniorDelia case: joined Bronze(10), voucher fully used at 10, now Silver(20) -> eligible', async () => {
@@ -130,6 +132,7 @@ test('NOT eligible when a voucher already exists at the CURRENT tier, status=3 f
     eligible: false,
     reason: 'already_has_voucher_for_current_tier',
     currentTier: 20,
+    joinedTier: 10,
     amount: 5000,
   });
 });
@@ -147,13 +150,17 @@ test('NOT eligible when a voucher already exists at the current tier, status=1 a
 test('NOT eligible for an unknown package type (not a PACKAGE_AMOUNTS key)', async () => {
   const conn = makeConn({ account: { currentaccttype: 99, accttype: 0 }, vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 6);
-  assert.deepStrictEqual(result, { eligible: false, reason: 'unknown_package', currentTier: null, amount: null });
+  assert.deepStrictEqual(result, {
+    eligible: false, reason: 'unknown_package', currentTier: null, joinedTier: 0, amount: null,
+  });
 });
 
 test('NOT eligible for a missing account (no usertab row)', async () => {
   const conn = makeConn({ account: null });
   const result = await isEligibleForPackageVoucher(conn, 7);
-  assert.deepStrictEqual(result, { eligible: false, reason: 'account_not_found', currentTier: null, amount: null });
+  assert.deepStrictEqual(result, {
+    eligible: false, reason: 'account_not_found', currentTier: null, joinedTier: null, amount: null,
+  });
 });
 
 test('currentaccttype takes precedence over accttype', async () => {
@@ -178,7 +185,9 @@ test('falls back to accttype when currentaccttype is null', async () => {
 test('unknown_package when BOTH currentaccttype and accttype are 0/null (fail closed)', async () => {
   const conn = makeConn({ account: { currentaccttype: 0, accttype: null }, vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 11);
-  assert.deepStrictEqual(result, { eligible: false, reason: 'unknown_package', currentTier: null, amount: null });
+  assert.deepStrictEqual(result, {
+    eligible: false, reason: 'unknown_package', currentTier: null, joinedTier: 0, amount: null,
+  });
 });
 
 // ── isEligibleForPackageVoucher requires conn (no default -> pool fallback) ──

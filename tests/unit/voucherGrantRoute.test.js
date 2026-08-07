@@ -93,7 +93,6 @@ function loadVoucherManagementRouter(options = {}) {
       UNUSED_VOUCHER_EXPIRY_MONTHS: { 10: 2 },
       buildVoucherExpiryLabel: () => 'Active',
       createManualVoucherAvailment: async () => ({}),
-      grantVouchersToExistingMembers: async () => 0,
       getVoucherExpiryMode: () => 'unused',
       getVoucherAvailmentById: async () => ({}),
       getVoucherAvailments,

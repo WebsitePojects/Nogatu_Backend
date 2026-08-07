@@ -158,13 +158,18 @@ function makeVoucherServiceStub(scenarios = {}) {
     }
 
     if (!scenario) {
-      return { eligible: false, reason: 'account_not_found', currentTier: null, amount: null };
+      return { eligible: false, reason: 'account_not_found', currentTier: null, joinedTier: null, amount: null };
     }
 
     return {
       eligible: scenario.eligible !== false,
       reason: scenario.reason || (scenario.eligible === false ? 'not_eligible' : 'eligible'),
       currentTier: scenario.currentTier ?? null,
+      // Defaults to 0, which never equals a real tier (10-60), so every existing
+      // scenario reads as an UPGRADED member and the upgraded-only policy is a
+      // no-op for them. Set joinedTier === currentTier to model a never-upgraded
+      // (pre-launch legacy) member and exercise the `not_upgraded` refusal.
+      joinedTier: scenario.joinedTier ?? 0,
       amount: scenario.amount ?? null,
     };
   }
@@ -412,4 +417,97 @@ test('the grant validator + handler contain no UPDATE/DELETE against voucherstab
     'the grant route must never DELETE from voucherstab');
   assert.match(slice, /isEligibleForPackageVoucher/, 'must use the shared eligibility helper');
   assert.match(slice, /issuePackageVoucher/, 'must use the shared issue helper (INSERT only)');
+});
+
+// ── Upgraded-only policy ─────────────────────────────────────────────────
+// The manual grant exists to fix members whose PACKAGE changed without a
+// matching voucher. Measured on prod 2026-08-07, dropping this gate exposes
+// 7,176 pre-launch legacy members = ₱40,755,000 of redeemable value.
+
+test('a never-upgraded (legacy) member is refused with not_upgraded and NO voucher is issued', async () => {
+  const scenarios = {
+    // joinedTier === currentTier -> registered Bronze, still Bronze, never upgraded.
+    601: { eligible: true, currentTier: 10, joinedTier: 10, amount: 2500 },
+  };
+  const { router, connectionsLog, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
+  const handlers = getMatchingHandlers(router, 'post', '/grant');
+  const req = { body: { uids: [601] }, session: { adminid: 1 } };
+  const res = createResponse();
+
+  await runHandlers(handlers, req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.granted, 0);
+  assert.deepEqual(res.body.results, [
+    { uid: 601, granted: false, reason: 'not_upgraded', amount: 2500 },
+  ]);
+  // The money assertion: the issue helper must never have been reached.
+  assert.deepEqual(voucherServiceStub.issueCalls, []);
+  // connectionsLog entries ARE the event arrays (see makePoolStub).
+  assert.ok(connectionsLog[0].includes('rollback'), 'a refused uid must roll back, never commit');
+  assert.ok(!connectionsLog[0].includes('commit'));
+});
+
+test('the upgraded-only refusal happens even though eligibility itself says eligible', async () => {
+  // Guards against someone "simplifying" the route by trusting eligible alone.
+  const scenarios = { 602: { eligible: true, reason: 'eligible', currentTier: 60, joinedTier: 60, amount: 150000 } };
+  const { router, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
+  const handlers = getMatchingHandlers(router, 'post', '/grant');
+  const res = createResponse();
+
+  await runHandlers(handlers, { body: { uids: [602] }, session: { adminid: 1 } }, res);
+
+  assert.equal(res.body.results[0].reason, 'not_upgraded');
+  assert.deepEqual(voucherServiceStub.issueCalls, [], 'a Diamond legacy member must not receive ₱150,000');
+});
+
+test('an upgraded member is still granted normally (the policy is not a blanket block)', async () => {
+  const scenarios = { 603: { eligible: true, currentTier: 20, joinedTier: 10, amount: 5000 } };
+  const { router, voucherServiceStub } = loadVoucherManagementRouterForGrant({ scenarios });
+  const handlers = getMatchingHandlers(router, 'post', '/grant');
+  const res = createResponse();
+
+  await runHandlers(handlers, { body: { uids: [603] }, session: { adminid: 1 } }, res);
+
+  assert.equal(res.body.granted, 1);
+  assert.deepEqual(voucherServiceStub.issueCalls, [{ uid: 603, packageType: 20 }]);
+});
+
+test('the unbounded bulk grant route and helper are GONE', () => {
+  const { router } = loadVoucherManagementRouterForGrant();
+  // NOTE: getMatchingHandlers() appends every router-level middleware regardless of
+  // path, so it can never return 0 and cannot prove a route's absence. Inspect the
+  // registered route paths directly instead.
+  const registered = router.stack
+    .filter((layer) => layer.route)
+    .map((layer) => `${Object.keys(layer.route.methods).join(',')} ${layer.route.path}`);
+  assert.ok(!registered.some((entry) => entry.endsWith(' /grant-existing')),
+    `POST /grant-existing issued vouchers to every member without one — it must not exist. Registered: ${registered.join(' | ')}`);
+  assert.ok(registered.some((entry) => entry === 'post /grant'),
+    'the per-uid POST /grant route must still be registered');
+
+  const src = fs.readFileSync(routePath, 'utf8');
+  assert.ok(!/router\.post\(\s*['"]\/grant-existing['"]/.test(src),
+    'no route may register /grant-existing');
+
+  const serviceSrc = fs.readFileSync(path.join(repoRoot, 'services', 'voucher.js'), 'utf8');
+  assert.ok(!/^\s*async function grantVouchersToExistingMembers/m.test(serviceSrc),
+    'grantVouchersToExistingMembers (unbounded INSERT...SELECT) must not be defined');
+  assert.ok(!/^\s*grantVouchersToExistingMembers,/m.test(serviceSrc),
+    'grantVouchersToExistingMembers must not be exported');
+});
+
+test('the candidate list is upgraded-only in grant mode, but NOT in the cashier includeAll lookup', () => {
+  const serviceSrc = fs.readFileSync(path.join(repoRoot, 'services', 'voucher.js'), 'utf8');
+  const start = serviceSrc.indexOf('async function listVoucherGrantCandidates');
+  assert.ok(start > -1, 'listVoucherGrantCandidates must exist');
+  const slice = serviceSrc.slice(start, start + 3000);
+
+  const guardIdx = slice.indexOf('if (!safeIncludeAll)');
+  const predicateIdx = slice.indexOf("u.currentaccttype <> u.accttype");
+  assert.ok(guardIdx > -1, 'the includeAll guard must exist');
+  assert.ok(predicateIdx > -1, 'the upgraded-only predicate must exist');
+  assert.ok(predicateIdx > guardIdx,
+    'the upgraded-only predicate must sit INSIDE if (!safeIncludeAll) — includeAll is the '
+    + "cashier's member+voucher lookup (VoucherGrant.jsx) and must keep listing every member");
 });

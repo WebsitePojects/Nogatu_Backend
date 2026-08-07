@@ -392,21 +392,26 @@ async function isEligibleForPackageVoucher(conn, uid) {
   );
 
   if (!Array.isArray(accountRows) || accountRows.length === 0) {
-    return { eligible: false, reason: 'account_not_found', currentTier: null, amount: null };
+    return { eligible: false, reason: 'account_not_found', currentTier: null, joinedTier: null, amount: null };
   }
 
   const currentTier = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
+  // Joining tier, reported so callers can apply an upgraded-only POLICY without a
+  // second query. Deliberately NOT part of the eligibility decision here: the
+  // automatic upgrade path must stay tier-based only (see ADMIN_GRANT policy in
+  // routes/admin/voucherManagement.js).
+  const joinedTier = Number(accountRows[0].accttype || 0);
   if (!PACKAGE_AMOUNTS[currentTier]) {
-    return { eligible: false, reason: 'unknown_package', currentTier: null, amount: null };
+    return { eligible: false, reason: 'unknown_package', currentTier: null, joinedTier, amount: null };
   }
 
   const amount = Number(PACKAGE_AMOUNTS[currentTier]);
   const alreadyHasVoucher = await hasVoucherForPackage(conn, safeUid, currentTier);
   if (alreadyHasVoucher) {
-    return { eligible: false, reason: 'already_has_voucher_for_current_tier', currentTier, amount };
+    return { eligible: false, reason: 'already_has_voucher_for_current_tier', currentTier, joinedTier, amount };
   }
 
-  return { eligible: true, reason: 'eligible', currentTier, amount };
+  return { eligible: true, reason: 'eligible', currentTier, joinedTier, amount };
 }
 
 /**
@@ -1574,6 +1579,18 @@ async function listVoucherGrantCandidates({
             AND v.package_type = COALESCE(NULLIF(u.currentaccttype, 0), u.accttype)
        )`
     );
+
+    // UPGRADED-ONLY POLICY. This tool exists to fix members whose PACKAGE changed
+    // without a matching voucher. Without this predicate the list returns every
+    // member who predates the voucher feature (2026-06-10) — measured on prod
+    // 2026-08-07 at 7,177 rows / ₱40,755,000 of redeemable value — turning a
+    // select-all into an eight-figure issuance. Backfilling those legacy members
+    // is a business decision, not an admin click; it must never be reachable by
+    // paging through this list. MUST stay in lockstep with the `not_upgraded`
+    // refusal in POST /grant, or the list offers members the grant then refuses
+    // them. Applied only in candidate mode — `includeAll` is the cashier's
+    // member+voucher LOOKUP (VoucherGrant.jsx:68) and must keep showing everyone.
+    filters.push('u.currentaccttype <> u.accttype');
   }
 
   const whereSql = `WHERE ${filters.join(' AND ')}`;
@@ -1650,136 +1667,31 @@ async function listVoucherGrantCandidates({
   };
 }
 
-/**
- * Grant vouchers to selected members.
- * Members with existing voucher history are skipped.
+/*
+ * REMOVED 2026-08-07: grantVouchersToMembers()
+ *
+ * Dead since the POST /grant rewrite — no caller anywhere in the repo, only its
+ * own definition and export. Left in place it was a loaded gun: an exported
+ * voucher-granter carrying the SAME tier-blind defect as grantVouchersToExisting-
+ * Members (`v.uid IS NULL` skips a member holding ANY voucher, so the upgraded
+ * members this tool exists for were the ones it refused), with no upgraded-only
+ * policy and no idempotency key. The live path is POST /grant, which calls the
+ * shared isEligibleForPackageVoucher + issuePackageVoucher per uid.
  */
-async function grantVouchersToMembers(uids = []) {
-  await ensureVoucherGrantTable();
-
-  const cleanUids = Array.from(new Set(
-    (Array.isArray(uids) ? uids : [])
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0)
-  ));
-
-  if (cleanUids.length === 0) {
-    return {
-      requested: 0,
-      granted: 0,
-      skippedCount: 0,
-      skippedUids: [],
-      grantedUids: [],
-    };
-  }
-
-  const placeholders = cleanUids.map(() => '?').join(',');
-  const conn = await pool.getConnection();
-
-  try {
-    await conn.beginTransaction();
-
-    const [eligibleRows] = await conn.query(
-      `SELECT u.uid, u.currentaccttype
-       FROM usertab u
-       LEFT JOIN voucherstab v ON v.uid = u.uid
-       WHERE u.uid IN (${placeholders})
-         AND u.uid = u.mainid
-         AND u.currentaccttype IN (10,20,30,40,50,60)
-         AND v.uid IS NULL
-       FOR UPDATE`,
-      cleanUids
-    );
-
-    const grantedUids = [];
-    for (const row of eligibleRows) {
-      const uid = Number(row.uid);
-      const packageType = Number(row.currentaccttype || 0);
-      const amount = Number(PACKAGE_AMOUNTS[packageType] || 0);
-      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[packageType] || 0);
-
-      if (!uid || !amount || !expiryMonths) continue;
-
-      await conn.query(
-        `INSERT INTO voucherstab
-          (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
-        [uid, packageType, amount, amount, expiryMonths]
-      );
-
-      grantedUids.push(uid);
-    }
-
-    await conn.commit();
-
-    const skippedUids = cleanUids.filter((uid) => !grantedUids.includes(uid));
-
-    return {
-      requested: cleanUids.length,
-      granted: grantedUids.length,
-      skippedCount: skippedUids.length,
-      skippedUids,
-      grantedUids,
-    };
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-/**
- * Grant one-time vouchers to existing members that still have no voucher record.
- * Idempotent: reruns only insert for members without any voucher row.
+/*
+ * REMOVED 2026-08-07: grantVouchersToExistingMembers()
+ *
+ * Unbounded bulk issuance — `INSERT ... SELECT ... WHERE v.uid IS NULL` with no
+ * uid list and no cap. On prod 2026-08-07 that predicate matched 7,176 members
+ * = ₱40,755,000 of redeemable voucher value from a single call. Its only caller
+ * was POST /grant-existing, which no frontend used; both are gone.
+ *
+ * It was also WRONG for the case it was meant to serve: `v.uid IS NULL` excludes
+ * any member holding ANY voucher, so an upgraded member with a spent lower-tier
+ * voucher (the SeniorDelia case) was skipped while 7,000+ legacy members were
+ * paid. Correct path is POST /grant — per-uid, capped, idempotent, row-locked,
+ * tier-scoped, upgraded-only.
  */
-async function grantVouchersToExistingMembers() {
-  await ensureVoucherGrantTable();
-
-  const [result] = await pool.query(
-    `INSERT INTO voucherstab
-      (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-     SELECT
-       u.uid,
-       u.currentaccttype,
-       CASE u.currentaccttype
-         WHEN 10 THEN 2500
-         WHEN 20 THEN 5000
-         WHEN 30 THEN 10000
-         WHEN 40 THEN 25000
-         WHEN 50 THEN 50000
-         WHEN 60 THEN 150000
-       END AS voucher_amount,
-       CASE u.currentaccttype
-         WHEN 10 THEN 2500
-         WHEN 20 THEN 5000
-         WHEN 30 THEN 10000
-         WHEN 40 THEN 25000
-         WHEN 50 THEN 50000
-         WHEN 60 THEN 150000
-       END AS remaining_balance,
-       NOW(),
-       DATE_ADD(
-         NOW(),
-         INTERVAL CASE u.currentaccttype
-           WHEN 10 THEN 2
-           WHEN 20 THEN 2
-           WHEN 30 THEN 4
-           WHEN 40 THEN 4
-           WHEN 50 THEN 6
-           WHEN 60 THEN 6
-         END MONTH
-       ),
-       1
-     FROM usertab u
-     LEFT JOIN voucherstab v ON v.uid = u.uid
-     WHERE u.uid = u.mainid
-       AND u.currentaccttype IN (10, 20, 30, 40, 50, 60)
-       AND v.uid IS NULL`
-  );
-
-  return Number(result.affectedRows || 0);
-}
 
 module.exports = {
   issueVoucher,
@@ -1792,8 +1704,6 @@ module.exports = {
   getAllVouchers,
   getGrantEligibleMembers,
   listVoucherGrantCandidates,
-  grantVouchersToMembers,
-  grantVouchersToExistingMembers,
   ensureVoucherGrantTable,
   ensureVoucherTable,
   ensureVoucherTxTable,

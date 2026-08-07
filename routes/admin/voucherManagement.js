@@ -7,7 +7,6 @@ const { getAccountTypeName } = require('../../utils/helpers');
 const {
   buildVoucherExpiryLabel,
   createManualVoucherAvailment,
-  grantVouchersToExistingMembers,
   getVoucherExpiryMode,
   getVoucherAvailmentById,
   getVoucherAvailments,
@@ -439,24 +438,22 @@ router.put('/:id/unsuspend', adminAuth, adminRights([1, 2, 3]), async (req, res)
   }
 });
 
-/**
- * POST /api/admin/voucher-management/grant-existing
+/*
+ * REMOVED 2026-08-07: POST /api/admin/voucher-management/grant-existing
+ *
+ * It took NO request body and called grantVouchersToExistingMembers(), an
+ * unbounded `INSERT ... SELECT ... WHERE v.uid IS NULL` — one authenticated
+ * request issued a voucher to EVERY member without one. Measured on prod
+ * 2026-08-07: 7,176 members / ₱40,755,000 of redeemable value, with no uid
+ * list, no cap, and no confirmation. It was also tier-blind (`v.uid IS NULL`
+ * excludes anyone holding ANY voucher), so it would have MISSED exactly the
+ * upgraded members it was supposed to help while paying everyone else.
+ *
+ * No frontend ever called it (VoucherGrant.jsx uses POST /grant with an
+ * explicit uid list). Use that route — per-uid, capped, idempotent, row-locked,
+ * upgraded-only. Bulk-backfilling legacy members is a business decision and
+ * must arrive as a reviewed script with sign-off, not an unguarded endpoint.
  */
-router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  try {
-    await ensureVoucherGrantTables();
-    const inserted = await grantVouchersToExistingMembers();
-
-    res.json({
-      success: true,
-      inserted,
-      message: `Granted ${inserted} voucher(s) to existing members without vouchers.`,
-    });
-  } catch (error) {
-    console.error('[Admin Voucher Management] Grant existing error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 /**
  * GET /api/admin/voucher-management/grant-candidates
@@ -572,6 +569,27 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), idempotent('admin.vouch
           granted: false,
           reason: eligibility?.reason || 'not_eligible',
           amount: eligibility?.amount ?? null,
+        });
+        continue;
+      }
+
+      // UPGRADED-ONLY POLICY (mirrors the candidate-list predicate in
+      // services/voucher.js). The list is a convenience; THIS is the guard —
+      // `uids` is client-supplied, so without it any admin could POST arbitrary
+      // uids and issue vouchers to the ~7,100 pre-launch legacy members
+      // (₱40,755,000 measured on prod 2026-08-07). Fails closed: a member whose
+      // package never changed is refused with a named reason, never silently.
+      // Deliberately enforced here rather than inside isEligibleForPackageVoucher
+      // so the automatic upgrade grant is unaffected by this admin policy.
+      if (eligibility.currentTier === eligibility.joinedTier) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({
+          uid,
+          granted: false,
+          reason: 'not_upgraded',
+          amount: eligibility.amount ?? null,
         });
         continue;
       }
