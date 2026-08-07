@@ -14,6 +14,7 @@ const { listMemberActivationHistory } = require('../services/codeHistory');
 const { refreshMemberRankSnapshot } = require('../services/ranking');
 const { applyRepurchaseDelta } = require('../services/rankPoints');
 const { getTotalPointsForRange } = require('../services/income/unilevel');
+const { isEligibleForPackageVoucher, issuePackageVoucher } = require('../services/voucher');
 
 /**
  * GET /api/codes?page=1
@@ -341,6 +342,30 @@ router.post('/upgrade', memberAuth, idempotent('codes.upgrade'), async (req, res
       },
       processKey: createProcessKey(['code-upgrade-use', code, uid, codeData.producttype, now]),
     });
+
+    // An upgrade consumes a full package code, so it earns that package's voucher —
+    // the same entitlement a member who joins directly at this tier receives. Until
+    // now only registration issued vouchers, so every upgraded member got nothing.
+    //
+    // ADDITIVE: any earlier-tier voucher is left exactly as it is, never modified.
+    // Exactly-once comes free from the code-consumption CAS above — this runs inside
+    // the same transaction, which only commits if this request won the code.
+    // `currentaccttype` is already updated by this point, so eligibility reads the NEW tier.
+    //
+    // Fail-open (warn, don't roll back), matching how registration treats voucher
+    // issuance: a voucher-table problem must never block a member's upgrade or strand
+    // their package code. Recovery is real — a member missed here shows up as eligible
+    // in the admin grant tool, which applies this exact same rule.
+    try {
+      const voucherEligibility = await isEligibleForPackageVoucher(conn, uid);
+      if (voucherEligibility.eligible) {
+        await issuePackageVoucher(conn, uid, codeData.producttype);
+      } else {
+        console.warn(`[Upgrade] Voucher not issued for uid ${uid}: ${voucherEligibility.reason}`);
+      }
+    } catch (voucherErr) {
+      console.error(`[Upgrade] Voucher issuance failed for uid ${uid}:`, voucherErr.message);
+    }
 
     await conn.commit();
 

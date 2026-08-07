@@ -358,6 +358,82 @@ async function issueVoucher(conn, uid, packageType) {
 }
 
 /**
+ * True if this uid already has a voucherstab row for this exact package tier,
+ * in ANY status (1 active / 2 expired / 3 fully used) — having received it at
+ * all counts, regardless of remaining balance.
+ * @param {object} conn - REQUIRED DB connection (caller's transaction).
+ */
+async function hasVoucherForPackage(conn, uid, packageType) {
+  const [rows] = await conn.query(
+    'SELECT id FROM voucherstab WHERE uid = ? AND package_type = ? LIMIT 1',
+    [Number(uid), Number(packageType)]
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+/**
+ * Single shared eligibility rule for the additive package voucher (upgrade grant
+ * AND admin manual grant use this — do not fork the logic).
+ * @param {object} conn - REQUIRED DB connection (caller's transaction).
+ * @returns {{ eligible: boolean, reason: string, currentTier: number|null, amount: number|null }}
+ *
+ * ⚠️ Race note: this is a plain read, not a lock. A caller that grants based on
+ * this result MUST hold the member row locked (e.g. `SELECT ... FOR UPDATE` on
+ * usertab already taken for the upgrade transaction) for the whole
+ * check-then-issuePackageVoucher span, or two concurrent upgrades to the same
+ * tier can both pass this check and double-grant (voucherstab has no UNIQUE
+ * constraint on uid+package_type — see V021).
+ */
+async function isEligibleForPackageVoucher(conn, uid) {
+  const safeUid = Number(uid);
+  const [accountRows] = await conn.query(
+    'SELECT currentaccttype, accttype FROM usertab WHERE uid = ? LIMIT 1',
+    [safeUid]
+  );
+
+  if (!Array.isArray(accountRows) || accountRows.length === 0) {
+    return { eligible: false, reason: 'account_not_found', currentTier: null, amount: null };
+  }
+
+  const currentTier = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
+  if (!PACKAGE_AMOUNTS[currentTier]) {
+    return { eligible: false, reason: 'unknown_package', currentTier: null, amount: null };
+  }
+
+  const amount = Number(PACKAGE_AMOUNTS[currentTier]);
+  const alreadyHasVoucher = await hasVoucherForPackage(conn, safeUid, currentTier);
+  if (alreadyHasVoucher) {
+    return { eligible: false, reason: 'already_has_voucher_for_current_tier', currentTier, amount };
+  }
+
+  return { eligible: true, reason: 'eligible', currentTier, amount };
+}
+
+/**
+ * Additive package voucher grant (e.g. on package upgrade). INSERT-only — never
+ * updates or replaces an existing voucherstab row. Same INSERT shape as
+ * issueVoucher (registration path), kept as a separate function so issueVoucher
+ * stays byte-identical for registration.
+ * @param {object} conn - REQUIRED DB connection (caller's transaction). No pool fallback.
+ * @returns {number|null} new voucherstab row id, or null for an unrecognized packageType.
+ */
+async function issuePackageVoucher(conn, uid, packageType, options = {}) {
+  const amount = PACKAGE_AMOUNTS[packageType];
+  const expiryMonths = UNUSED_VOUCHER_EXPIRY_MONTHS[packageType];
+
+  if (!amount || !expiryMonths) return null;
+
+  const [result] = await conn.query(
+    `INSERT INTO voucherstab (uid, package_type, voucher_amount, remaining_balance,
+     issued_date, expiry_date, status)
+     VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
+    [uid, packageType, amount, amount, expiryMonths]
+  );
+
+  return result.insertId;
+}
+
+/**
  * Get all vouchers for a member
  */
 async function getVouchers(uid) {
@@ -1482,7 +1558,22 @@ async function listVoucherGrantCandidates({
   }
 
   if (!safeIncludeAll) {
-    filters.push('NOT EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
+    // Vouchers are additive per package TIER (see isEligibleForPackageVoucher above),
+    // not a one-time-ever grant. Excluding "has ANY voucher row" would hide members
+    // who fully used an older-tier voucher and later upgraded (e.g. SeniorDelia:
+    // spent her Bronze voucher, now Silver, entitled to a Silver voucher) — the
+    // exact people this list exists to surface. Scope the exclusion to the
+    // member's CURRENT tier only, and resolve that tier identically to
+    // isEligibleForPackageVoucher (currentaccttype, falling back to accttype when
+    // currentaccttype is 0/NULL) so a candidate shown here is never refused by the
+    // grant itself.
+    filters.push(
+      `NOT EXISTS (
+         SELECT 1 FROM voucherstab v
+          WHERE v.uid = u.uid
+            AND v.package_type = COALESCE(NULLIF(u.currentaccttype, 0), u.accttype)
+       )`
+    );
   }
 
   const whereSql = `WHERE ${filters.join(' AND ')}`;
@@ -1692,6 +1783,9 @@ async function grantVouchersToExistingMembers() {
 
 module.exports = {
   issueVoucher,
+  hasVoucherForPackage,
+  isEligibleForPackageVoucher,
+  issuePackageVoucher,
   getVouchers,
   redeemVoucher,
   getVoucherTransactions,

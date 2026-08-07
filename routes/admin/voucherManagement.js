@@ -2,21 +2,26 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
+const { idempotent } = require('../../middleware/idempotency');
 const { getAccountTypeName } = require('../../utils/helpers');
 const {
-  PACKAGE_AMOUNTS,
   buildVoucherExpiryLabel,
   createManualVoucherAvailment,
   grantVouchersToExistingMembers,
   getVoucherExpiryMode,
   getVoucherAvailmentById,
   getVoucherAvailments,
+  isEligibleForPackageVoucher,
+  issuePackageVoucher,
   listVoucherGrantCandidates,
   markVoucherAvailmentClaimed,
   updateManualVoucherAvailment,
-  UNUSED_VOUCHER_EXPIRY_MONTHS,
 } = require('../../services/voucher');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
+
+// Hard cap on a single grant batch — bounds worst-case connection/transaction fan-out
+// per request and gives a clear 400 instead of a slow/huge silent loop.
+const MAX_GRANT_BATCH_SIZE = 500;
 
 async function ensureVoucherTables() {
   await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
@@ -476,79 +481,134 @@ router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, r
 });
 
 /**
- * POST /api/admin/voucher-management/grant
+ * Boundary validation for the grant batch: `uids` must be a non-empty array of
+ * strictly positive integers (no numeric strings, no floats, no NaN), capped at
+ * MAX_GRANT_BATCH_SIZE. ANY invalid element rejects the WHOLE request with 400 —
+ * fail closed rather than silently dropping bad entries (money-integrity rule 3).
+ * Returns { error } on failure, { uids } (deduped preserved-order) on success.
  */
-router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  const connection = await pool.getConnection();
+function validateGrantUids(rawUids) {
+  if (!Array.isArray(rawUids) || rawUids.length === 0) {
+    return { error: 'At least one UID is required' };
+  }
+
+  if (rawUids.length > MAX_GRANT_BATCH_SIZE) {
+    return { error: `Too many UIDs in one request — max ${MAX_GRANT_BATCH_SIZE}` };
+  }
+
+  const uids = [];
+  for (const raw of rawUids) {
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+      return { error: `Invalid UID in request: ${JSON.stringify(raw)}` };
+    }
+    uids.push(raw);
+  }
+
+  return { uids };
+}
+
+/**
+ * POST /api/admin/voucher-management/grant
+ *
+ * Additive, per-uid grant using the shared eligibility/issue helpers so this
+ * admin path can never diverge from the automatic upgrade-grant path. Each uid
+ * is checked and inserted in its OWN connection + transaction so one bad uid in
+ * a batch can never roll back or block the others. Never UPDATE/DELETE
+ * voucherstab here — grants are INSERT-only, existing rows are left untouched.
+ */
+router.post('/grant', adminAuth, adminRights([1, 2, 3]), idempotent('admin.voucherManagement.grant'), async (req, res) => {
+  const validation = validateGrantUids(req.body?.uids);
+  if (validation.error) {
+    return res.status(400).json({ error: validation.error });
+  }
 
   try {
     await ensureVoucherGrantTables();
-
-    const uids = Array.isArray(req.body?.uids)
-      ? req.body.uids.map((uid) => Number(uid)).filter((uid) => Number.isFinite(uid) && uid > 0)
-      : [];
-
-    if (uids.length === 0) {
-      return res.status(400).json({ error: 'At least one UID is required' });
-    }
-
-    await connection.beginTransaction();
-
-    let granted = 0;
-    let skippedCount = 0;
-
-    for (const uid of uids) {
-      const [existing] = await connection.query(
-        'SELECT id FROM voucherstab WHERE uid = ? LIMIT 1',
-        [uid]
-      );
-
-      if (existing.length > 0) {
-        skippedCount += 1;
-        continue;
-      }
-
-      const [accountRows] = await connection.query(
-        `SELECT currentaccttype, accttype
-         FROM usertab
-         WHERE uid = ? AND uid = mainid
-         LIMIT 1`,
-        [uid]
-      );
-
-      if (accountRows.length === 0) {
-        skippedCount += 1;
-        continue;
-      }
-
-      const accttype = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
-      const voucherAmount = Number(PACKAGE_AMOUNTS[accttype] || 0);
-      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[accttype] || 0);
-
-      if (!voucherAmount || !expiryMonths) {
-        skippedCount += 1;
-        continue;
-      }
-
-      await connection.query(
-        `INSERT INTO voucherstab
-           (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
-        [uid, accttype, voucherAmount, voucherAmount, expiryMonths]
-      );
-
-      granted += 1;
-    }
-
-    await connection.commit();
-    res.json({ success: true, granted, skippedCount });
   } catch (error) {
-    await connection.rollback();
-    console.error('[Admin Voucher Management] Grant error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  } finally {
-    connection.release();
+    console.error('[Admin Voucher Management] Grant schema check error:', error);
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Internal server error' });
   }
+
+  const results = [];
+  let granted = 0;
+  let skipped = 0;
+
+  for (const uid of validation.uids) {
+    const connection = await pool.getConnection();
+    let inTransaction = false;
+
+    try {
+      await connection.beginTransaction();
+      inTransaction = true;
+
+      // Lock the member row BEFORE the eligibility check so two concurrent
+      // grants for the SAME uid (two admins, or one admin double-tapping with
+      // different Idempotency-Keys) serialize instead of both reading "not yet
+      // granted" and both inserting a real, money-value voucher. Do not remove.
+      const [lockRows] = await connection.query(
+        'SELECT uid FROM usertab WHERE uid = ? LIMIT 1 FOR UPDATE',
+        [uid]
+      );
+
+      if (lockRows.length === 0) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({ uid, granted: false, reason: 'account_not_found', amount: null });
+        continue;
+      }
+
+      const eligibility = await isEligibleForPackageVoucher(connection, uid);
+
+      if (!eligibility?.eligible) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({
+          uid,
+          granted: false,
+          reason: eligibility?.reason || 'not_eligible',
+          amount: eligibility?.amount ?? null,
+        });
+        continue;
+      }
+
+      const insertedId = await issuePackageVoucher(connection, uid, eligibility.currentTier);
+
+      if (!insertedId) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({ uid, granted: false, reason: 'grant_failed', amount: eligibility.amount ?? null });
+        continue;
+      }
+
+      await connection.commit();
+      inTransaction = false;
+      granted += 1;
+      results.push({ uid, granted: true, reason: 'eligible', amount: eligibility.amount ?? null });
+    } catch (error) {
+      if (inTransaction) {
+        try {
+          await connection.rollback();
+        } catch (rollbackError) {
+          console.error(`[Admin Voucher Management] Grant rollback error for uid ${uid}:`, rollbackError);
+        }
+      }
+      console.error(`[Admin Voucher Management] Grant error for uid ${uid}:`, error);
+      skipped += 1;
+      results.push({ uid, granted: false, reason: 'error', amount: null });
+    } finally {
+      connection.release();
+    }
+  }
+
+  // `skippedCount` kept alongside `skipped` — the existing admin frontend
+  // (VoucherGrant.jsx) reads `res.data.skippedCount`.
+  res.json({ success: true, granted, skipped, skippedCount: skipped, results });
 });
 
 module.exports = router;
