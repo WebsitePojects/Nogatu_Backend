@@ -466,6 +466,10 @@ router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, r
       perPage: 30,
       search: String(req.query.search || '').trim(),
       includeAll: req.query.includeAll === '1' || req.query.includeAll === 'true',
+      // Visibility only. An unrecognised value falls back to the narrowest view in
+      // the service (fail closed), and no view can make a member grantable — every
+      // row carries `grantable`, and POST /grant re-checks under a row lock.
+      view: String(req.query.view || '').trim(),
     });
     res.json(result);
   } catch (error) {

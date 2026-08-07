@@ -497,17 +497,119 @@ test('the unbounded bulk grant route and helper are GONE', () => {
     'grantVouchersToExistingMembers must not be exported');
 });
 
-test('the candidate list is upgraded-only in grant mode, but NOT in the cashier includeAll lookup', () => {
-  const serviceSrc = fs.readFileSync(path.join(repoRoot, 'services', 'voucher.js'), 'utf8');
-  const start = serviceSrc.indexOf('async function listVoucherGrantCandidates');
-  assert.ok(start > -1, 'listVoucherGrantCandidates must exist');
-  const slice = serviceSrc.slice(start, start + 3000);
+// ── Candidate-list views (behavioural: capture the real generated SQL) ────
+// queryExecutor is injectable and ensureVoucherGrantTable only calls
+// assertSchemaRequirements, so the true WHERE clause can be captured without a DB.
 
-  const guardIdx = slice.indexOf('if (!safeIncludeAll)');
-  const predicateIdx = slice.indexOf("u.currentaccttype <> u.accttype");
-  assert.ok(guardIdx > -1, 'the includeAll guard must exist');
-  assert.ok(predicateIdx > -1, 'the upgraded-only predicate must exist');
-  assert.ok(predicateIdx > guardIdx,
-    'the upgraded-only predicate must sit INSIDE if (!safeIncludeAll) — includeAll is the '
-    + "cashier's member+voucher lookup (VoucherGrant.jsx) and must keep listing every member");
+const UPGRADED_PREDICATE = 'u.currentaccttype <> u.accttype';
+const CURRENT_TIER_NOT_EXISTS = /NOT EXISTS \(\s*SELECT 1 FROM voucherstab v\s+WHERE v\.uid = u\.uid\s+AND v\.package_type/;
+const ANY_VOUCHER_NOT_EXISTS = 'NOT EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)';
+const ANY_VOUCHER_EXISTS = 'EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)';
+
+function loadVoucherServiceForList() {
+  const servicePath = path.join(repoRoot, 'services', 'voucher.js');
+  delete require.cache[servicePath];
+  return withStubbedModules({
+    [path.join(repoRoot, 'config', 'database.js')]: {
+      pool: { query: async () => [[]], getConnection: async () => ({}) },
+    },
+    [path.join(repoRoot, 'services', 'schemaReadiness.js')]: {
+      SCHEMA_REQUIREMENTS: { VOUCHER_GRANTS: 'VOUCHER_GRANTS' },
+      assertSchemaRequirements: async () => {},
+      assertSchemaReadyOnce: async () => {},
+    },
+  }, () => require(servicePath));
+}
+
+function makeCapturingExecutor({ dataRows = [], voucherRows = [] } = {}) {
+  const sqls = [];
+  return {
+    sqls,
+    get dataSql() { return sqls.find((s) => /AS is_upgraded/i.test(s))  || ''; },
+    get whereSql() { return sqls.find((s) => /COUNT\(\*\) AS total/i.test(s)) || ''; },
+    async query(sql) {
+      sqls.push(sql);
+      if (/COUNT\(\*\) AS total/i.test(sql)) return [[{ total: dataRows.length }]];
+      if (/FROM voucherstab\s+WHERE uid IN/i.test(sql)) return [voucherRows];
+      return [dataRows];
+    },
+  };
+}
+
+async function listWithView(view, opts = {}) {
+  const { listVoucherGrantCandidates } = loadVoucherServiceForList();
+  const executor = makeCapturingExecutor(opts);
+  const result = await listVoucherGrantCandidates({ view, queryExecutor: executor, ...opts.args });
+  return { result, executor, where: executor.whereSql };
+}
+
+test('needs_voucher (default view) applies BOTH the upgraded predicate and the current-tier exclusion', async () => {
+  const { where } = await listWithView(undefined);
+  assert.ok(where.includes(UPGRADED_PREDICATE), 'must be upgraded-only');
+  assert.match(where, CURRENT_TIER_NOT_EXISTS, 'must exclude an existing current-tier voucher');
+});
+
+test('no_voucher view lists members with no voucher at all and is NOT upgraded-filtered', async () => {
+  const { where } = await listWithView('no_voucher');
+  assert.ok(where.includes(ANY_VOUCHER_NOT_EXISTS), 'must filter to members with no voucher row');
+  assert.ok(!where.includes(UPGRADED_PREDICATE),
+    'no_voucher is a LOOKUP view — it must not hide non-upgraded members');
+});
+
+test('has_voucher view lists members holding a voucher', async () => {
+  const { where } = await listWithView('has_voucher');
+  assert.ok(where.includes(ANY_VOUCHER_EXISTS));
+  assert.ok(!where.includes(UPGRADED_PREDICATE));
+});
+
+test('all view and the cashier includeAll lookup apply no voucher/upgrade filter at all', async () => {
+  const { where: allWhere } = await listWithView('all');
+  assert.ok(!allWhere.includes(UPGRADED_PREDICATE));
+  assert.ok(!allWhere.includes(ANY_VOUCHER_NOT_EXISTS));
+
+  // includeAll must keep meaning "show everyone" — the cashier lookup depends on it.
+  const { where: cashierWhere } = await listWithView(undefined, { args: { includeAll: true } });
+  assert.ok(!cashierWhere.includes(UPGRADED_PREDICATE),
+    'includeAll is the cashier member+voucher lookup and must list every member');
+});
+
+test('an unrecognised view falls back to needs_voucher (fails closed, never to `all`)', async () => {
+  for (const bogus of ['everyone', '', 'ALL; DROP', null, 42]) {
+    const { where } = await listWithView(bogus);
+    assert.ok(where.includes(UPGRADED_PREDICATE),
+      `view=${JSON.stringify(bogus)} must fall back to the narrowest view`);
+  }
+});
+
+test('grantable mirrors the two POST /grant refusals, per row', async () => {
+  const dataRows = [
+    { uid: 1, currentaccttype: 20, accttype: 10, username: 'upgraded', is_upgraded: 1, has_current_tier_voucher: 0 },
+    { uid: 2, currentaccttype: 10, accttype: 10, username: 'legacy', is_upgraded: 0, has_current_tier_voucher: 0 },
+    { uid: 3, currentaccttype: 20, accttype: 10, username: 'alreadyGranted', is_upgraded: 1, has_current_tier_voucher: 1 },
+  ];
+  const { result } = await listWithView('all', { dataRows });
+  const byName = Object.fromEntries(result.users.map((u) => [u.username, u]));
+
+  assert.equal(byName.upgraded.grantable, true);
+  assert.equal(byName.upgraded.notGrantableReason, null);
+  assert.equal(byName.legacy.grantable, false);
+  assert.equal(byName.legacy.notGrantableReason, 'not_upgraded');
+  assert.equal(byName.alreadyGranted.grantable, false);
+  assert.equal(byName.alreadyGranted.notGrantableReason, 'already_has_voucher_for_current_tier');
+});
+
+test('REGRESSION: an upgraded member holding a SPENT lower-tier voucher stays grantable', async () => {
+  // The SeniorDelia case. Voucher rows are now fetched for every view, so hasVoucher
+  // is TRUE for her — if selection ever keys on hasVoucher instead of grantable, the
+  // checkbox disables on exactly the member this feature exists to serve.
+  const dataRows = [
+    { uid: 77, currentaccttype: 20, accttype: 10, username: 'SeniorDelia', is_upgraded: 1, has_current_tier_voucher: 0 },
+  ];
+  const voucherRows = [{ uid: 77, id: 501, remaining_balance: 0, status: 3 }];
+  const { result } = await listWithView('needs_voucher', { dataRows, voucherRows });
+  const row = result.users[0];
+
+  assert.equal(row.hasVoucher, true, 'she does hold a (spent, lower-tier) voucher');
+  assert.equal(row.grantable, true, 'and she must still be grantable for her NEW tier');
+  assert.equal(row.notGrantableReason, null);
 });

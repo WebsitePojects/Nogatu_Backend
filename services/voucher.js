@@ -1538,17 +1538,45 @@ async function getGrantEligibleMembers(page = 1, perPage = 30, search = '') {
   return listVoucherGrantCandidates({ page, perPage, search, includeAll: false });
 }
 
+/**
+ * Which members the grant list DISPLAYS. This is a visibility filter only — it never
+ * widens who may receive a voucher. Every row carries `grantable`, and POST /grant
+ * re-checks the same two conditions under a row lock.
+ *
+ *  needs_voucher — upgraded AND missing a voucher for the current tier (the only
+ *                  view whose rows are grantable). Default.
+ *  no_voucher    — holds no voucher row at all. Mostly the ~7,100 members who
+ *                  predate the voucher feature (2026-06-10); view-only.
+ *  has_voucher   — holds at least one voucher.
+ *  all           — everyone. What `includeAll` (cashier lookup) maps to.
+ */
+const VOUCHER_GRANT_VIEWS = {
+  NEEDS_VOUCHER: 'needs_voucher',
+  NO_VOUCHER: 'no_voucher',
+  HAS_VOUCHER: 'has_voucher',
+  ALL: 'all',
+};
+const VOUCHER_GRANT_VIEW_VALUES = Object.values(VOUCHER_GRANT_VIEWS);
+
 async function listVoucherGrantCandidates({
   page = 1,
   perPage = 30,
   search = '',
   includeAll = false,
+  view = VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER,
   queryExecutor = pool,
 } = {}) {
   await ensureVoucherGrantTable();
 
   const pager = new TableQueryPager(queryExecutor);
   const safeIncludeAll = includeAll === true || includeAll === '1' || includeAll === 'true';
+  // `view` decides only what is VISIBLE. What may be GRANTED is decided per row by
+  // `grantable` below and re-checked server-side in POST /grant — switching views can
+  // never widen who can receive a voucher. Unknown values fall back to the narrowest
+  // view (fail closed), and legacy `includeAll` keeps meaning "show everything".
+  const safeView = safeIncludeAll
+    ? VOUCHER_GRANT_VIEWS.ALL
+    : (VOUCHER_GRANT_VIEW_VALUES.includes(view) ? view : VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER);
   const filters = [
     'u.uid = u.mainid',
     'u.currentaccttype IN (10,20,30,40,50,60)',
@@ -1562,7 +1590,16 @@ async function listVoucherGrantCandidates({
     params.push(like, like, like, like);
   }
 
-  if (!safeIncludeAll) {
+  if (safeView === VOUCHER_GRANT_VIEWS.NO_VOUCHER) {
+    // VIEW ONLY. Members holding no voucher row at all — overwhelmingly the ~7,100
+    // who predate the voucher feature (2026-06-10). They are shown so an admin can
+    // look someone up, and are returned with grantable=false / not_upgraded unless
+    // they also upgraded. Backfilling them is a business decision (₱40,755,000 on
+    // prod 2026-08-07), never an admin click.
+    filters.push('NOT EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
+  } else if (safeView === VOUCHER_GRANT_VIEWS.HAS_VOUCHER) {
+    filters.push('EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
+  } else if (safeView === VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER) {
     // Vouchers are additive per package TIER (see isEligibleForPackageVoucher above),
     // not a one-time-ever grant. Excluding "has ANY voucher row" would hide members
     // who fully used an older-tier voucher and later upgraded (e.g. SeniorDelia:
@@ -1588,8 +1625,10 @@ async function listVoucherGrantCandidates({
     // is a business decision, not an admin click; it must never be reachable by
     // paging through this list. MUST stay in lockstep with the `not_upgraded`
     // refusal in POST /grant, or the list offers members the grant then refuses
-    // them. Applied only in candidate mode — `includeAll` is the cashier's
-    // member+voucher LOOKUP (VoucherGrant.jsx:68) and must keep showing everyone.
+    // them. Applied only in the NEEDS_VOUCHER view — the other views are lookups
+    // (and `includeAll` is the cashier's member+voucher LOOKUP,
+    // VoucherGrant.jsx:68), where non-qualifying rows are shown but carry
+    // grantable=false rather than being hidden.
     filters.push('u.currentaccttype <> u.accttype');
   }
 
@@ -1602,9 +1641,21 @@ async function listVoucherGrantCandidates({
                INNER JOIN memberstab m ON m.uid = u.uid
                ${whereSql}`,
     countParams: params,
+    // is_upgraded / has_current_tier_voucher are the row-level mirror of the two
+    // conditions POST /grant re-checks (`not_upgraded` and
+    // `already_has_voucher_for_current_tier`). They are selected for EVERY view so a
+    // lookup view can show WHY a member cannot be granted instead of silently
+    // offering a grant the server will refuse. Keep the tier resolution identical to
+    // isEligibleForPackageVoucher.
     dataSql: `SELECT u.uid, u.currentaccttype, u.accttype,
                      DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg,
-                     m.username, m.firstname, m.lastname
+                     m.username, m.firstname, m.lastname,
+                     (u.currentaccttype <> u.accttype) AS is_upgraded,
+                     EXISTS (
+                       SELECT 1 FROM voucherstab v
+                        WHERE v.uid = u.uid
+                          AND v.package_type = COALESCE(NULLIF(u.currentaccttype, 0), u.accttype)
+                     ) AS has_current_tier_voucher
               FROM usertab u
               INNER JOIN memberstab m ON m.uid = u.uid
               ${whereSql}
@@ -1612,8 +1663,13 @@ async function listVoucherGrantCandidates({
     dataParams: params,
   });
 
+  // Fetched for every view (not just includeAll) so lookup views can show voucher
+  // status. NOTE: this makes `hasVoucher` true for an upgraded member holding a
+  // SPENT lower-tier voucher (the SeniorDelia case), so selection must key on
+  // `grantable`, never on `hasVoucher` — the latter would disable the checkbox on
+  // exactly the members this tool exists to serve.
   let voucherRowsByUid = new Map();
-  if (safeIncludeAll && pageResult.rows.length > 0) {
+  if (pageResult.rows.length > 0) {
     voucherRowsByUid = await pager.fetchByKeys({
       rows: pageResult.rows,
       rowKey: 'uid',
@@ -1645,8 +1701,20 @@ async function listVoucherGrantCandidates({
       const uid = Number(row.uid);
       const accttype = Number(row.currentaccttype || row.accttype || 0);
       const voucherRow = voucherRowsByUid.get(uid) || null;
+      // Mirrors POST /grant's two refusals, in the same order, so the UI's reason
+      // matches the server's. `grantable` is a UI affordance only — the route
+      // re-checks both conditions under a row lock and is the actual guard.
+      const isUpgraded = Boolean(Number(row.is_upgraded || 0));
+      const hasCurrentTierVoucher = Boolean(Number(row.has_current_tier_voucher || 0));
+      const notGrantableReason = !isUpgraded
+        ? 'not_upgraded'
+        : (hasCurrentTierVoucher ? 'already_has_voucher_for_current_tier' : null);
       return {
         uid,
+        isUpgraded,
+        hasCurrentTierVoucher,
+        grantable: notGrantableReason === null,
+        notGrantableReason,
         username: row.username,
         firstname: row.firstname,
         lastname: row.lastname,
@@ -1709,6 +1777,7 @@ module.exports = {
   getAllVouchers,
   getGrantEligibleMembers,
   listVoucherGrantCandidates,
+  VOUCHER_GRANT_VIEWS,
   ensureVoucherGrantTable,
   ensureVoucherTable,
   ensureVoucherTxTable,
