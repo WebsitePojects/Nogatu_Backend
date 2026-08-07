@@ -1652,6 +1652,11 @@ async function listVoucherGrantCandidates({
         lastname: row.lastname,
         fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
         accttype,
+        // Joining package. In candidate mode every row is an UPGRADED member
+        // (joinedAccttype !== accttype is exactly why they qualify), so the UI can
+        // show "joined as X, now Y" and make the list's scope self-evident instead
+        // of leaving an admin to guess why someone is missing from it.
+        joinedAccttype: Number(row.accttype || 0),
         voucherAmount: Number(PACKAGE_AMOUNTS[accttype] || 0),
         datereg: row.datereg,
         hasVoucher: Boolean(voucherRow),
