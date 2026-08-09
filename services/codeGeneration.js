@@ -29,6 +29,58 @@ const PRODUCT_CONFIG = {
 
 // Code type prefixes
 const CODE_PREFIXES = { 1: 'PD', 2: 'FS', 3: 'CD' };
+
+const CODE_TYPE_PAID = 1;
+const CODE_TYPE_FREE_SLOT = 2;
+const CODE_TYPE_CD = 3;
+const VALID_CODE_TYPES = [CODE_TYPE_PAID, CODE_TYPE_FREE_SLOT, CODE_TYPE_CD];
+
+/**
+ * CD Slot is restricted to GOLD (30) and PLATINUM (40) — management decision
+ * 2026-08-08. A CD code creates a standing 25% encashment-deduction obligation
+ * sized to the package (`cdamount`), so issuing one against a tier or a
+ * maintenance product outside this list creates an obligation the comp plan does
+ * not define, on a member who can then never clear it.
+ *
+ * Enforced server-side because the Generate Codes form is a convenience: the
+ * route accepts a JSON body, so hiding the option in the UI restricts nothing.
+ */
+const CD_ELIGIBLE_PRODUCT_TYPES = [30, 40];
+
+function isCdEligibleProductType(productType) {
+  return CD_ELIGIBLE_PRODUCT_TYPES.includes(Number(productType));
+}
+
+/**
+ * Boundary validation for a code-generation request. FAILS CLOSED: an unknown
+ * product type or code type is rejected, never defaulted (money-integrity rule 3).
+ * @returns {{ valid: true } | { valid: false, error: string }}
+ */
+function validateCodeGenerationRequest(productType, codeType) {
+  const type = Number(productType);
+  const kind = Number(codeType);
+
+  if (!Number.isInteger(type) || !PRODUCT_CONFIG[type]) {
+    return { valid: false, error: `Unknown product type: ${productType}` };
+  }
+
+  if (!Number.isInteger(kind) || !VALID_CODE_TYPES.includes(kind)) {
+    return { valid: false, error: `Unknown code type: ${codeType}` };
+  }
+
+  if (kind === CODE_TYPE_CD && !isCdEligibleProductType(type)) {
+    const allowed = CD_ELIGIBLE_PRODUCT_TYPES
+      .map((t) => PRODUCT_CONFIG[t]?.name || t)
+      .join(' and ');
+    return {
+      valid: false,
+      error: `CD Slot is only available for ${allowed}. `
+        + `"${PRODUCT_CONFIG[type].name}" cannot be issued as a CD code.`,
+    };
+  }
+
+  return { valid: true };
+}
 const PACKAGE_ABBREVIATIONS = {
   10: 'BR',
   20: 'SI',
@@ -79,6 +131,15 @@ function normalizeAdminContext(adminContext) {
 }
 
 async function generateCodes(noOfCodes, productType, codeType, stockistId, adminContext) {
+  // Re-validated here, not only at the route, so no future caller can bypass the
+  // CD restriction by reaching the generator directly.
+  const validation = validateCodeGenerationRequest(productType, codeType);
+  if (!validation.valid) {
+    const error = new Error(validation.error);
+    error.code = 'INVALID_CODE_GENERATION_REQUEST';
+    throw error;
+  }
+
   const normalizedAdmin = normalizeAdminContext(adminContext);
   // Get current max ID from codestab
   const [maxRows] = await pool.query('SELECT MAX(id) as maxId FROM codestab');
@@ -169,6 +230,10 @@ async function codeInsert(code, productType, codeType, stockistId, adminContext)
 
 module.exports = {
   generateCodes,
+  validateCodeGenerationRequest,
+  isCdEligibleProductType,
+  CD_ELIGIBLE_PRODUCT_TYPES,
+  VALID_CODE_TYPES,
   PRODUCT_CONFIG,
   CODE_PREFIXES,
   PACKAGE_ABBREVIATIONS,

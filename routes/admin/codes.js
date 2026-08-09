@@ -7,7 +7,7 @@ const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
 const { idempotent } = require('../../middleware/idempotency');
-const { generateCodes } = require('../../services/codeGeneration');
+const { generateCodes, validateCodeGenerationRequest } = require('../../services/codeGeneration');
 const { PRODUCT_TYPES } = require('../../utils/helpers');
 const { sanitizeAlphaNum } = require('../../utils/helpers');
 const { createProcessKey } = require('../../utils/security');
@@ -85,6 +85,14 @@ router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     if (!noOfCodes || noOfCodes < 1 || noOfCodes > 1000) {
       return res.status(400).json({ error: 'Number of codes must be 1-1000' });
+    }
+
+    // productType/codeType were previously passed straight to the generator with no
+    // validation at all. Validate at the boundary and fail closed: an unknown product
+    // or code type, or CD Slot against anything other than Gold/Platinum, is a 400.
+    const validation = validateCodeGenerationRequest(productType, codeType);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
     }
 
     const codes = await generateCodes(
