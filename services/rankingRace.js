@@ -316,8 +316,15 @@ function computeRankAwardsFromEvents({
     const counts = subtreeQualifiedRankCounts[rankNo] || {};
     const leftQualifiedCount  = toNumber(counts.leftQualifiedCount);
     const rightQualifiedCount = toNumber(counts.rightQualifiedCount);
-    const leftRequirementMet  = toNumber(definition.left_rank_required)  <= 0 || leftQualifiedCount  > 0;
-    const rightRequirementMet = toNumber(definition.right_rank_required) <= 0 || rightQualifiedCount > 0;
+    // Compare against the REQUIRED count, not merely > 0. Supervisor 2 requires 1 per leg,
+    // so `> 0` happened to be equivalent there — but Supervisor 3 requires 2, Manager 1
+    // requires 3, and so on, and `> 0` would have awarded every one of them off a SINGLE
+    // qualified downline per leg. The display path (buildRaceState below) already used
+    // `>= required`, so the gate and the progress UI disagreed for every rank above 2.
+    const leftRankRequired    = toNumber(definition.left_rank_required);
+    const rightRankRequired   = toNumber(definition.right_rank_required);
+    const leftRequirementMet  = leftQualifiedCount  >= leftRankRequired;
+    const rightRequirementMet = rightQualifiedCount >= rightRankRequired;
     if (!leftRequirementMet || !rightRequirementMet) break;
 
     const availablePoints = remainingEvents.reduce((sum, e) => sum + toNumber(e.remainingPoints), 0);
