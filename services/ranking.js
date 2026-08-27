@@ -105,12 +105,30 @@ function toNumber(value) {
   return Number(value || 0);
 }
 
+// Format a JS Date as a MySQL DATETIME **in the server's local timezone**.
+//
+// The pool sets no mysql2 `timezone` option, so mysql2 defaults to 'local' and parses
+// DATETIME columns into JS Dates using the server's zone (this box runs Manila, UTC+8).
+// Re-emitting such a Date with toISOString() writes the same INSTANT as UTC, which
+// silently shifts the stored wall-clock by -8h on every DB -> JS -> DB round-trip.
+// rank_date makes that trip twice (transdate -> achieved_at -> rank_date), which is why
+// ranks were stamped 16h BEFORE the repurchase that earned them (uid 6499134: crossing
+// event 2026-08-27 10:38:16 -> rank_date 2026-08-26 18:38:16). Formatting from the local
+// getters keeps the wall-clock intact, so it matches repurchasetab.transdate, which is
+// written by MySQL NOW() (= Manila).
+//
+// NOTE: utils/helpers.nowMySQL() deliberately stores UTC (see the TIMEZONE block in
+// services/income/encashmentWindow.js, whose week math depends on it). That is a separate,
+// documented convention for "now" stamps — do NOT unify the two without the MED-3
+// canonical-clock pass. This function only round-trips values that are ALREADY Manila.
 function toMysqlDateTime(value) {
   if (!value) return null;
   if (typeof value === 'string') return value.replace('T', ' ').replace('Z', '');
-  const date = new Date(value);
+  const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return date.toISOString().slice(0, 19).replace('T', ' ');
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+       + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 // mysql2 returns DATETIME columns as JS Date objects, so String(date) produces
@@ -438,7 +456,9 @@ async function insertAchievementAward(memberUid, award, definitionByRank, grossR
   const definition   = definitionByRank.get(toNumber(award.rank));
   const achievementUid = createPublicId();
   const sequenceId   = await nextSequenceId(conn);
-  const achievedAt   = toMysqlDateTime(award.achievedAt) || nowMySQL();
+  // Fallback must use the SAME clock as toMysqlDateTime above — nowMySQL() is UTC by
+  // convention and would stamp this award 8h behind every other achieved_at.
+  const achievedAt   = toMysqlDateTime(award.achievedAt) || toMysqlDateTime(new Date());
   const lastConsumption = award.consumptionRows[award.consumptionRows.length - 1] || null;
   const remainingAfterAward = Math.max(0, toNumber(award.remainingRankablePointsAfterAward));
 
