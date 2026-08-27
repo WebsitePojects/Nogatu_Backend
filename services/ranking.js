@@ -636,6 +636,17 @@ function applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, a
     canReleaseRankAchievementForPackage(packageType, a.rank)
   );
   const effectiveAchievementSummary = buildPendingAchievementSummary(filteredAchievements);
+  // The admin list view (getAllRankings) deliberately does NOT load per-member achievement
+  // rows -- that would be an N+1 across the whole leaderboard -- and instead supplies the
+  // denormalized rankingstab.pending_achievement_count on the incoming snapshot. Recompute
+  // the summary ONLY when real achievement rows were handed in; otherwise the recomputed 0
+  // clobbers a correct stored count and the board renders every ranked member as
+  // "Handed over" while their incentives are still pending_fulfillment -- i.e. it asserts
+  // that cash + a motorcycle + a laptop were physically handed over when nothing was.
+  // Note this keys on `achievements`, not `filteredAchievements`: if rows WERE supplied but
+  // the package gate filtered them all out, 0 is the correct answer and must not be
+  // replaced by the stored count.
+  const achievementRowsSupplied = Array.isArray(achievements) && achievements.length > 0;
   const effectiveCurrentRankFromAchievements = filteredAchievements.length > 0
     ? Math.max(...filteredAchievements.map((a) => toNumber(a.rank)))
     : 0;
@@ -669,8 +680,12 @@ function applyPackageRankingGateToSnapshot(snapshot, packageType, definitions, a
     upgradeRequiredPackageType:  null,
     upgradeRequiredPackageLabel: null,
     achievements:              filteredAchievements,
-    pendingAchievementCount:   effectiveAchievementSummary.pendingCount,
-    nextPendingRank:           effectiveAchievementSummary.nextPendingRank,
+    pendingAchievementCount:   achievementRowsSupplied
+      ? effectiveAchievementSummary.pendingCount
+      : toNumber(snapshot.pendingAchievementCount),
+    nextPendingRank:           achievementRowsSupplied
+      ? effectiveAchievementSummary.nextPendingRank
+      : (snapshot.nextPendingRank || null),
     rankDefinitions:           effectiveDefinitions,
   };
 }
@@ -1550,6 +1565,7 @@ async function processIncentive(uid, options = {}) {
 module.exports = {
   ensureRankingTable,
   toMysqlDateTime,
+  applyPackageRankingGateToSnapshot, // exported for unit tests (pure display transform)
   dateSortValue,
   getRankDefinitions,
   getLatestPairingSnapshot,
