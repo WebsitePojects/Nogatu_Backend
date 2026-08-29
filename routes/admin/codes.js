@@ -38,6 +38,42 @@ function firstRowByCode(rows, codeField = 'code') {
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Status filter values accepted by the admin list/export. `transferred` is DERIVED
+// (codestab has no such column) and deliberately OVERLAPS the codestatus values:
+// a code can be Released-and-transferred or Used-and-transferred. It is offered as
+// its own filter option, and the row payload carries a separate `transferred` flag,
+// so the base status is never replaced by transfer history -- consumption state
+// (Used) must stay visible on a money-adjacent screen.
+const CODE_STATUS_FILTERS = new Set(['all', 'not_released', 'released', 'used', 'transferred']);
+const DEFAULT_CODES_PER_PAGE = 40;
+const MAX_CODES_PER_PAGE = 500;
+const TRANSFER_EVENT_TYPES = ['transfer', 'admin_transfer'];
+
+// Which tables can evidence a transfer, probed once per process. tableExists() runs a
+// SHOW TABLES, and the status filter is on the request path for both the list and the
+// export -- an uncached schema probe per request is exactly the cost pattern that made
+// the ranking rebuild slow (see .claude/rules/lessons.md 2026-08-06).
+let transferSourcesPromise = null;
+function getTransferSources() {
+  if (!transferSourcesPromise) {
+    transferSourcesPromise = (async () => ({
+      legacy: await tableExists('codehistorytab'),
+      usage: await tableExists('activation_code_usagetab'),
+    }))().catch((err) => {
+      transferSourcesPromise = null; // don't cache a failure
+      throw err;
+    });
+  }
+  return transferSourcesPromise;
+}
+
+class InvalidCodeStatusFilterError extends Error {
+  constructor(value) {
+    super(`Unknown status filter: ${value}`);
+    this.name = 'InvalidCodeStatusFilterError';
+  }
+}
+
 /**
  * Shared WHERE builder for the code list/count/export. All conditions use the
  * `c.` alias (codestab AS c), so every caller must alias codestab as c.
@@ -45,8 +81,12 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
  * exactly), owner (holder username LIKE), dateFrom/dateTo (c.dategen window,
  * inclusive, validated as YYYY-MM-DD to reject junk).
  * Cashier (rights=2) is still capped at codestatus <= 1.
+ * status: all | not_released | released | used | transferred. Unknown values are
+ * REJECTED, never silently ignored -- an unrecognised filter that fell through to
+ * "all" would show an admin more codes than they asked for and look like a match.
+ * Async because `transferred` must know which transfer-evidence tables exist.
  */
-function buildCodeFilter(req, adminRight) {
+async function buildCodeFilter(req, adminRight) {
   const conds = [adminRight === 2 ? 'c.codestatus <= 1' : 'c.codestatus <= 2'];
   const params = [];
   const q = (req.query.q || '').trim();
@@ -70,6 +110,32 @@ function buildCodeFilter(req, adminRight) {
   }
   if (ISO_DATE.test(dateFrom)) { conds.push('c.dategen >= ?'); params.push(`${dateFrom} 00:00:00`); }
   if (ISO_DATE.test(dateTo)) { conds.push('c.dategen < DATE_ADD(?, INTERVAL 1 DAY)'); params.push(dateTo); }
+
+  const status = (req.query.status || 'all').trim().toLowerCase();
+  if (!CODE_STATUS_FILTERS.has(status)) throw new InvalidCodeStatusFilterError(status);
+  if (status === 'not_released') conds.push('c.codestatus = 0');
+  else if (status === 'released') conds.push('c.codestatus = 1');
+  else if (status === 'used') conds.push('c.codestatus = 2');
+  else if (status === 'transferred') {
+    // Two independent sources of truth: the legacy codehistorytab (pre-Node transfers)
+    // and Node-era usage events. Both are single indexed-equality EXISTS probes, NOT a
+    // correlated subquery carrying a JOIN/OR/CAST -- that shape is what degraded the
+    // voucher search (lessons.md 2026-07-22). Needs an index on codehistorytab.code.
+    const sources = await getTransferSources();
+    const parts = [];
+    if (sources.legacy) {
+      parts.push('EXISTS (SELECT 1 FROM codehistorytab h WHERE h.code = c.code)');
+    }
+    if (sources.usage) {
+      parts.push(
+        'EXISTS (SELECT 1 FROM activation_code_usagetab a WHERE a.code = c.code'
+        + ` AND a.event_type IN (${TRANSFER_EVENT_TYPES.map(() => '?').join(', ')}))`
+      );
+      params.push(...TRANSFER_EVENT_TYPES);
+    }
+    // Neither table present: fail CLOSED (match nothing) rather than matching everything.
+    conds.push(parts.length > 0 ? `(${parts.join(' OR ')})` : '1 = 0');
+  }
 
   return { whereSql: `WHERE ${conds.join(' AND ')}`, params };
 }
@@ -121,12 +187,15 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 40));
+    // Management asked for a custom row count instead of the fixed 40/100 toggle.
+    // Still bounded: every listed page fans out into 4 enrichment queries with an
+    // IN-list of that many codes, and the response is rendered/printed in one go.
+    const perPage = Math.min(MAX_CODES_PER_PAGE, Math.max(1, Number(req.query.perPage) || DEFAULT_CODES_PER_PAGE));
     const offset = (page - 1) * perPage;
 
     // Cashier (rights=2) capped at codestatus <= 1; shared filter adds the
     // optional q / owner / dateFrom / dateTo conditions.
-    const { whereSql, params: whereParams } = buildCodeFilter(req, adminRight);
+    const { whereSql, params: whereParams } = await buildCodeFilter(req, adminRight);
 
     const [countRows] = await pool.query(
       `SELECT COUNT(*) as total FROM codestab c ${whereSql}`,
@@ -190,7 +259,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
            LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
            LEFT JOIN memberstab fm ON fm.uid = a.from_uid
            LEFT JOIN memberstab tm ON tm.uid = a.to_uid
-           WHERE a.event_type = 'admin_transfer'
+           WHERE a.event_type IN ('transfer', 'admin_transfer')
              AND a.code IN (${codePlaceholders})
            ORDER BY a.id DESC`,
           pageCodes
@@ -255,6 +324,10 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
         transferHistory,
         lastTransferDate: legacyHistory?.datetransfer || transferAudit?.created_at || null,
         lastReleaseDate: releaseAudit?.created_at || null,
+        // Derived, and INDEPENDENT of codestatus -- a code can be Used AND transferred.
+        // The UI shows this as an extra marker beside the base status, never instead of
+        // it, so consumption state is not hidden by transfer history.
+        transferred: Boolean(legacyHistory || transferAudit),
         codestatus: r.codestatus,
         statusLabel: r.codestatus === 0 ? 'Not Released' : r.codestatus === 1 ? 'Released' : 'Used',
         releasedate: r.releasedate,
@@ -264,6 +337,9 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     res.json({ codes, total, page, totalPages: Math.ceil(total / perPage) });
   } catch (err) {
+    if (err instanceof InvalidCodeStatusFilterError) {
+      return res.status(400).json({ error: err.message });
+    }
     console.error('[Admin Codes] List error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -277,7 +353,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
-    const { whereSql, params } = buildCodeFilter(req, adminRight);
+    const { whereSql, params } = await buildCodeFilter(req, adminRight);
     const MAX_ROWS = 50000;
 
     const [rows] = await pool.query(
@@ -332,6 +408,9 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
     await wb.xlsx.write(res);
     res.end();
   } catch (err) {
+    if (err instanceof InvalidCodeStatusFilterError) {
+      return res.status(400).json({ error: err.message });
+    }
     console.error('[Admin Codes] Export error:', err);
     res.status(500).json({ error: 'Failed to export activation codes' });
   }
