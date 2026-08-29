@@ -129,8 +129,27 @@ for (const pair of [['not_released', 'c.codestatus = 0'], ['released', 'c.codest
 test('status=transferred matches legacy history OR a Node-era transfer event', async () => {
   const r = await listWith({ status: 'transferred' });
   const sql = countQuery(r.queries).sql;
-  assert.match(sql, /EXISTS \(SELECT 1 FROM codehistorytab h WHERE h\.code = c\.code\)/);
+  assert.match(sql, /EXISTS \(SELECT 1 FROM codehistorytab h WHERE h\.code = c\.code AND h\.history LIKE \?\)/);
   assert.match(sql, /EXISTS \(SELECT 1 FROM activation_code_usagetab a WHERE a\.code = c\.code/);
+  // Order matters: the legacy probe binds first, then the two event types.
+  assert.deepEqual(countQuery(r.queries).params, ['%->%', 'transfer', 'admin_transfer']);
+});
+
+test('REGRESSION: the legacy probe must require a real hop, not merely a history row', async () => {
+  // codehistorytab holds ONE row per code, written when the code is RELEASED. On prod
+  // 15,354 of 24,647 rows are release-only. A bare "has a history row" test matched
+  // 24,654 of 24,889 codes (99%) -- a filter that selects everything. Only a `->` in
+  // the trail marks an actual hand-off.
+  const r = await listWith({ status: 'transferred' });
+  const sql = countQuery(r.queries).sql;
+  assert.doesNotMatch(sql, /codehistorytab h WHERE h\.code = c\.code\)/,
+    'legacy probe is unqualified: it would match every released code');
+  assert.ok(countQuery(r.queries).params.includes('%->%'),
+    'the transfer-trail separator is not bound');
+});
+
+test('the legacy hop test is dropped entirely when only the event table exists', async () => {
+  const r = await listWith({ status: 'transferred' }, { tablesPresent: ['activation_code_usagetab'] });
   assert.deepEqual(countQuery(r.queries).params, ['transfer', 'admin_transfer']);
 });
 

@@ -48,6 +48,8 @@ const CODE_STATUS_FILTERS = new Set(['all', 'not_released', 'released', 'used', 
 const DEFAULT_CODES_PER_PAGE = 40;
 const MAX_CODES_PER_PAGE = 500;
 const TRANSFER_EVENT_TYPES = ['transfer', 'admin_transfer'];
+// A code that only ever moved admin -> first holder has no separator in its trail.
+const TRANSFER_TRAIL_SEPARATOR = '->';
 
 // Which tables can evidence a transfer, probed once per process. tableExists() runs a
 // SHOW TABLES, and the status filter is on the request path for both the list and the
@@ -117,14 +119,35 @@ async function buildCodeFilter(req, adminRight) {
   else if (status === 'released') conds.push('c.codestatus = 1');
   else if (status === 'used') conds.push('c.codestatus = 2');
   else if (status === 'transferred') {
-    // Two independent sources of truth: the legacy codehistorytab (pre-Node transfers)
-    // and Node-era usage events. Both are single indexed-equality EXISTS probes, NOT a
+    // Two independent sources: the legacy codehistorytab and Node-era usage events.
+    //
+    // codehistorytab is NOT a transfer log -- it holds ONE row per code (PK on `code`)
+    // and gets that row when the code is RELEASED. On prod, 15,354 of its 24,647 rows
+    // are release-only (`(nogatuadmin)Themaker`, or just `nogatuadmin`) with no second
+    // hop. Treating "has a history row" as "was transferred" matched 24,654 of 24,889
+    // codes -- 99% -- i.e. a filter that selects everything while looking authoritative.
+    // A real hand-off always writes a `->` separator, in BOTH stored trail formats:
+    //   (nogatuadmin)Ann050890 -> (Ann050890)Malou05      <- legacy chain
+    //   tabsqui->VernieS01                                 <- Node member transfer
+    // so the arrow is what distinguishes a transfer from a release. With it the
+    // predicate matches 10,520 codes (42%), which reconciles with the 9,293 multi-hop
+    // history rows plus codes whose only transfer is a Node-era event.
+    //
+    // The event side needs no such guard: `release` is its own event_type (2,291 rows),
+    // distinct from transfer (4,310) and admin_transfer (2,409).
+    //
+    // Both are single PK-seek EXISTS probes (codehistorytab's PK is `code`), NOT a
     // correlated subquery carrying a JOIN/OR/CAST -- that shape is what degraded the
-    // voucher search (lessons.md 2026-07-22). Needs an index on codehistorytab.code.
+    // voucher search (lessons.md 2026-07-22). The LIKE runs on the one row the seek
+    // returns, so it is not a scan.
     const sources = await getTransferSources();
     const parts = [];
     if (sources.legacy) {
-      parts.push('EXISTS (SELECT 1 FROM codehistorytab h WHERE h.code = c.code)');
+      parts.push(
+        'EXISTS (SELECT 1 FROM codehistorytab h WHERE h.code = c.code'
+        + ' AND h.history LIKE ?)'
+      );
+      params.push(`%${TRANSFER_TRAIL_SEPARATOR}%`);
     }
     if (sources.usage) {
       parts.push(
