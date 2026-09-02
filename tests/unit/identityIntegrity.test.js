@@ -53,7 +53,13 @@ test('same address, dob, contact, and similar username signals do not block when
   assert.deepEqual(result.matchedSignals, []);
 });
 
-test('same first name and last name blocks registration even when other details differ', async () => {
+// INVERTED 2026-08-27. This test previously asserted the OPPOSITE: that a shared
+// first+last name blocks on its own. That rule rejected real people -- production
+// already holds 118 name groups covering 240 members, and it blocked a paid Gold
+// registration. Kept inverted rather than deleted, so reintroducing the old rule
+// fails the suite. Corroborated name matches are covered in
+// tests/unit/duplicateIdentityCorroboration.test.js.
+test('a shared first name and last name alone does NOT block registration', async () => {
   const conn = {
     query: async () => [[{
       uid: 2002,
@@ -79,9 +85,9 @@ test('same first name and last name blocks registration even when other details 
     address: 'New address',
   }, conn);
 
-  assert.equal(result.allowed, false);
-  assert.deepEqual(result.matchedSignals, ['firstname_lastname']);
-  assert.equal(result.matchedUid, 2002);
+  assert.equal(result.allowed, true, 'a name-only match must not block a different person');
+  assert.deepEqual(result.matchedSignals, []);
+  assert.equal(result.matchedUid, null);
 });
 
 test('same tin blocks registration even when first and last name differ', async () => {

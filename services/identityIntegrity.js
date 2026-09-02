@@ -147,6 +147,23 @@ function isCloseNameMatch(inputIdentity, existingIdentity) {
   return score >= 0.92;
 }
 
+// A shared name is NOT evidence of a shared identity.
+//
+// Philippine name collisions are ordinary: production already holds 118 first+last
+// name groups covering 240 members, every one of them registered legitimately.
+// Blocking on the name alone would have rejected 122 of those existing members, and
+// on 2026-08-27 it blocked a real paid Gold registration -- Ruben Abayan Ramos, whose
+// only "match" was the unrelated Ruben Dinglasan Ramos (uid 2516680), a record that
+// carries no dob, email, contact number or TIN to compare against at all.
+//
+// So an exact name match now blocks ONLY when a second, independent identifier also
+// agrees. A genuine re-registration nearly always repeats a birthday, a phone number
+// or an email; two different people who merely share a name repeat none of them.
+//
+// Address is deliberately NOT corroborating: relatives share both a surname and a
+// household, so name + address is the pairing most likely to reject two real people.
+const CORROBORATING_SIGNALS = ['tin', 'dob', 'email', 'contactno'];
+
 function matchedSignalsForCandidate(input, candidate) {
   const matched = [];
 
@@ -193,33 +210,46 @@ async function evaluateDuplicateIdentity(input, conn = pool) {
   );
 
   for (const row of rows) {
-    const existingTin = normalizeTinValue(row.tin);
     const existingFirst = normalizeNameKey(row.firstname);
     const existingLast = normalizeNameKey(row.lastname);
     const existingNameKey = [existingFirst, existingLast].filter(Boolean).join('|');
+
+    // Every independent identifier that agrees between the applicant and this row.
+    // matchedSignalsForCandidate already guards each signal on the INPUT value being
+    // non-empty, so two blank fields never count as agreeing with each other.
+    const corroborating = matchedSignalsForCandidate(input, row)
+      .filter((signal) => CORROBORATING_SIGNALS.includes(signal));
+
+    const tinMatches = corroborating.includes('tin');
+    const exactNameMatches = Boolean(inputNameKey)
+      && Boolean(existingNameKey)
+      && inputNameKey === existingNameKey;
+
+    // A TIN is a government-issued unique identifier, so it stands alone.
+    // A name needs a second identifier to agree before it blocks anyone.
+    const blockedByTin = tinMatches;
+    const blockedByName = exactNameMatches && corroborating.length > 0;
+    if (!blockedByTin && !blockedByName) continue;
+
     const matchedSignals = [];
-
-    if (normalizedTin && !isZeroTin(normalizedTin) && existingTin && !isZeroTin(existingTin) && normalizedTin === existingTin) {
-      matchedSignals.push('tin');
+    if (tinMatches) matchedSignals.push('tin');
+    if (exactNameMatches) matchedSignals.push('firstname_lastname');
+    for (const signal of corroborating) {
+      if (signal !== 'tin') matchedSignals.push(signal);
     }
 
-    if (inputNameKey && existingNameKey && inputNameKey === existingNameKey) {
-      matchedSignals.push('firstname_lastname');
-    }
-
-    if (matchedSignals.length > 0) {
-      return {
-        allowed: false,
-        matchedUid: Number(row.uid || 0),
-        normalizedName: inputNameKey,
-        matchedSignals,
-        reason: matchedSignals.includes('tin') && matchedSignals.includes('firstname_lastname')
-          ? 'tin-and-firstname-lastname-match'
-          : matchedSignals.includes('tin')
-            ? 'tin-match'
-            : 'firstname-lastname-match',
-      };
-    }
+    return {
+      allowed: false,
+      matchedUid: Number(row.uid || 0),
+      normalizedName: inputNameKey,
+      matchedSignals,
+      corroboratingSignals: corroborating,
+      reason: blockedByTin && exactNameMatches
+        ? 'tin-and-firstname-lastname-match'
+        : blockedByTin
+          ? 'tin-match'
+          : 'firstname-lastname-with-corroborating-signal-match',
+    };
   }
 
   return {
