@@ -40,9 +40,15 @@ test('registration consumes sponsor-owned activation code without reassigning ow
   // reassigns it from) a sponsor uid; the real registrant link lives in
   // activation_code_usagetab, not codestab.uid.
   assert.deepEqual(calls[0].params, ['CDQVF123']);
-  assert.deepEqual(calls[1].params, ['CDQVF123']);
-  assert.match(calls[1].sql, /codestatus = 2/i);
-  assert.doesNotMatch(calls[1].sql.split(/WHERE/i)[0], /uid\s*=\s*\?/i);
+
+  // Located rather than indexed: an already-used guard now runs between the lookup
+  // and the consuming UPDATE (services/codeConsumption.js), so a fixed position
+  // would silently start asserting against the wrong statement.
+  const consume = calls.find((c) => /UPDATE\s+codestab/i.test(c.sql));
+  assert.ok(consume, 'the consuming UPDATE must still be issued');
+  assert.deepEqual(consume.params, ['CDQVF123']);
+  assert.match(consume.sql, /codestatus = 2/i);
+  assert.doesNotMatch(consume.sql.split(/WHERE/i)[0], /uid\s*=\s*\?/i);
 });
 
 test('registration rejects activation codes that cannot be consumed for the sponsor', async () => {

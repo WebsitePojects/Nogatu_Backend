@@ -545,6 +545,14 @@ router.post('/public-register', idempotent('registration.public'), async (req, r
         field: 'username',
       });
     }
+    if (err.code === 'CODE_ALREADY_USED') {
+      return res.status(400).json({
+        error: err.message,
+        errorCode: err.code,
+        popup: true,
+        field: 'activationCode',
+      });
+    }
     res.status(400).json({ error: err.message });
   }
 });
@@ -652,6 +660,14 @@ router.post('/register', memberAuth, idempotent('registration.member'), async (r
         errorCode: err.code,
         popup: true,
         field: 'username',
+      });
+    }
+    if (err.code === 'CODE_ALREADY_USED') {
+      return res.status(400).json({
+        error: err.message,
+        errorCode: err.code,
+        popup: true,
+        field: 'activationCode',
       });
     }
     res.status(400).json({ error: err.message });

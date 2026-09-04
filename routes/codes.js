@@ -7,6 +7,7 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { idempotent } = require('../middleware/idempotency');
+const { assertCodeNotAlreadyConsumed } = require('../services/codeConsumption');
 const { sanitizeAlphaNum, nowMySQL, PRODUCT_TYPES, ACCOUNT_TYPES, CODE_PREFIXES, currentMonthRange } = require('../utils/helpers');
 const { createProcessKey, createPublicId } = require('../utils/security');
 const { appendActivationCodeUsage } = require('../services/registrationAudit');
@@ -240,6 +241,11 @@ router.post('/upgrade', memberAuth, idempotent('codes.upgrade'), async (req, res
 
     const codeData = codeRows[0];
 
+    // Same second gate as registration: a legacy code can read as available while
+    // already having been consumed. Upgrade accepts the same producttype range as
+    // registration, so the identical exposure applies here.
+    await assertCodeNotAlreadyConsumed(conn, code, codeData);
+
     // Update code status
     const [useResult] = await conn.query(
       "UPDATE codestab SET dateused = NOW(), codestatus = 2, uid = ? WHERE code = ? AND uid = ? AND codestatus = 1 LIMIT 1",
@@ -392,6 +398,9 @@ router.post('/upgrade', memberAuth, idempotent('codes.upgrade'), async (req, res
     });
   } catch (err) {
     if (conn) await conn.rollback();
+    if (err.code === 'CODE_ALREADY_USED') {
+      return res.status(400).json({ error: err.message, errorCode: err.code, popup: true, field: 'code' });
+    }
     console.error('[Codes] Upgrade error:', err);
     res.status(500).json({ error: 'Internal server error' });
   } finally {

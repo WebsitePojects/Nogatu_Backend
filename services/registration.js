@@ -13,6 +13,7 @@ const { createPublicId, createReferralSlug, createProcessKey } = require('../uti
 const { normalizeEmail, isValidEmail } = require('../utils/email');
 const { evaluateDuplicateIdentity, normalizeContactNo, normalizeDob } = require('./identityIntegrity');
 const { appendPlacementAudit, appendActivationCodeUsage } = require('./registrationAudit');
+const { assertCodeNotAlreadyConsumed } = require('./codeConsumption');
 const { getPlacementPolicyForSponsor } = require('./binaryPlacementPolicy');
 const { recommendPlacementForSponsor } = require('./placementRecommendation');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
@@ -426,6 +427,12 @@ async function consumeActivationCodeForRegistration(conn, { activationCode }) {
   );
   if (codeRows.length === 0) throw new Error('Invalid or used activation code');
   const codeData = codeRows[0];
+
+  // codestatus = 1 is not on its own proof that a code is unused. The legacy PHP
+  // registration flow stamped dateused but never advanced codestatus, leaving 28
+  // already-used codes selectable in production and letting one of them register a
+  // second account in August 2026. See services/codeConsumption.js.
+  await assertCodeNotAlreadyConsumed(conn, activationCode, codeData);
 
   const [updateResult] = await conn.query(
     `UPDATE codestab
