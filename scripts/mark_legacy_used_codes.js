@@ -29,7 +29,9 @@
  *   - each UPDATE re-asserts `codestatus = 1` AND the expected code string AND the
  *     expected owning uid, so a row that drifted since this was authorized is refused
  *     rather than overwritten
- *   - a full money snapshot is taken before and after and must match exactly
+ *   - the per-row compare-and-swap IS the guarantee. The money figures printed before
+ *     and after are a REPORT taken OUTSIDE the transaction, never a gate: two reads
+ *     inside one REPEATABLE READ transaction share one view and would prove nothing.
  *   - re-running is a no-op: already-corrected rows report `already-used` and are skipped
  *
  *   DRY-RUN: NODE_ENV=production node scripts/mark_legacy_used_codes.js
@@ -60,16 +62,21 @@ const TARGETS = [
   [5962, 'PDQMXEX7GJTF', 3596299], [5963, 'PD36G2PVBMLQ', 6099982],
 ];
 
-async function moneySnapshot(conn) {
-  const [[totals]] = await conn.query(
+// Deliberately reads on the POOL, never on the write connection. Two reads inside one
+// REPEATABLE READ transaction share a single consistent-read view, so an "after" read
+// taken there is structurally incapable of observing anything and proves nothing. These
+// run in autocommit, before the transaction opens and after it commits, so each is a
+// genuinely fresh read.
+async function moneySnapshot() {
+  const [[totals]] = await pool.query(
     `SELECT COALESCE(SUM(ttlincome1),0) i1, COALESCE(SUM(ttlincome2),0) i2,
             COALESCE(SUM(ttlincome3),0) i3, COALESCE(SUM(ttlincome4),0) i4,
             COALESCE(SUM(ttlincome5),0) i5, COALESCE(SUM(ttlincome6),0) i6,
             COALESCE(SUM(ttlcashbalance),0) cash
        FROM payouttotaltab`
   );
-  const [[hist]] = await conn.query('SELECT COUNT(*) rows_count FROM payouthistorytab');
-  const [[members]] = await conn.query(
+  const [[hist]] = await pool.query('SELECT COUNT(*) rows_count FROM payouthistorytab');
+  const [[members]] = await pool.query(
     'SELECT COUNT(*) members, COALESCE(SUM(status),0) status_sum FROM usertab'
   );
   return { ...totals, ...hist, ...members };
@@ -162,21 +169,42 @@ function describe(snap) {
       updated += 1;
     }
 
-    const after = await moneySnapshot(conn);
-    console.log(`AFTER   ${describe(after)}`);
-
-    const drift = Object.keys(before).filter((k) => String(before[k]) !== String(after[k]));
-    if (drift.length > 0) {
-      throw new Error(`money or membership moved during this run: ${drift.join(', ')}. Rolling back.`);
-    }
-    console.log('money + membership snapshot identical before and after\n');
-
     await conn.commit();
     committed = true;
     console.log(`COMMITTED: ${updated} code(s) marked Used.`);
+    // Post-commit verification. Every write this script makes is a codestatus flip on
+    // codestab, each one a compare-and-swap that already asserted affectedRows === 1 --
+    // that CAS is the real guarantee, not the figures below. This is a REPORT: on a live
+    // system other traffic commits during the run, so a difference here means concurrent
+    // member activity, not damage by this script. Investigate a difference; do not assume
+    // one cannot appear.
+    const after = await moneySnapshot();
+    console.log(`AFTER   ${describe(after)}`);
+    const drift = Object.keys(before).filter((k) => String(before[k]) !== String(after[k]));
+    console.log(drift.length === 0
+      ? 'money + membership unchanged across the run'
+      : `NOTE: concurrent activity moved ${drift.join(', ')} during the run -- `
+        + 'this script writes only codestab.codestatus, so verify the cause before assuming it is related.');
+
+    const [[check]] = await pool.query(
+      `SELECT COUNT(*) still_released FROM codestab
+        WHERE id IN (${TARGETS.map(() => '?').join(',')}) AND codestatus <> 2`,
+      TARGETS.map(([id]) => id)
+    );
+    console.log(`verification: ${check.still_released} of ${TARGETS.length} target rows are NOT status 2 `
+              + `(expected 0)`);
   } catch (err) {
     if (!committed) await conn.rollback().catch(() => {});
-    console.error(`\nFAILED, nothing committed: ${err.message}`);
+    // `committed` decides the wording. Once the commit lands the 28 rows ARE changed,
+    // and a later failure in the verification read must not report 'nothing committed' --
+    // that would send an operator to re-run a job that already succeeded.
+    console.error(committed
+      ? `
+COMMIT SUCCEEDED, but a post-commit step failed: ${err.message}
+`
+        + '  The codes ARE marked Used. Verify with the read-only query; do not re-run blindly.'
+      : `
+FAILED, nothing committed: ${err.message}`);
     process.exitCode = 1;
   } finally {
     conn.release();

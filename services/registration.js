@@ -106,8 +106,11 @@ async function releaseRegistrationAdvisoryLocks(conn, lockKeys = []) {
  */
 async function checkCode(code) {
   const [rows] = await pool.query(
+    // `AND dateused IS NULL` mirrors the consumption guard so these read-only checks
+    // cannot advertise a code that submission will refuse. It costs nothing: the column
+    // is already on the row being fetched. See services/codeConsumption.js.
     `SELECT * FROM codestab WHERE code = ? AND producttype >= 1
-     AND producttype <= 100 AND codestatus = 1`,
+     AND producttype <= 100 AND codestatus = 1 AND dateused IS NULL`,
     [code]
   );
   return rows.length >= 1 ? rows[0] : null;
@@ -118,7 +121,7 @@ async function checkCode(code) {
  */
 async function validateCode(code) {
   const [rows] = await pool.query(
-    "SELECT * FROM codestab WHERE code = ? AND codestatus = '1'",
+    "SELECT * FROM codestab WHERE code = ? AND codestatus = '1' AND dateused IS NULL",
     [code.trim()]
   );
   return rows.length === 1;
@@ -353,6 +356,7 @@ async function getAvailableCodes(sponsorUid, packageType) {
                FROM codestab
               WHERE uid = ?
                 AND codestatus = 1
+                AND dateused IS NULL
                 AND producttype BETWEEN 10 AND 60`;
 
   if (numericPackageType > 0) {

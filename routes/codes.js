@@ -463,6 +463,13 @@ router.post('/maintenance', memberAuth, idempotent('codes.maintenance'), async (
 
     const codeData = codeRows[0];
 
+    // Third consumption path. Repurchase codes cannot collide with registration
+    // codes by producttype, but the legacy defect is a STATUS defect, not a product
+    // one: any path that stamped dateused without advancing codestatus leaves the
+    // same reusable code behind, and a replayed repurchase feeds real money surfaces
+    // (the unilevel maintenance bucket and ranking points).
+    await assertCodeNotAlreadyConsumed(conn, code, codeData);
+
     // Update code status to used
     const [useResult] = await conn.query(
       "UPDATE codestab SET dateused = NOW(), codestatus = 2 WHERE code = ? AND uid = ? AND codestatus = 1 LIMIT 1",
@@ -512,6 +519,9 @@ router.post('/maintenance', memberAuth, idempotent('codes.maintenance'), async (
     res.json({ success: true, producttype: codeData.producttype });
   } catch (err) {
     if (conn) await conn.rollback();
+    if (err.code === 'CODE_ALREADY_USED') {
+      return res.status(400).json({ error: err.message, errorCode: err.code, popup: true, field: 'code' });
+    }
     console.error('[Codes] Maintenance error:', err);
     res.status(500).json({ error: 'Internal server error' });
   } finally {

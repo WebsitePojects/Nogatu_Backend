@@ -26,6 +26,13 @@ test('registration consumes sponsor-owned activation code without reassigning ow
         }]];
       }
 
+      // Answer the already-used guard explicitly. Previously this fell through to
+      // `[{ affectedRows: 1 }]`, which the guard read as "no member" only because
+      // `.length` was undefined -- an accidental pass, not a stated intent.
+      if (/membersRegistered/i.test(sql)) {
+        return [[{ membersRegistered: 0, physicalRows: 1, registeredUid: null }]];
+      }
+
       return [{ affectedRows: 1 }];
     },
   };
@@ -54,7 +61,10 @@ test('registration consumes sponsor-owned activation code without reassigning ow
 test('registration rejects activation codes that cannot be consumed for the sponsor', async () => {
   let step = 0;
   const conn = {
-    query: async () => {
+    query: async (sql) => {
+      if (/membersRegistered/i.test(sql)) {
+        return [[{ membersRegistered: 0, physicalRows: 1, registeredUid: null }]];
+      }
       step += 1;
       if (step === 1) {
         return [[{

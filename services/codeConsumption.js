@@ -18,8 +18,9 @@
  * different directions:
  *
  *   `dateused`                 - stamped by EVERY consumption path, legacy and current
- *                                (registration, upgrade, repurchase). Measured against
- *                                the production snapshot, within released codes this
+ *                                (registration, upgrade, repurchase). This evidence is
+ *                                ROW-SPECIFIC, so it is always safe. Measured against
+ *                                the production snapshot, within released codes it
  *                                matched "already tied to a member" 29 times out of 29,
  *                                with no false positives. It costs nothing: the column
  *                                is already on the row that was just fetched.
@@ -30,15 +31,29 @@
  *                                current system re-stamped it in August 2026 and erased
  *                                the 2025 marker.
  *
+ * ⚠️ Why the member-side evidence is COUNTED rather than merely looked up.
+ * `codestab.code` has no unique constraint and production genuinely holds 7 duplicate
+ * code strings (legacy twins, every one already codestatus = 2). A member row records
+ * only the code STRING, never which physical `codestab` row was consumed, so a bare
+ * "does any member hold this string" test would permanently refuse a real, paid-for,
+ * never-used twin the moment its sibling was consumed -- a blocked paying customer with
+ * no override path. Comparing the number of members holding the string against the
+ * number of physical rows carrying it keeps the normal case (one row, one member)
+ * refusing, while letting a genuinely free twin through, where its own row-specific
+ * `dateused` remains the guard. Verified against production: zero duplicate strings
+ * currently have an available twin, so this is a latent vector, not a live one.
+ *
  * Read-only. Nothing here writes, and no money table is touched.
  */
 
 /**
- * Has this code already been consumed at some point?
+ * Has this specific code row already been consumed?
  *
  * MySQL zero-dates and empty strings are NOT evidence of use -- they are the absence
- * of a value written by a legacy row, and treating them as "used" would refuse
- * perfectly good codes. Fail open here and let the usertab check below fail closed.
+ * of a value on a legacy row, and treating them as "used" would refuse perfectly good
+ * codes. Fail open here; the member-side check below is the half that fails closed.
+ * mysql2 parses a zero DATETIME through `new Date(str)`, which yields an Invalid Date,
+ * so that case arrives here as a Date whose time is NaN.
  */
 function isCodeAlreadyConsumed(dateused) {
   if (dateused === null || dateused === undefined) return false;
@@ -54,29 +69,55 @@ function isCodeAlreadyConsumed(dateused) {
 }
 
 /**
- * uid of the member already registered under this exact code, or null.
- * One indexed seek (see migrations/V044) on a table of a few thousand rows.
+ * Member-side evidence for one code string, in a single round trip.
+ *
+ * `registeredUid` is ordered so the value reported to support is deterministic when a
+ * duplicate string ties to more than one member.
  */
-async function findMemberRegisteredWithCode(conn, code) {
+async function findMemberRegistrationEvidence(conn, code) {
   const value = String(code || '').trim();
-  if (!value) return null;
+  if (!value) return { membersRegistered: 0, physicalRows: 0, registeredUid: null };
 
   const [rows] = await conn.query(
-    'SELECT uid FROM usertab WHERE activationcode = ? LIMIT 1',
-    [value]
+    `SELECT
+       (SELECT COUNT(*) FROM usertab u WHERE u.activationcode = ?)  AS membersRegistered,
+       (SELECT COUNT(*) FROM codestab c WHERE c.code = ?)           AS physicalRows,
+       (SELECT u2.uid FROM usertab u2 WHERE u2.activationcode = ?
+         ORDER BY u2.uid LIMIT 1)                                   AS registeredUid`,
+    [value, value, value]
   );
-  return rows.length ? Number(rows[0].uid) : null;
+
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return { membersRegistered: 0, physicalRows: 0, registeredUid: null };
+
+  return {
+    membersRegistered: Number(row.membersRegistered || 0),
+    physicalRows: Number(row.physicalRows || 0),
+    registeredUid: row.registeredUid == null ? null : Number(row.registeredUid),
+  };
 }
 
-function createCodeAlreadyUsedError(code, registeredUid = null) {
-  const error = new Error(
-    'This activation code has already been used to register an account and cannot be used again. '
-    + 'Please use a different code.'
-  );
+/**
+ * True when every physical code row carrying this string is already spoken for.
+ *
+ * `membersRegistered > 0` matters: without it a string carried by zero members and
+ * zero rows would satisfy `0 >= 0` and refuse a perfectly good code.
+ */
+function everyPhysicalRowIsSpokenFor({ membersRegistered, physicalRows }) {
+  return membersRegistered > 0 && membersRegistered >= physicalRows;
+}
+
+function createCodeAlreadyUsedError(code, { registeredUid = null, evidence = 'used' } = {}) {
+  const detail = evidence === 'registration'
+    ? 'This activation code has already been used to register an account and cannot be used again.'
+    : 'This activation code has already been used and cannot be used again.';
+
+  const error = new Error(`${detail} Please use a different code.`);
   error.code = 'CODE_ALREADY_USED';
   error.details = {
     activationCode: String(code || ''),
     registeredUid: registeredUid === null ? null : Number(registeredUid),
+    evidence,
   };
   return error;
 }
@@ -86,20 +127,27 @@ function createCodeAlreadyUsedError(code, registeredUid = null) {
  * and BEFORE the consuming UPDATE, inside the same transaction.
  */
 async function assertCodeNotAlreadyConsumed(conn, code, codeRow) {
+  const evidence = await findMemberRegistrationEvidence(conn, code);
+
   if (isCodeAlreadyConsumed(codeRow?.dateused)) {
-    const registeredUid = await findMemberRegisteredWithCode(conn, code);
-    throw createCodeAlreadyUsedError(code, registeredUid);
+    throw createCodeAlreadyUsedError(code, {
+      registeredUid: evidence.registeredUid,
+      evidence: 'used',
+    });
   }
 
-  const registeredUid = await findMemberRegisteredWithCode(conn, code);
-  if (registeredUid) {
-    throw createCodeAlreadyUsedError(code, registeredUid);
+  if (everyPhysicalRowIsSpokenFor(evidence)) {
+    throw createCodeAlreadyUsedError(code, {
+      registeredUid: evidence.registeredUid,
+      evidence: 'registration',
+    });
   }
 }
 
 module.exports = {
   isCodeAlreadyConsumed,
-  findMemberRegisteredWithCode,
+  findMemberRegistrationEvidence,
+  everyPhysicalRowIsSpokenFor,
   createCodeAlreadyUsedError,
   assertCodeNotAlreadyConsumed,
 };
