@@ -2,21 +2,26 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
+const { idempotent } = require('../../middleware/idempotency');
 const { getAccountTypeName } = require('../../utils/helpers');
 const {
-  PACKAGE_AMOUNTS,
   buildVoucherExpiryLabel,
   createManualVoucherAvailment,
-  grantVouchersToExistingMembers,
   getVoucherExpiryMode,
   getVoucherAvailmentById,
   getVoucherAvailments,
+  isEligibleForPackageVoucher,
+  issuePackageVoucher,
   listVoucherGrantCandidates,
+  resolveVoucherSources,
   markVoucherAvailmentClaimed,
   updateManualVoucherAvailment,
-  UNUSED_VOUCHER_EXPIRY_MONTHS,
 } = require('../../services/voucher');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
+
+// Hard cap on a single grant batch — bounds worst-case connection/transaction fan-out
+// per request and gives a clear 400 instead of a slow/huge silent loop.
+const MAX_GRANT_BATCH_SIZE = 500;
 
 async function ensureVoucherTables() {
   await assertSchemaRequirements(SCHEMA_REQUIREMENTS.VOUCHERS, 'Voucher management');
@@ -38,7 +43,7 @@ router.use(adminAuth, adminRights([1, 2, 3]));
 
 function normalizeVoucherStatus(raw) {
   const value = String(raw || 'all').toLowerCase();
-  return ['1', '2', '3', '4'].includes(value) ? Number(value) : 'all';
+  return ['1', '2', '3', '4', '5'].includes(value) ? Number(value) : 'all';
 }
 
 /**
@@ -90,16 +95,67 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
 
     if (search) {
       // Cashier-centric trace: match by the ACTIVATION CODE the cashier distributed (any code
-      // the voucher owner used — codestab.code), or by username. The code is what the cashier
-      // tracks; the internal voucher id/ER is not part of their workflow.
+      // the voucher owner used — codestab.code), the underlying Code ID (codestab.id), or by
+      // username. The code/Code ID is what the cashier tracks; the internal voucher id/ER is
+      // not part of their workflow.
+      //
+      // Perf: resolve matching voucher owners FIRST via small bounded indexed queries, then
+      // filter vouchers by a literal uid list. Never leave LIKE subqueries inside the voucher
+      // query — the optimizer can degrade them to per-outer-row execution (the minutes-long
+      // prod search). Fuzzy match only where cheap and useful (username / code contains);
+      // Code ID and the VCH voucher id are exact indexed point lookups.
       const pattern = `%${search}%`;
-      const ors = [
-        'm.username LIKE ?',
-        'EXISTS (SELECT 1 FROM activation_code_usagetab acu WHERE acu.to_uid = v.uid AND acu.code LIKE ?)',
-      ];
-      const searchParams = [pattern, pattern];
-      filters.push(`(${ors.join(' OR ')})`);
-      params.push(...searchParams);
+      const matchedUids = new Set();
+
+      const [usernameRows] = await pool.query(
+        'SELECT uid FROM memberstab WHERE username LIKE ? LIMIT 1000',
+        [pattern]
+      );
+      for (const row of usernameRows) matchedUids.add(Number(row.uid));
+
+      const [codeRows] = await pool.query(
+        `SELECT DISTINCT to_uid FROM activation_code_usagetab
+          WHERE code LIKE ? AND to_uid IS NOT NULL
+          LIMIT 1000`,
+        [pattern]
+      );
+      for (const row of codeRows) matchedUids.add(Number(row.to_uid));
+
+      // Digits or "VCH-000123": exact Code ID (usage code_row_id / codestab PK) plus the
+      // voucher's own displayed VCH id (voucherstab PK).
+      const idMatch = search.match(/^(?:VCH-?)?0*(\d{1,10})$/i);
+      const numericId = idMatch ? Number(idMatch[1]) : null;
+      if (numericId !== null) {
+        const [idRows] = await pool.query(
+          `SELECT DISTINCT acu.to_uid
+             FROM activation_code_usagetab acu
+            WHERE acu.to_uid IS NOT NULL
+              AND (acu.code_row_id = ?
+                   OR acu.code IN (SELECT code FROM codestab WHERE id = ?))
+            LIMIT 1000`,
+          [numericId, numericId]
+        );
+        for (const row of idRows) matchedUids.add(Number(row.to_uid));
+      }
+
+      const ors = [];
+      const searchParams = [];
+      if (matchedUids.size > 0) {
+        const uidList = [...matchedUids];
+        ors.push(`v.uid IN (${uidList.map(() => '?').join(',')})`);
+        searchParams.push(...uidList);
+      }
+      if (numericId !== null) {
+        ors.push('v.id = ?');
+        searchParams.push(numericId);
+      }
+      if (ors.length === 0) {
+        // Nothing matches — keep the count/page queries trivially false instead of scanning.
+        filters.push('1 = 0');
+      } else {
+        filters.push(`(${ors.join(' OR ')})`);
+        params.push(...searchParams);
+      }
     }
 
     const whereSql = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
@@ -119,9 +175,6 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               DATE_FORMAT(v.expiry_date, '%Y-%m-%d %H:%i') AS expiry_at,
               DATE_FORMAT(v.first_used_at, '%Y-%m-%d %H:%i') AS first_used_at,
               DATE_FORMAT(v.use_expires_at, '%Y-%m-%d %H:%i') AS use_expires_at,
-              (SELECT acu.code FROM activation_code_usagetab acu
-                 WHERE acu.to_uid = v.uid
-                 ORDER BY (acu.event_type = 'registration') DESC, acu.id ASC LIMIT 1) AS source_code,
               m.username, m.firstname, m.lastname
        FROM voucherstab v
        LEFT JOIN memberstab m ON m.uid = v.uid
@@ -136,16 +189,37 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS activeCount,
               SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) AS expiredCount,
               SUM(CASE WHEN status = 3 THEN 1 ELSE 0 END) AS fullyUsedCount,
-              SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) AS suspendedCount
+              SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) AS suspendedCount,
+              SUM(CASE WHEN status = 5 THEN 1 ELSE 0 END) AS revokedCount
        FROM voucherstab`
     );
+
+    // Derived per page with a few bounded, uid-keyed queries (never correlated
+    // subqueries per row — that is what made this screen slow enough for management
+    // to report it). Guarantees every voucher reports a source, so the UI never has
+    // to render an ambiguous blank Code cell.
+    // FAIL SOFT: provenance is a display aid, not voucher data. If the lookup throws
+    // (missing/partial schema on an older DB, upgradetab unavailable, ...) the admin
+    // must still get their voucher list — degraded to "No record", never a 500.
+    let sourceByVoucherId = new Map();
+    try {
+      sourceByVoucherId = await resolveVoucherSources(rows);
+    } catch (sourceError) {
+      console.error('[Admin Voucher Management] Voucher source resolution failed:', sourceError.message);
+    }
 
     res.json({
       vouchers: rows.map((row) => {
         const expiryMode = getVoucherExpiryMode(row);
+        const origin = sourceByVoucherId.get(Number(row.id)) || {
+          source: 'unknown', sourceLabel: 'No record', code: null, codeId: null,
+        };
         return {
           id: Number(row.id),
-          code: row.source_code || null,
+          code: origin.code,
+          codeId: origin.codeId,
+          source: origin.source,
+          sourceLabel: origin.sourceLabel,
           uid: Number(row.uid),
           username: row.username,
           fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || null,
@@ -173,6 +247,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
         expired: Number(countsRows[0]?.expiredCount || 0),
         fullyUsed: Number(countsRows[0]?.fullyUsedCount || 0),
         suspended: Number(countsRows[0]?.suspendedCount || 0),
+        revoked: Number(countsRows[0]?.revokedCount || 0),
       },
       pagination: {
         page,
@@ -378,24 +453,22 @@ router.put('/:id/unsuspend', adminAuth, adminRights([1, 2, 3]), async (req, res)
   }
 });
 
-/**
- * POST /api/admin/voucher-management/grant-existing
+/*
+ * REMOVED 2026-08-07: POST /api/admin/voucher-management/grant-existing
+ *
+ * It took NO request body and called grantVouchersToExistingMembers(), an
+ * unbounded `INSERT ... SELECT ... WHERE v.uid IS NULL` — one authenticated
+ * request issued a voucher to EVERY member without one. Measured on prod
+ * 2026-08-07: 7,176 members / ₱40,755,000 of redeemable value, with no uid
+ * list, no cap, and no confirmation. It was also tier-blind (`v.uid IS NULL`
+ * excludes anyone holding ANY voucher), so it would have MISSED exactly the
+ * upgraded members it was supposed to help while paying everyone else.
+ *
+ * No frontend ever called it (VoucherGrant.jsx uses POST /grant with an
+ * explicit uid list). Use that route — per-uid, capped, idempotent, row-locked,
+ * upgraded-only. Bulk-backfilling legacy members is a business decision and
+ * must arrive as a reviewed script with sign-off, not an unguarded endpoint.
  */
-router.post('/grant-existing', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  try {
-    await ensureVoucherGrantTables();
-    const inserted = await grantVouchersToExistingMembers();
-
-    res.json({
-      success: true,
-      inserted,
-      message: `Granted ${inserted} voucher(s) to existing members without vouchers.`,
-    });
-  } catch (error) {
-    console.error('[Admin Voucher Management] Grant existing error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 /**
  * GET /api/admin/voucher-management/grant-candidates
@@ -408,6 +481,10 @@ router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, r
       perPage: 30,
       search: String(req.query.search || '').trim(),
       includeAll: req.query.includeAll === '1' || req.query.includeAll === 'true',
+      // Visibility only. An unrecognised value falls back to the narrowest view in
+      // the service (fail closed), and no view can make a member grantable — every
+      // row carries `grantable`, and POST /grant re-checks under a row lock.
+      view: String(req.query.view || '').trim(),
     });
     res.json(result);
   } catch (error) {
@@ -420,79 +497,146 @@ router.get('/grant-candidates', adminAuth, adminRights([1, 2, 3]), async (req, r
 });
 
 /**
- * POST /api/admin/voucher-management/grant
+ * Boundary validation for the grant batch: `uids` must be a non-empty array of
+ * strictly positive integers (no numeric strings, no floats, no NaN), capped at
+ * MAX_GRANT_BATCH_SIZE. ANY invalid element rejects the WHOLE request with 400 —
+ * fail closed rather than silently dropping bad entries (money-integrity rule 3).
+ * Returns { error } on failure, { uids } (deduped preserved-order) on success.
  */
-router.post('/grant', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
-  const connection = await pool.getConnection();
+function validateGrantUids(rawUids) {
+  if (!Array.isArray(rawUids) || rawUids.length === 0) {
+    return { error: 'At least one UID is required' };
+  }
+
+  if (rawUids.length > MAX_GRANT_BATCH_SIZE) {
+    return { error: `Too many UIDs in one request — max ${MAX_GRANT_BATCH_SIZE}` };
+  }
+
+  const uids = [];
+  for (const raw of rawUids) {
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+      return { error: `Invalid UID in request: ${JSON.stringify(raw)}` };
+    }
+    uids.push(raw);
+  }
+
+  return { uids };
+}
+
+/**
+ * POST /api/admin/voucher-management/grant
+ *
+ * Additive, per-uid grant using the shared eligibility/issue helpers so this
+ * admin path can never diverge from the automatic upgrade-grant path. Each uid
+ * is checked and inserted in its OWN connection + transaction so one bad uid in
+ * a batch can never roll back or block the others. Never UPDATE/DELETE
+ * voucherstab here — grants are INSERT-only, existing rows are left untouched.
+ */
+router.post('/grant', adminAuth, adminRights([1, 2, 3]), idempotent('admin.voucherManagement.grant'), async (req, res) => {
+  const validation = validateGrantUids(req.body?.uids);
+  if (validation.error) {
+    return res.status(400).json({ error: validation.error });
+  }
 
   try {
     await ensureVoucherGrantTables();
-
-    const uids = Array.isArray(req.body?.uids)
-      ? req.body.uids.map((uid) => Number(uid)).filter((uid) => Number.isFinite(uid) && uid > 0)
-      : [];
-
-    if (uids.length === 0) {
-      return res.status(400).json({ error: 'At least one UID is required' });
-    }
-
-    await connection.beginTransaction();
-
-    let granted = 0;
-    let skippedCount = 0;
-
-    for (const uid of uids) {
-      const [existing] = await connection.query(
-        'SELECT id FROM voucherstab WHERE uid = ? LIMIT 1',
-        [uid]
-      );
-
-      if (existing.length > 0) {
-        skippedCount += 1;
-        continue;
-      }
-
-      const [accountRows] = await connection.query(
-        `SELECT currentaccttype, accttype
-         FROM usertab
-         WHERE uid = ? AND uid = mainid
-         LIMIT 1`,
-        [uid]
-      );
-
-      if (accountRows.length === 0) {
-        skippedCount += 1;
-        continue;
-      }
-
-      const accttype = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
-      const voucherAmount = Number(PACKAGE_AMOUNTS[accttype] || 0);
-      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[accttype] || 0);
-
-      if (!voucherAmount || !expiryMonths) {
-        skippedCount += 1;
-        continue;
-      }
-
-      await connection.query(
-        `INSERT INTO voucherstab
-           (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
-        [uid, accttype, voucherAmount, voucherAmount, expiryMonths]
-      );
-
-      granted += 1;
-    }
-
-    await connection.commit();
-    res.json({ success: true, granted, skippedCount });
   } catch (error) {
-    await connection.rollback();
-    console.error('[Admin Voucher Management] Grant error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  } finally {
-    connection.release();
+    console.error('[Admin Voucher Management] Grant schema check error:', error);
+    if (error.code === 'SCHEMA_NOT_READY') {
+      return res.status(503).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Internal server error' });
   }
+
+  const results = [];
+  let granted = 0;
+  let skipped = 0;
+
+  for (const uid of validation.uids) {
+    const connection = await pool.getConnection();
+    let inTransaction = false;
+
+    try {
+      await connection.beginTransaction();
+      inTransaction = true;
+
+      // Lock the member row BEFORE the eligibility check so two concurrent
+      // grants for the SAME uid (two admins, or one admin double-tapping with
+      // different Idempotency-Keys) serialize instead of both reading "not yet
+      // granted" and both inserting a real, money-value voucher. Do not remove.
+      const [lockRows] = await connection.query(
+        'SELECT uid FROM usertab WHERE uid = ? LIMIT 1 FOR UPDATE',
+        [uid]
+      );
+
+      if (lockRows.length === 0) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({ uid, granted: false, reason: 'account_not_found', amount: null });
+        continue;
+      }
+
+      const eligibility = await isEligibleForPackageVoucher(connection, uid);
+
+      if (!eligibility?.eligible) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({
+          uid,
+          granted: false,
+          reason: eligibility?.reason || 'not_eligible',
+          amount: eligibility?.amount ?? null,
+        });
+        continue;
+      }
+
+      // NOTE (policy, 2026-08-07): an upgraded-only refusal (`not_upgraded`) used to
+      // sit here. The account owner decided an admin may grant a voucher to ANY
+      // member, upgraded or not, so it was removed deliberately — do not
+      // reintroduce it as a "fix" without checking with them first.
+      //
+      // What that leaves as the only protection against a bulk over-issuance
+      // (~7,177 members / ₱40,755,000 of redeemable value on prod):
+      //   - MAX_GRANT_BATCH_SIZE on this route,
+      //   - the confirmation total shown in the UI before submit,
+      //   - `already_has_voucher_for_current_tier` from isEligibleForPackageVoucher,
+      //     which is the DUPLICATE guard (vouchers are additive per tier) and is NOT
+      //     a policy gate — it must stay.
+      const insertedId = await issuePackageVoucher(connection, uid, eligibility.currentTier);
+
+      if (!insertedId) {
+        await connection.rollback();
+        inTransaction = false;
+        skipped += 1;
+        results.push({ uid, granted: false, reason: 'grant_failed', amount: eligibility.amount ?? null });
+        continue;
+      }
+
+      await connection.commit();
+      inTransaction = false;
+      granted += 1;
+      results.push({ uid, granted: true, reason: 'eligible', amount: eligibility.amount ?? null });
+    } catch (error) {
+      if (inTransaction) {
+        try {
+          await connection.rollback();
+        } catch (rollbackError) {
+          console.error(`[Admin Voucher Management] Grant rollback error for uid ${uid}:`, rollbackError);
+        }
+      }
+      console.error(`[Admin Voucher Management] Grant error for uid ${uid}:`, error);
+      skipped += 1;
+      results.push({ uid, granted: false, reason: 'error', amount: null });
+    } finally {
+      connection.release();
+    }
+  }
+
+  // `skippedCount` kept alongside `skipped` — the existing admin frontend
+  // (VoucherGrant.jsx) reads `res.data.skippedCount`.
+  res.json({ success: true, granted, skipped, skippedCount: skipped, results });
 });
 
 module.exports = router;

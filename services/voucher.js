@@ -12,6 +12,7 @@ const { pool } = require('../config/database');
 const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 const { TableQueryPager } = require('./tableQueryPager');
+const { assertVoucherPolicyAllowed, resolveVoucherAccountPolicy } = require('./cdVoucherPolicy');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
@@ -313,6 +314,7 @@ function getVoucherRepurchasePoints() {
 }
 
 function buildVoucherExpiryLabel({ unusedExpiryDate, usedExpiryDate, firstUsedAt, status }) {
+  if (Number(status || 0) === 5) return 'Revoked';
   if (Number(status || 0) === 2) return 'Expired';
   if (Number(status || 0) === 3) return 'Fully used';
   if (Number(status || 0) === 4) return 'Suspended';
@@ -341,11 +343,102 @@ function getVoucherExpiryMode(row) {
  */
 async function issueVoucher(conn, uid, packageType) {
   await ensureVoucherTable();
+  await assertVoucherPolicyAllowed(conn, uid, 'issuance');
 
   const amount = PACKAGE_AMOUNTS[packageType];
   const expiryMonths = UNUSED_VOUCHER_EXPIRY_MONTHS[packageType];
 
   if (!amount || !expiryMonths) return null;
+
+  const [result] = await conn.query(
+    `INSERT INTO voucherstab (uid, package_type, voucher_amount, remaining_balance,
+     issued_date, expiry_date, status)
+     VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
+    [uid, packageType, amount, amount, expiryMonths]
+  );
+
+  return result.insertId;
+}
+
+/**
+ * True if this uid already has a voucherstab row for this exact package tier,
+ * in ANY status (1 active / 2 expired / 3 fully used) — having received it at
+ * all counts, regardless of remaining balance.
+ * @param {object} conn - REQUIRED DB connection (caller's transaction).
+ */
+async function hasVoucherForPackage(conn, uid, packageType) {
+  const [rows] = await conn.query(
+    'SELECT id FROM voucherstab WHERE uid = ? AND package_type = ? LIMIT 1',
+    [Number(uid), Number(packageType)]
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+/**
+ * Single shared eligibility rule for the additive package voucher (upgrade grant
+ * AND admin manual grant use this — do not fork the logic).
+ * @param {object} conn - REQUIRED DB connection (caller's transaction).
+ * @returns {{ eligible: boolean, reason: string, currentTier: number|null, amount: number|null }}
+ *
+ * ⚠️ Race note: this is a plain read, not a lock. A caller that grants based on
+ * this result MUST hold the member row locked (e.g. `SELECT ... FOR UPDATE` on
+ * usertab already taken for the upgrade transaction) for the whole
+ * check-then-issuePackageVoucher span, or two concurrent upgrades to the same
+ * tier can both pass this check and double-grant (voucherstab has no UNIQUE
+ * constraint on uid+package_type — see V021).
+ */
+async function isEligibleForPackageVoucher(conn, uid) {
+  const safeUid = Number(uid);
+  const [accountRows] = await conn.query(
+    'SELECT uid, currentaccttype, accttype, codeid, cdamount, cdtotal, cdstatus FROM usertab WHERE uid = ? LIMIT 1',
+    [safeUid]
+  );
+
+  if (!Array.isArray(accountRows) || accountRows.length === 0) {
+    return { eligible: false, reason: 'account_not_found', currentTier: null, joinedTier: null, amount: null };
+  }
+
+  const policy = await resolveVoucherAccountPolicy(conn, safeUid, accountRows[0]);
+  if (!policy.known) {
+    return { eligible: false, reason: 'unknown_effective_account_state', currentTier: null, joinedTier: null, amount: null };
+  }
+  if (!policy.allowed) {
+    return { eligible: false, reason: 'cd_accounts_have_no_digital_vouchers', currentTier: null, joinedTier: null, amount: null };
+  }
+
+  const currentTier = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
+  // Joining tier, reported so callers can apply an upgraded-only POLICY without a
+  // second query. Deliberately NOT part of the eligibility decision here: the
+  // automatic upgrade path must stay tier-based only (see ADMIN_GRANT policy in
+  // routes/admin/voucherManagement.js).
+  const joinedTier = Number(accountRows[0].accttype || 0);
+  if (!PACKAGE_AMOUNTS[currentTier]) {
+    return { eligible: false, reason: 'unknown_package', currentTier: null, joinedTier, amount: null };
+  }
+
+  const amount = Number(PACKAGE_AMOUNTS[currentTier]);
+  const alreadyHasVoucher = await hasVoucherForPackage(conn, safeUid, currentTier);
+  if (alreadyHasVoucher) {
+    return { eligible: false, reason: 'already_has_voucher_for_current_tier', currentTier, joinedTier, amount };
+  }
+
+  return { eligible: true, reason: 'eligible', currentTier, joinedTier, amount };
+}
+
+/**
+ * Additive package voucher grant (e.g. on package upgrade). INSERT-only — never
+ * updates or replaces an existing voucherstab row. Same INSERT shape as
+ * issueVoucher (registration path), kept as a separate function so issueVoucher
+ * stays byte-identical for registration.
+ * @param {object} conn - REQUIRED DB connection (caller's transaction). No pool fallback.
+ * @returns {number|null} new voucherstab row id, or null for an unrecognized packageType.
+ */
+async function issuePackageVoucher(conn, uid, packageType, options = {}) {
+  const amount = PACKAGE_AMOUNTS[packageType];
+  const expiryMonths = UNUSED_VOUCHER_EXPIRY_MONTHS[packageType];
+
+  if (!amount || !expiryMonths) return null;
+  await assertVoucherPolicyAllowed(conn, uid, 'issuance');
 
   const [result] = await conn.query(
     `INSERT INTO voucherstab (uid, package_type, voucher_amount, remaining_balance,
@@ -384,6 +477,7 @@ async function getVouchers(uid) {
             DATE_FORMAT(use_expires_at, '%Y-%m-%d') as use_expires_at,
             status,
             CASE
+              WHEN status = 5 THEN 'Revoked'
               WHEN status = 4 THEN 'Suspended'
               WHEN status = 3 THEN 'Fully Used'
               WHEN first_used_at IS NULL AND expiry_date < NOW() THEN 'Expired'
@@ -455,6 +549,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
 
     await conn.beginTransaction();
     txStarted = true;
+    await assertVoucherPolicyAllowed(conn, memberUid, 'redemption');
 
     let rows = [];
     if (selectedVoucherId > 0) {
@@ -495,6 +590,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     }
 
     const voucher = rows[0];
+    await assertVoucherPolicyAllowed(conn, Number(voucher.uid), 'redemption');
     const resolvedVoucherId = Number(voucher.id || 0);
     const remaining = Number(voucher.remaining_balance || 0);
     if (remaining <= 0) {
@@ -912,6 +1008,10 @@ async function createManualVoucherAvailment({
       [safeVoucherId]
     );
     const voucher = voucherRows[0];
+    if (!voucher) {
+      throw new Error('Voucher not found');
+    }
+    await assertVoucherPolicyAllowed(conn, Number(voucher.uid), 'manual consumption');
     assertVoucherManualAvailmentAllowed(voucher);
 
     const balanceUpdate = computeVoucherAvailmentBalanceUpdate({
@@ -1096,6 +1196,7 @@ async function markVoucherAvailmentClaimed({
     if (!existing) {
       throw new Error('Voucher request not found');
     }
+    await assertVoucherPolicyAllowed(conn, Number(existing.uid), 'claim');
 
     const beforeItemsMap = await getVoucherAvailmentItemsByAvailmentIds(conn, [safeAvailmentId]);
     const beforeState = formatVoucherAvailmentRow(
@@ -1205,6 +1306,9 @@ async function updateManualVoucherAvailment({
     if (!existingAvailment) {
       throw new Error('Voucher availment not found');
     }
+    if (String(existingAvailment.claim_status || '').toLowerCase() === 'cancelled') {
+      throw new Error('Cancelled voucher entries cannot be edited');
+    }
 
     lockKey = `nogatu_voucher_availment_${Number(existingAvailment.voucher_id || 0)}`;
     const [lockRows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
@@ -1218,6 +1322,10 @@ async function updateManualVoucherAvailment({
       [Number(existingAvailment.voucher_id || 0)]
     );
     const voucher = voucherRows[0];
+    if (!voucher) {
+      throw new Error('Voucher not found');
+    }
+    await assertVoucherPolicyAllowed(conn, Number(voucher.uid), 'manual consumption');
     assertVoucherManualAvailmentAllowed(voucher, { allowFullyUsed: true });
 
     const beforeItemsMap = await getVoucherAvailmentItemsByAvailmentIds(conn, [safeAvailmentId]);
@@ -1457,17 +1565,206 @@ async function getGrantEligibleMembers(page = 1, perPage = 30, search = '') {
   return listVoucherGrantCandidates({ page, perPage, search, includeAll: false });
 }
 
+/**
+ * Which members the grant list DISPLAYS. Visibility only.
+ *
+ *  needs_voucher          — missing a voucher for their current package. Default.
+ *  upgraded_needs_voucher — the above, narrowed to members whose package changed
+ *                           (the targeted backfill set: 49 members / ₱770,000 on
+ *                           prod 2026-08-07).
+ *  no_voucher             — holds no voucher row at all.
+ *  has_voucher            — holds at least one voucher.
+ *  all                    — everyone. What `includeAll` (cashier lookup) maps to.
+ *
+ * POLICY (changed 2026-08-07 by the account owner): an admin may grant a voucher to
+ * ANY member, upgraded or not. The earlier upgraded-only restriction is gone from
+ * both this list and POST /grant. Consequence, stated so it is not rediscovered as a
+ * surprise: the grantable population is ~7,177 members / ₱40,755,000 of redeemable
+ * value, bounded now only by MAX_GRANT_BATCH_SIZE and the confirmation total.
+ *
+ * The ONE remaining refusal is `already_has_voucher_for_current_tier`. That is not a
+ * policy gate but the duplicate-value guard: vouchers are additive per TIER, so a
+ * second voucher for a package the member already holds is a duplicate, not a grant.
+ */
+const VOUCHER_GRANT_VIEWS = {
+  NEEDS_VOUCHER: 'needs_voucher',
+  UPGRADED_NEEDS_VOUCHER: 'upgraded_needs_voucher',
+  NO_VOUCHER: 'no_voucher',
+  HAS_VOUCHER: 'has_voucher',
+  ALL: 'all',
+};
+const VOUCHER_GRANT_VIEW_VALUES = Object.values(VOUCHER_GRANT_VIEWS);
+
+/**
+ * Where a voucher came from. Every voucher resolves to exactly one of these — the
+ * admin list must never render a bare blank, because "no code was involved" and "we
+ * could not find the code" look identical to the reader and mean opposite things.
+ */
+const VOUCHER_SOURCES = {
+  REGISTRATION: 'registration',
+  UPGRADE: 'upgrade',
+  ADMIN_GRANT: 'admin_grant',
+  UNKNOWN: 'unknown',
+};
+
+const VOUCHER_SOURCE_LABELS = {
+  [VOUCHER_SOURCES.REGISTRATION]: 'Registration',
+  [VOUCHER_SOURCES.UPGRADE]: 'Package upgrade',
+  [VOUCHER_SOURCES.ADMIN_GRANT]: 'Admin grant',
+  [VOUCHER_SOURCES.UNKNOWN]: 'No record',
+};
+
+/**
+ * Resolve the activation code behind each voucher, for a PAGE of vouchers.
+ *
+ * A voucher carries no provenance column, so it is derived by matching the voucher's
+ * package_type to whatever moved the member to that package:
+ *   - upgradetab row with producttype = package_type  -> the upgrade code
+ *   - usertab.accttype = package_type                 -> the registration code
+ *   - a Node-era usage event                          -> that code
+ *   - nothing                                         -> admin grant (no code exists)
+ *
+ * `usertab.activationcode` is the primary registration source on purpose:
+ * activation_code_usagetab is NODE-ERA ONLY, so members who registered before it
+ * have zero events and any column built solely from it renders blank even though
+ * their code is on file (see lessons 2026-07-15).
+ *
+ * Prefetched with a few bounded queries keyed on the page's uids rather than
+ * correlated subqueries per row — the pattern that made Voucher Management search
+ * slow enough for management to report it (lessons 2026-07-22).
+ *
+ * @returns {Map<number, {source, sourceLabel, code, codeId}>} keyed by voucher id
+ */
+async function resolveVoucherSources(voucherRows, conn = null) {
+  // `pool` is the module's destructured binding (config/database). Do NOT write
+  // `conn = pool` as a default parameter — see lessons 2026-08-06, where exactly that
+  // threw ReferenceError on every real request while every test passed a conn.
+  const db = conn || pool;
+  const resolved = new Map();
+  if (!Array.isArray(voucherRows) || voucherRows.length === 0) return resolved;
+
+  const uids = [...new Set(voucherRows.map((r) => Number(r.uid)).filter(Boolean))];
+  if (uids.length === 0) return resolved;
+  const uidPlaceholders = uids.map(() => '?').join(',');
+
+  const [accountRows] = await db.query(
+    `SELECT uid, accttype, activationcode FROM usertab WHERE uid IN (${uidPlaceholders})`,
+    uids
+  );
+  const accountByUid = new Map(accountRows.map((r) => [Number(r.uid), r]));
+
+  const [upgradeRows] = await db.query(
+    `SELECT ut.uid, ut.producttype, ut.codeid, cs.code
+       FROM upgradetab ut
+       LEFT JOIN codestab cs ON cs.id = ut.codeid
+      WHERE ut.uid IN (${uidPlaceholders})`,
+    uids
+  );
+  // Keyed by uid+tier: an upgrade to tier T is what entitles the voucher for tier T.
+  const upgradeByUidTier = new Map();
+  for (const r of upgradeRows) {
+    upgradeByUidTier.set(`${Number(r.uid)}:${Number(r.producttype)}`, r);
+  }
+
+  const registrationCodes = [...new Set(
+    accountRows.map((r) => r.activationcode).filter((c) => typeof c === 'string' && c.trim() !== '')
+  )];
+  const codeIdByCode = new Map();
+  if (registrationCodes.length > 0) {
+    const [codeRows] = await db.query(
+      `SELECT id, code FROM codestab WHERE code IN (${registrationCodes.map(() => '?').join(',')})`,
+      registrationCodes
+    );
+    // Duplicate code strings exist in legacy data (7 on prod, all codestatus=2). Keep
+    // the first — the Code ID is a display aid here, never a money key.
+    for (const r of codeRows) {
+      if (!codeIdByCode.has(r.code)) codeIdByCode.set(r.code, Number(r.id));
+    }
+  }
+
+  const [usageRows] = await db.query(
+    `SELECT to_uid, code, code_row_id, event_type
+       FROM activation_code_usagetab
+      WHERE to_uid IN (${uidPlaceholders})
+      ORDER BY (event_type = 'registration') DESC, id ASC`,
+    uids
+  );
+  const usageByUid = new Map();
+  for (const r of usageRows) {
+    if (!usageByUid.has(Number(r.to_uid))) usageByUid.set(Number(r.to_uid), r);
+  }
+
+  for (const voucher of voucherRows) {
+    const uid = Number(voucher.uid);
+    const tier = Number(voucher.package_type);
+    const account = accountByUid.get(uid);
+
+    const upgrade = upgradeByUidTier.get(`${uid}:${tier}`);
+    if (upgrade && upgrade.code) {
+      resolved.set(Number(voucher.id), {
+        source: VOUCHER_SOURCES.UPGRADE,
+        sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.UPGRADE],
+        code: upgrade.code,
+        codeId: upgrade.codeid != null ? Number(upgrade.codeid) : null,
+      });
+      continue;
+    }
+
+    const joinedTier = Number(account?.accttype || 0);
+    const registrationCode = account?.activationcode || null;
+    if (joinedTier === tier && registrationCode) {
+      resolved.set(Number(voucher.id), {
+        source: VOUCHER_SOURCES.REGISTRATION,
+        sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.REGISTRATION],
+        code: registrationCode,
+        codeId: codeIdByCode.get(registrationCode) ?? null,
+      });
+      continue;
+    }
+
+    const usage = usageByUid.get(uid);
+    if (usage && usage.code) {
+      resolved.set(Number(voucher.id), {
+        source: VOUCHER_SOURCES.REGISTRATION,
+        sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.REGISTRATION],
+        code: usage.code,
+        codeId: usage.code_row_id != null ? Number(usage.code_row_id) : null,
+      });
+      continue;
+    }
+
+    // No code moved this member to this package — the voucher was issued by an admin.
+    // Reported explicitly so the UI shows "Admin grant" instead of an ambiguous blank.
+    resolved.set(Number(voucher.id), {
+      source: VOUCHER_SOURCES.ADMIN_GRANT,
+      sourceLabel: VOUCHER_SOURCE_LABELS[VOUCHER_SOURCES.ADMIN_GRANT],
+      code: null,
+      codeId: null,
+    });
+  }
+
+  return resolved;
+}
+
 async function listVoucherGrantCandidates({
   page = 1,
   perPage = 30,
   search = '',
   includeAll = false,
+  view = VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER,
   queryExecutor = pool,
 } = {}) {
   await ensureVoucherGrantTable();
 
   const pager = new TableQueryPager(queryExecutor);
   const safeIncludeAll = includeAll === true || includeAll === '1' || includeAll === 'true';
+  // `view` decides only what is VISIBLE. What may be GRANTED is decided per row by
+  // `grantable` below and re-checked server-side in POST /grant — switching views can
+  // never widen who can receive a voucher. Unknown values fall back to the narrowest
+  // view (fail closed), and legacy `includeAll` keeps meaning "show everything".
+  const safeView = safeIncludeAll
+    ? VOUCHER_GRANT_VIEWS.ALL
+    : (VOUCHER_GRANT_VIEW_VALUES.includes(view) ? view : VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER);
   const filters = [
     'u.uid = u.mainid',
     'u.currentaccttype IN (10,20,30,40,50,60)',
@@ -1481,8 +1778,40 @@ async function listVoucherGrantCandidates({
     params.push(like, like, like, like);
   }
 
-  if (!safeIncludeAll) {
+  if (safeView === VOUCHER_GRANT_VIEWS.NO_VOUCHER) {
+    // Members holding no voucher row at all — overwhelmingly the ~7,100 who predate
+    // the voucher feature (2026-06-10). Grantable like any other view.
     filters.push('NOT EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
+  } else if (safeView === VOUCHER_GRANT_VIEWS.HAS_VOUCHER) {
+    filters.push('EXISTS (SELECT 1 FROM voucherstab v WHERE v.uid = u.uid)');
+  } else if (
+    safeView === VOUCHER_GRANT_VIEWS.NEEDS_VOUCHER
+    || safeView === VOUCHER_GRANT_VIEWS.UPGRADED_NEEDS_VOUCHER
+  ) {
+    // Vouchers are additive per package TIER (see isEligibleForPackageVoucher above),
+    // not a one-time-ever grant. Excluding "has ANY voucher row" would hide members
+    // who fully used an older-tier voucher and later upgraded (e.g. SeniorDelia:
+    // spent her Bronze voucher, now Silver, entitled to a Silver voucher) — the
+    // exact people this list exists to surface. Scope the exclusion to the
+    // member's CURRENT tier only, and resolve that tier identically to
+    // isEligibleForPackageVoucher (currentaccttype, falling back to accttype when
+    // currentaccttype is 0/NULL) so a candidate shown here is never refused by the
+    // grant itself.
+    filters.push(
+      `NOT EXISTS (
+         SELECT 1 FROM voucherstab v
+          WHERE v.uid = u.uid
+            AND v.package_type = COALESCE(NULLIF(u.currentaccttype, 0), u.accttype)
+       )`
+    );
+
+    // Narrowing to members whose package CHANGED is now a view choice, not a
+    // permission rule (policy changed 2026-08-07 — see VOUCHER_GRANT_VIEWS). It
+    // isolates the targeted backfill set (49 members / ₱770,000 on prod) from the
+    // full ~7,177 who are missing a current-tier voucher.
+    if (safeView === VOUCHER_GRANT_VIEWS.UPGRADED_NEEDS_VOUCHER) {
+      filters.push('u.currentaccttype <> u.accttype');
+    }
   }
 
   const whereSql = `WHERE ${filters.join(' AND ')}`;
@@ -1494,9 +1823,21 @@ async function listVoucherGrantCandidates({
                INNER JOIN memberstab m ON m.uid = u.uid
                ${whereSql}`,
     countParams: params,
-    dataSql: `SELECT u.uid, u.currentaccttype, u.accttype,
+    // is_upgraded / has_current_tier_voucher are the row-level mirror of the two
+    // conditions POST /grant re-checks (`not_upgraded` and
+    // `already_has_voucher_for_current_tier`). They are selected for EVERY view so a
+    // lookup view can show WHY a member cannot be granted instead of silently
+    // offering a grant the server will refuse. Keep the tier resolution identical to
+    // isEligibleForPackageVoucher.
+    dataSql: `SELECT u.uid, u.currentaccttype, u.accttype, u.codeid,
                      DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg,
-                     m.username, m.firstname, m.lastname
+                     m.username, m.firstname, m.lastname,
+                     (u.currentaccttype <> u.accttype) AS is_upgraded,
+                     EXISTS (
+                       SELECT 1 FROM voucherstab v
+                        WHERE v.uid = u.uid
+                          AND v.package_type = COALESCE(NULLIF(u.currentaccttype, 0), u.accttype)
+                     ) AS has_current_tier_voucher
               FROM usertab u
               INNER JOIN memberstab m ON m.uid = u.uid
               ${whereSql}
@@ -1504,8 +1845,13 @@ async function listVoucherGrantCandidates({
     dataParams: params,
   });
 
+  // Fetched for every view (not just includeAll) so lookup views can show voucher
+  // status. NOTE: this makes `hasVoucher` true for an upgraded member holding a
+  // SPENT lower-tier voucher (the SeniorDelia case), so selection must key on
+  // `grantable`, never on `hasVoucher` — the latter would disable the checkbox on
+  // exactly the members this tool exists to serve.
   let voucherRowsByUid = new Map();
-  if (safeIncludeAll && pageResult.rows.length > 0) {
+  if (pageResult.rows.length > 0) {
     voucherRowsByUid = await pager.fetchByKeys({
       rows: pageResult.rows,
       rowKey: 'uid',
@@ -1537,13 +1883,36 @@ async function listVoucherGrantCandidates({
       const uid = Number(row.uid);
       const accttype = Number(row.currentaccttype || row.accttype || 0);
       const voucherRow = voucherRowsByUid.get(uid) || null;
+      // Mirrors POST /grant's ONLY remaining refusal, so the UI's reason matches the
+      // server's. `grantable` is a UI affordance — the route re-checks under a row
+      // lock and is the actual guard. Upgrade status no longer affects grantability
+      // (policy changed 2026-08-07); `isUpgraded` is reported for display only.
+      const isUpgraded = Boolean(Number(row.is_upgraded || 0));
+      const hasCurrentTierVoucher = Boolean(Number(row.has_current_tier_voucher || 0));
+      const rawCodeId = row.codeid == null ? null : Number(row.codeid);
+      const notGrantableReason = rawCodeId === 3
+        ? 'cd_accounts_have_no_digital_vouchers'
+        : rawCodeId != null && ![1, 2].includes(rawCodeId)
+          ? 'unknown_effective_account_state'
+          : hasCurrentTierVoucher
+        ? 'already_has_voucher_for_current_tier'
+        : null;
       return {
         uid,
+        isUpgraded,
+        hasCurrentTierVoucher,
+        grantable: notGrantableReason === null,
+        notGrantableReason,
         username: row.username,
         firstname: row.firstname,
         lastname: row.lastname,
         fullname: `${row.firstname || ''} ${row.lastname || ''}`.trim(),
         accttype,
+        // Joining package. In candidate mode every row is an UPGRADED member
+        // (joinedAccttype !== accttype is exactly why they qualify), so the UI can
+        // show "joined as X, now Y" and make the list's scope self-evident instead
+        // of leaving an admin to guess why someone is missing from it.
+        joinedAccttype: Number(row.accttype || 0),
         voucherAmount: Number(PACKAGE_AMOUNTS[accttype] || 0),
         datereg: row.datereg,
         hasVoucher: Boolean(voucherRow),
@@ -1559,147 +1928,47 @@ async function listVoucherGrantCandidates({
   };
 }
 
-/**
- * Grant vouchers to selected members.
- * Members with existing voucher history are skipped.
+/*
+ * REMOVED 2026-08-07: grantVouchersToMembers()
+ *
+ * Dead since the POST /grant rewrite — no caller anywhere in the repo, only its
+ * own definition and export. Left in place it was a loaded gun: an exported
+ * voucher-granter carrying the SAME tier-blind defect as grantVouchersToExisting-
+ * Members (`v.uid IS NULL` skips a member holding ANY voucher, so the upgraded
+ * members this tool exists for were the ones it refused), with no upgraded-only
+ * policy and no idempotency key. The live path is POST /grant, which calls the
+ * shared isEligibleForPackageVoucher + issuePackageVoucher per uid.
  */
-async function grantVouchersToMembers(uids = []) {
-  await ensureVoucherGrantTable();
-
-  const cleanUids = Array.from(new Set(
-    (Array.isArray(uids) ? uids : [])
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0)
-  ));
-
-  if (cleanUids.length === 0) {
-    return {
-      requested: 0,
-      granted: 0,
-      skippedCount: 0,
-      skippedUids: [],
-      grantedUids: [],
-    };
-  }
-
-  const placeholders = cleanUids.map(() => '?').join(',');
-  const conn = await pool.getConnection();
-
-  try {
-    await conn.beginTransaction();
-
-    const [eligibleRows] = await conn.query(
-      `SELECT u.uid, u.currentaccttype
-       FROM usertab u
-       LEFT JOIN voucherstab v ON v.uid = u.uid
-       WHERE u.uid IN (${placeholders})
-         AND u.uid = u.mainid
-         AND u.currentaccttype IN (10,20,30,40,50,60)
-         AND v.uid IS NULL
-       FOR UPDATE`,
-      cleanUids
-    );
-
-    const grantedUids = [];
-    for (const row of eligibleRows) {
-      const uid = Number(row.uid);
-      const packageType = Number(row.currentaccttype || 0);
-      const amount = Number(PACKAGE_AMOUNTS[packageType] || 0);
-      const expiryMonths = Number(UNUSED_VOUCHER_EXPIRY_MONTHS[packageType] || 0);
-
-      if (!uid || !amount || !expiryMonths) continue;
-
-      await conn.query(
-        `INSERT INTO voucherstab
-          (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-         VALUES (?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MONTH), 1)`,
-        [uid, packageType, amount, amount, expiryMonths]
-      );
-
-      grantedUids.push(uid);
-    }
-
-    await conn.commit();
-
-    const skippedUids = cleanUids.filter((uid) => !grantedUids.includes(uid));
-
-    return {
-      requested: cleanUids.length,
-      granted: grantedUids.length,
-      skippedCount: skippedUids.length,
-      skippedUids,
-      grantedUids,
-    };
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-}
-
-/**
- * Grant one-time vouchers to existing members that still have no voucher record.
- * Idempotent: reruns only insert for members without any voucher row.
+/*
+ * REMOVED 2026-08-07: grantVouchersToExistingMembers()
+ *
+ * Unbounded bulk issuance — `INSERT ... SELECT ... WHERE v.uid IS NULL` with no
+ * uid list and no cap. On prod 2026-08-07 that predicate matched 7,176 members
+ * = ₱40,755,000 of redeemable voucher value from a single call. Its only caller
+ * was POST /grant-existing, which no frontend used; both are gone.
+ *
+ * It was also WRONG for the case it was meant to serve: `v.uid IS NULL` excludes
+ * any member holding ANY voucher, so an upgraded member with a spent lower-tier
+ * voucher (the SeniorDelia case) was skipped while 7,000+ legacy members were
+ * paid. Correct path is POST /grant — per-uid, capped, idempotent, row-locked,
+ * tier-scoped, upgraded-only.
  */
-async function grantVouchersToExistingMembers() {
-  await ensureVoucherGrantTable();
-
-  const [result] = await pool.query(
-    `INSERT INTO voucherstab
-      (uid, package_type, voucher_amount, remaining_balance, issued_date, expiry_date, status)
-     SELECT
-       u.uid,
-       u.currentaccttype,
-       CASE u.currentaccttype
-         WHEN 10 THEN 2500
-         WHEN 20 THEN 5000
-         WHEN 30 THEN 10000
-         WHEN 40 THEN 25000
-         WHEN 50 THEN 50000
-         WHEN 60 THEN 150000
-       END AS voucher_amount,
-       CASE u.currentaccttype
-         WHEN 10 THEN 2500
-         WHEN 20 THEN 5000
-         WHEN 30 THEN 10000
-         WHEN 40 THEN 25000
-         WHEN 50 THEN 50000
-         WHEN 60 THEN 150000
-       END AS remaining_balance,
-       NOW(),
-       DATE_ADD(
-         NOW(),
-         INTERVAL CASE u.currentaccttype
-           WHEN 10 THEN 2
-           WHEN 20 THEN 2
-           WHEN 30 THEN 4
-           WHEN 40 THEN 4
-           WHEN 50 THEN 6
-           WHEN 60 THEN 6
-         END MONTH
-       ),
-       1
-     FROM usertab u
-     LEFT JOIN voucherstab v ON v.uid = u.uid
-     WHERE u.uid = u.mainid
-       AND u.currentaccttype IN (10, 20, 30, 40, 50, 60)
-       AND v.uid IS NULL`
-  );
-
-  return Number(result.affectedRows || 0);
-}
 
 module.exports = {
   issueVoucher,
+  hasVoucherForPackage,
+  isEligibleForPackageVoucher,
+  issuePackageVoucher,
   getVouchers,
   redeemVoucher,
   getVoucherTransactions,
   getAllVouchers,
   getGrantEligibleMembers,
   listVoucherGrantCandidates,
-  grantVouchersToMembers,
-  grantVouchersToExistingMembers,
+  VOUCHER_GRANT_VIEWS,
+  VOUCHER_SOURCES,
+  VOUCHER_SOURCE_LABELS,
+  resolveVoucherSources,
   ensureVoucherGrantTable,
   ensureVoucherTable,
   ensureVoucherTxTable,

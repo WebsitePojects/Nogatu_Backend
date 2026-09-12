@@ -6,16 +6,19 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../../config/database');
 const { adminAuth, adminRights } = require('../../middleware/auth');
-const { generateCodes } = require('../../services/codeGeneration');
+const { idempotent } = require('../../middleware/idempotency');
+const { generateCodes, validateCodeGenerationRequest } = require('../../services/codeGeneration');
 const { PRODUCT_TYPES } = require('../../utils/helpers');
 const { sanitizeAlphaNum } = require('../../utils/helpers');
 const { createProcessKey } = require('../../utils/security');
 const { appendActivationCodeUsage } = require('../../services/registrationAudit');
 const { listAdminActivationHistory } = require('../../services/codeHistory');
+const { findLeadersForMember } = require('../../services/leaders');
 const {
   buildSectionedCsv,
   sendCsv,
 } = require('../../services/csvExport');
+const { buildCodesWorkbook } = require('../../services/xlsxExport');
 
 async function tableExists(tableName) {
   const [rows] = await pool.query('SHOW TABLES LIKE ?', [tableName]);
@@ -33,6 +36,133 @@ function firstRowByCode(rows, codeField = 'code') {
   return map;
 }
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Status filter values accepted by the admin list/export. `transferred` is DERIVED
+// (codestab has no such column) and deliberately OVERLAPS the codestatus values:
+// a code can be Released-and-transferred or Used-and-transferred. It is offered as
+// its own filter option, and the row payload carries a separate `transferred` flag,
+// so the base status is never replaced by transfer history -- consumption state
+// (Used) must stay visible on a money-adjacent screen.
+const CODE_STATUS_FILTERS = new Set(['all', 'not_released', 'released', 'used', 'transferred']);
+const DEFAULT_CODES_PER_PAGE = 40;
+const MAX_CODES_PER_PAGE = 500;
+const TRANSFER_EVENT_TYPES = ['transfer', 'admin_transfer'];
+// A code that only ever moved admin -> first holder has no separator in its trail.
+const TRANSFER_TRAIL_SEPARATOR = '->';
+
+// Which tables can evidence a transfer, probed once per process. tableExists() runs a
+// SHOW TABLES, and the status filter is on the request path for both the list and the
+// export -- an uncached schema probe per request is exactly the cost pattern that made
+// the ranking rebuild slow (see .claude/rules/lessons.md 2026-08-06).
+let transferSourcesPromise = null;
+function getTransferSources() {
+  if (!transferSourcesPromise) {
+    transferSourcesPromise = (async () => ({
+      legacy: await tableExists('codehistorytab'),
+      usage: await tableExists('activation_code_usagetab'),
+    }))().catch((err) => {
+      transferSourcesPromise = null; // don't cache a failure
+      throw err;
+    });
+  }
+  return transferSourcesPromise;
+}
+
+class InvalidCodeStatusFilterError extends Error {
+  constructor(value) {
+    super(`Unknown status filter: ${value}`);
+    this.name = 'InvalidCodeStatusFilterError';
+  }
+}
+
+/**
+ * Shared WHERE builder for the code list/count/export. All conditions use the
+ * `c.` alias (codestab AS c), so every caller must alias codestab as c.
+ * Filters: q (code LIKE; an all-digit q ALSO matches the numeric Code ID
+ * exactly), owner (holder username LIKE), dateFrom/dateTo (c.dategen window,
+ * inclusive, validated as YYYY-MM-DD to reject junk).
+ * Cashier (rights=2) is still capped at codestatus <= 1.
+ * status: all | not_released | released | used | transferred. Unknown values are
+ * REJECTED, never silently ignored -- an unrecognised filter that fell through to
+ * "all" would show an admin more codes than they asked for and look like a match.
+ * Async because `transferred` must know which transfer-evidence tables exist.
+ */
+async function buildCodeFilter(req, adminRight) {
+  const conds = [adminRight === 2 ? 'c.codestatus <= 1' : 'c.codestatus <= 2'];
+  const params = [];
+  const q = (req.query.q || '').trim();
+  const owner = (req.query.owner || '').trim();
+  const dateFrom = (req.query.dateFrom || '').trim();
+  const dateTo = (req.query.dateTo || '').trim();
+
+  if (q) {
+    if (/^\d+$/.test(q)) {
+      // Digits-only: management searches by the table's "Code ID" number too.
+      conds.push('(c.code LIKE ? OR c.id = ?)');
+      params.push(`%${q}%`, Number(q));
+    } else {
+      conds.push('c.code LIKE ?');
+      params.push(`%${q}%`);
+    }
+  }
+  if (owner) {
+    conds.push('c.uid IN (SELECT uid FROM memberstab WHERE username LIKE ?)');
+    params.push(`%${owner}%`);
+  }
+  if (ISO_DATE.test(dateFrom)) { conds.push('c.dategen >= ?'); params.push(`${dateFrom} 00:00:00`); }
+  if (ISO_DATE.test(dateTo)) { conds.push('c.dategen < DATE_ADD(?, INTERVAL 1 DAY)'); params.push(dateTo); }
+
+  const status = (req.query.status || 'all').trim().toLowerCase();
+  if (!CODE_STATUS_FILTERS.has(status)) throw new InvalidCodeStatusFilterError(status);
+  if (status === 'not_released') conds.push('c.codestatus = 0');
+  else if (status === 'released') conds.push('c.codestatus = 1');
+  else if (status === 'used') conds.push('c.codestatus = 2');
+  else if (status === 'transferred') {
+    // Two independent sources: the legacy codehistorytab and Node-era usage events.
+    //
+    // codehistorytab is NOT a transfer log -- it holds ONE row per code (PK on `code`)
+    // and gets that row when the code is RELEASED. On prod, 15,354 of its 24,647 rows
+    // are release-only (`(nogatuadmin)Themaker`, or just `nogatuadmin`) with no second
+    // hop. Treating "has a history row" as "was transferred" matched 24,654 of 24,889
+    // codes -- 99% -- i.e. a filter that selects everything while looking authoritative.
+    // A real hand-off always writes a `->` separator, in BOTH stored trail formats:
+    //   (nogatuadmin)Ann050890 -> (Ann050890)Malou05      <- legacy chain
+    //   tabsqui->VernieS01                                 <- Node member transfer
+    // so the arrow is what distinguishes a transfer from a release. With it the
+    // predicate matches 10,520 codes (42%), which reconciles with the 9,293 multi-hop
+    // history rows plus codes whose only transfer is a Node-era event.
+    //
+    // The event side needs no such guard: `release` is its own event_type (2,291 rows),
+    // distinct from transfer (4,310) and admin_transfer (2,409).
+    //
+    // Both are single PK-seek EXISTS probes (codehistorytab's PK is `code`), NOT a
+    // correlated subquery carrying a JOIN/OR/CAST -- that shape is what degraded the
+    // voucher search (lessons.md 2026-07-22). The LIKE runs on the one row the seek
+    // returns, so it is not a scan.
+    const sources = await getTransferSources();
+    const parts = [];
+    if (sources.legacy) {
+      parts.push(
+        'EXISTS (SELECT 1 FROM codehistorytab h WHERE h.code = c.code'
+        + ' AND h.history LIKE ?)'
+      );
+      params.push(`%${TRANSFER_TRAIL_SEPARATOR}%`);
+    }
+    if (sources.usage) {
+      parts.push(
+        'EXISTS (SELECT 1 FROM activation_code_usagetab a WHERE a.code = c.code'
+        + ` AND a.event_type IN (${TRANSFER_EVENT_TYPES.map(() => '?').join(', ')}))`
+      );
+      params.push(...TRANSFER_EVENT_TYPES);
+    }
+    // Neither table present: fail CLOSED (match nothing) rather than matching everything.
+    conds.push(parts.length > 0 ? `(${parts.join(' OR ')})` : '1 = 0');
+  }
+
+  return { whereSql: `WHERE ${conds.join(' AND ')}`, params };
+}
+
 /**
  * POST /api/admin/codes/generate
  * Generate activation codes
@@ -40,11 +170,15 @@ function firstRowByCode(rows, codeField = 'code') {
  */
 router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const { noOfCodes, productType, codeType } = req.body;
+    const { noOfCodes, productType, codeType, arNumber } = req.body;
+    const idempotencyKey = (typeof req.get === 'function' ? req.get('Idempotency-Key') : req.headers?.['idempotency-key']) || req.body?.idempotencyKey;
 
-    if (!noOfCodes || noOfCodes < 1 || noOfCodes > 1000) {
-      return res.status(400).json({ error: 'Number of codes must be 1-1000' });
+    const codeValidation = validateCodeGenerationRequest(productType, codeType);
+    if (!codeValidation.valid) return res.status(400).json({ error: codeValidation.error });
+    if (!Number.isInteger(Number(noOfCodes)) || Number(noOfCodes) < 1 || Number(noOfCodes) > 500) {
+      return res.status(400).json({ error: 'Number of codes must be a positive integer no greater than 500' });
     }
+    if (!idempotencyKey) return res.status(400).json({ error: 'Idempotency-Key header is required' });
 
     const codes = await generateCodes(
       Number(noOfCodes),
@@ -54,13 +188,15 @@ router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
       {
         adminUsername: req.session.adminid || null,
         actorAdminId: req.session.adminNumericId || null,
-      }
+      },
+      { arNumber, idempotencyKey }
     );
 
     res.json({ success: true, count: codes.length, codes });
   } catch (err) {
     console.error('[Admin Codes] Generate error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    const status = ['INVALID_CODE_GENERATION_REQUEST', 'IDEMPOTENCY_PAYLOAD_MISMATCH'].includes(err.code) ? 400 : err.code === 'GENERATION_IN_PROGRESS' ? 409 : 500;
+    res.status(status).json({ error: status === 500 ? 'Internal server error' : err.message });
   }
 });
 
@@ -72,22 +208,18 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const page = Math.max(1, Number(req.query.page) || 1);
-    const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 40));
+    // Management asked for a custom row count instead of the fixed 40/100 toggle.
+    // Still bounded: every listed page fans out into 4 enrichment queries with an
+    // IN-list of that many codes, and the response is rendered/printed in one go.
+    const perPage = Math.min(MAX_CODES_PER_PAGE, Math.max(1, Number(req.query.perPage) || DEFAULT_CODES_PER_PAGE));
     const offset = (page - 1) * perPage;
-    const q = (req.query.q || '').trim();
 
-    // Cashier (rights=2) can manage transfer/release-ready codes only.
-    let whereSql = adminRight === 2 ? 'WHERE c.codestatus <= 1' : 'WHERE c.codestatus <= 2';
-    let countWhereSql = adminRight === 2 ? 'WHERE codestatus <= 1' : 'WHERE codestatus <= 2';
-    const whereParams = [];
-    if (q) {
-      whereSql += ' AND c.code LIKE ?';
-      countWhereSql += ' AND code LIKE ?';
-      whereParams.push(`%${q}%`);
-    }
+    // Cashier (rights=2) capped at codestatus <= 1; shared filter adds the
+    // optional q / owner / dateFrom / dateTo conditions.
+    const { whereSql, params: whereParams } = await buildCodeFilter(req, adminRight);
 
     const [countRows] = await pool.query(
-      `SELECT COUNT(*) as total FROM codestab ${countWhereSql}`,
+      `SELECT COUNT(*) as total FROM codestab c ${whereSql}`,
       whereParams
     );
     const total = Number(countRows[0].total);
@@ -148,7 +280,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
            LEFT JOIN accesstab aa ON aa.id = a.actor_admin_id
            LEFT JOIN memberstab fm ON fm.uid = a.from_uid
            LEFT JOIN memberstab tm ON tm.uid = a.to_uid
-           WHERE a.event_type = 'admin_transfer'
+           WHERE a.event_type IN ('transfer', 'admin_transfer')
              AND a.code IN (${codePlaceholders})
            ORDER BY a.id DESC`,
           pageCodes
@@ -213,6 +345,10 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
         transferHistory,
         lastTransferDate: legacyHistory?.datetransfer || transferAudit?.created_at || null,
         lastReleaseDate: releaseAudit?.created_at || null,
+        // Derived, and INDEPENDENT of codestatus -- a code can be Used AND transferred.
+        // The UI shows this as an extra marker beside the base status, never instead of
+        // it, so consumption state is not hidden by transfer history.
+        transferred: Boolean(legacyHistory || transferAudit),
         codestatus: r.codestatus,
         statusLabel: r.codestatus === 0 ? 'Not Released' : r.codestatus === 1 ? 'Released' : 'Used',
         releasedate: r.releasedate,
@@ -222,8 +358,82 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     res.json({ codes, total, page, totalPages: Math.ceil(total / perPage) });
   } catch (err) {
+    if (err instanceof InvalidCodeStatusFilterError) {
+      return res.status(400).json({ error: err.message });
+    }
     console.error('[Admin Codes] List error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/codes/export
+ * Export ALL codes matching the current filters (q / owner / dateFrom / dateTo)
+ * as an Excel-openable CSV — not just the visible page. Read-only.
+ */
+router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
+  try {
+    const adminRight = Number(req.session.adminrights || 0);
+    const { whereSql, params } = await buildCodeFilter(req, adminRight);
+    const MAX_ROWS = 50000;
+
+    const [rows] = await pool.query(
+      `SELECT c.id, c.code, c.producttype, c.codestatus, c.processid,
+              DATE_FORMAT(c.dategen, '%Y-%m-%d %H:%i') AS dategen,
+              m.username AS owner_username,
+              TRIM(CONCAT(COALESCE(m.firstname,''), ' ', COALESCE(m.lastname,''))) AS owner_fullname
+       FROM codestab c
+       LEFT JOIN memberstab m ON m.uid = c.uid
+       ${whereSql}
+       ORDER BY c.dategen DESC, c.id DESC
+       LIMIT ?`,
+      [...params, MAX_ROWS]
+    );
+
+    const statusLabel = (s) => (s === 0 ? 'Not Released' : s === 1 ? 'Released' : 'Used');
+    const owner = (req.query.owner || '').trim().replace(/[^A-Za-z0-9_-]/g, '') || 'all';
+    const filename = `activation-codes-${owner}`;
+
+    // CSV kept as an explicit fallback; default is a real .xlsx with fixed
+    // column widths so dates/names don't overlap or show "########" in Excel.
+    if (String(req.query.format || '').toLowerCase() === 'csv') {
+      const csvRows = rows.map((r, i) => ({
+        '#': i + 1,
+        'Code ID': r.id,
+        'Activation Code': r.code,
+        'Package': PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
+        'Status': statusLabel(r.codestatus),
+        'Holder Username': r.owner_username || '',
+        'Holder Name': (r.owner_fullname || '').trim(),
+        'Generated By': r.processid || '',
+        'Date Generated': r.dategen || '',
+      }));
+      sendCsv(res, filename, buildSectionedCsv([{ rows: csvRows }]));
+      return;
+    }
+
+    const xlsxRows = rows.map((r, i) => ({
+      idx: i + 1,
+      codeId: r.id,
+      code: r.code,
+      pkg: PRODUCT_TYPES[r.producttype] || `Type ${r.producttype}`,
+      status: statusLabel(r.codestatus),
+      holderUsername: r.owner_username || '',
+      holderName: (r.owner_fullname || '').trim(),
+      generatedBy: r.processid || '',
+      dategen: r.dategen || '',
+    }));
+    const wb = buildCodesWorkbook(xlsxRows, { sheetName: 'Activation Codes' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    if (err instanceof InvalidCodeStatusFilterError) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error('[Admin Codes] Export error:', err);
+    res.status(500).json({ error: 'Failed to export activation codes' });
   }
 });
 
@@ -288,11 +498,23 @@ router.get('/lookup-account', adminAuth, adminRights([1, 3]), async (req, res) =
     }
 
     const row = rows[0];
+
+    // Nearest named leader above this member in EACH tree. Read-only; a lookup
+    // failure must never break the account tag itself, so it degrades to null.
+    let leaders = { unilevel: null, binary: null };
+    try {
+      leaders = await findLeadersForMember(row.uid);
+    } catch (leaderErr) {
+      console.error('[Admin Codes] Leader lookup failed:', leaderErr.message);
+    }
+
     res.json({
       account: {
         uid: row.uid,
         username: row.username,
         fullname: `${row.firstname} ${row.lastname}`.trim(),
+        unilevelLeader: leaders.unilevel,
+        binaryLeader: leaders.binary,
       },
     });
   } catch (err) {
@@ -352,7 +574,7 @@ router.post('/release', adminAuth, adminRights([1, 3]), async (req, res) => {
  * POST /api/admin/codes/transfer
  * Transfer codes to member account
  */
-router.post('/transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
+router.post('/transfer', adminAuth, adminRights([1, 3]), idempotent('admin.codes.transfer'), async (req, res) => {
   try {
     const adminRight = Number(req.session.adminrights || 0);
     const { targetUsername, codes: selectedCodes } = req.body;
@@ -378,10 +600,13 @@ router.post('/transfer', adminAuth, adminRights([1, 3]), async (req, res) => {
       );
       if (codeRows.length === 0) continue;
 
-      await pool.query(
-        'UPDATE codestab SET uid = ? WHERE code = ? LIMIT 1',
+      // Atomic claim: re-assert the same status predicate the SELECT used so a
+      // double-submit or concurrent member action can't transfer a consumed code.
+      const [transferResult] = await pool.query(
+        `UPDATE codestab SET uid = ? WHERE code = ? AND ${codeWhere} LIMIT 1`,
         [targetUid, code]
       );
+      if (transferResult.affectedRows !== 1) continue;
 
       const history = `(${req.session.adminid}).${targetSanitized}`;
       await pool.query(
