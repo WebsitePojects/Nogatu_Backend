@@ -12,6 +12,7 @@ const { pool } = require('../config/database');
 const { VOUCHER_PRODUCT_CATALOG } = require('../constants/maintenanceProductCatalog');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('./schemaReadiness');
 const { TableQueryPager } = require('./tableQueryPager');
+const { assertVoucherPolicyAllowed, resolveVoucherAccountPolicy } = require('./cdVoucherPolicy');
 
 let voucherTableReady = false;
 let voucherTxTableReady = false;
@@ -313,6 +314,7 @@ function getVoucherRepurchasePoints() {
 }
 
 function buildVoucherExpiryLabel({ unusedExpiryDate, usedExpiryDate, firstUsedAt, status }) {
+  if (Number(status || 0) === 5) return 'Revoked';
   if (Number(status || 0) === 2) return 'Expired';
   if (Number(status || 0) === 3) return 'Fully used';
   if (Number(status || 0) === 4) return 'Suspended';
@@ -341,6 +343,7 @@ function getVoucherExpiryMode(row) {
  */
 async function issueVoucher(conn, uid, packageType) {
   await ensureVoucherTable();
+  await assertVoucherPolicyAllowed(conn, uid, 'issuance');
 
   const amount = PACKAGE_AMOUNTS[packageType];
   const expiryMonths = UNUSED_VOUCHER_EXPIRY_MONTHS[packageType];
@@ -387,12 +390,20 @@ async function hasVoucherForPackage(conn, uid, packageType) {
 async function isEligibleForPackageVoucher(conn, uid) {
   const safeUid = Number(uid);
   const [accountRows] = await conn.query(
-    'SELECT currentaccttype, accttype FROM usertab WHERE uid = ? LIMIT 1',
+    'SELECT uid, currentaccttype, accttype, codeid, cdamount, cdtotal, cdstatus FROM usertab WHERE uid = ? LIMIT 1',
     [safeUid]
   );
 
   if (!Array.isArray(accountRows) || accountRows.length === 0) {
     return { eligible: false, reason: 'account_not_found', currentTier: null, joinedTier: null, amount: null };
+  }
+
+  const policy = await resolveVoucherAccountPolicy(conn, safeUid, accountRows[0]);
+  if (!policy.known) {
+    return { eligible: false, reason: 'unknown_effective_account_state', currentTier: null, joinedTier: null, amount: null };
+  }
+  if (!policy.allowed) {
+    return { eligible: false, reason: 'cd_accounts_have_no_digital_vouchers', currentTier: null, joinedTier: null, amount: null };
   }
 
   const currentTier = Number(accountRows[0].currentaccttype || accountRows[0].accttype || 0);
@@ -427,6 +438,7 @@ async function issuePackageVoucher(conn, uid, packageType, options = {}) {
   const expiryMonths = UNUSED_VOUCHER_EXPIRY_MONTHS[packageType];
 
   if (!amount || !expiryMonths) return null;
+  await assertVoucherPolicyAllowed(conn, uid, 'issuance');
 
   const [result] = await conn.query(
     `INSERT INTO voucherstab (uid, package_type, voucher_amount, remaining_balance,
@@ -465,6 +477,7 @@ async function getVouchers(uid) {
             DATE_FORMAT(use_expires_at, '%Y-%m-%d') as use_expires_at,
             status,
             CASE
+              WHEN status = 5 THEN 'Revoked'
               WHEN status = 4 THEN 'Suspended'
               WHEN status = 3 THEN 'Fully Used'
               WHEN first_used_at IS NULL AND expiry_date < NOW() THEN 'Expired'
@@ -536,6 +549,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
 
     await conn.beginTransaction();
     txStarted = true;
+    await assertVoucherPolicyAllowed(conn, memberUid, 'redemption');
 
     let rows = [];
     if (selectedVoucherId > 0) {
@@ -576,6 +590,7 @@ async function redeemVoucher(uid, voucherId, cashAmount, options = {}) {
     }
 
     const voucher = rows[0];
+    await assertVoucherPolicyAllowed(conn, Number(voucher.uid), 'redemption');
     const resolvedVoucherId = Number(voucher.id || 0);
     const remaining = Number(voucher.remaining_balance || 0);
     if (remaining <= 0) {
@@ -993,6 +1008,10 @@ async function createManualVoucherAvailment({
       [safeVoucherId]
     );
     const voucher = voucherRows[0];
+    if (!voucher) {
+      throw new Error('Voucher not found');
+    }
+    await assertVoucherPolicyAllowed(conn, Number(voucher.uid), 'manual consumption');
     assertVoucherManualAvailmentAllowed(voucher);
 
     const balanceUpdate = computeVoucherAvailmentBalanceUpdate({
@@ -1177,6 +1196,7 @@ async function markVoucherAvailmentClaimed({
     if (!existing) {
       throw new Error('Voucher request not found');
     }
+    await assertVoucherPolicyAllowed(conn, Number(existing.uid), 'claim');
 
     const beforeItemsMap = await getVoucherAvailmentItemsByAvailmentIds(conn, [safeAvailmentId]);
     const beforeState = formatVoucherAvailmentRow(
@@ -1286,6 +1306,9 @@ async function updateManualVoucherAvailment({
     if (!existingAvailment) {
       throw new Error('Voucher availment not found');
     }
+    if (String(existingAvailment.claim_status || '').toLowerCase() === 'cancelled') {
+      throw new Error('Cancelled voucher entries cannot be edited');
+    }
 
     lockKey = `nogatu_voucher_availment_${Number(existingAvailment.voucher_id || 0)}`;
     const [lockRows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [lockKey]);
@@ -1299,6 +1322,10 @@ async function updateManualVoucherAvailment({
       [Number(existingAvailment.voucher_id || 0)]
     );
     const voucher = voucherRows[0];
+    if (!voucher) {
+      throw new Error('Voucher not found');
+    }
+    await assertVoucherPolicyAllowed(conn, Number(voucher.uid), 'manual consumption');
     assertVoucherManualAvailmentAllowed(voucher, { allowFullyUsed: true });
 
     const beforeItemsMap = await getVoucherAvailmentItemsByAvailmentIds(conn, [safeAvailmentId]);
@@ -1802,7 +1829,7 @@ async function listVoucherGrantCandidates({
     // lookup view can show WHY a member cannot be granted instead of silently
     // offering a grant the server will refuse. Keep the tier resolution identical to
     // isEligibleForPackageVoucher.
-    dataSql: `SELECT u.uid, u.currentaccttype, u.accttype,
+    dataSql: `SELECT u.uid, u.currentaccttype, u.accttype, u.codeid,
                      DATE_FORMAT(u.datereg, '%Y-%m-%d %H:%i') AS datereg,
                      m.username, m.firstname, m.lastname,
                      (u.currentaccttype <> u.accttype) AS is_upgraded,
@@ -1862,7 +1889,12 @@ async function listVoucherGrantCandidates({
       // (policy changed 2026-08-07); `isUpgraded` is reported for display only.
       const isUpgraded = Boolean(Number(row.is_upgraded || 0));
       const hasCurrentTierVoucher = Boolean(Number(row.has_current_tier_voucher || 0));
-      const notGrantableReason = hasCurrentTierVoucher
+      const rawCodeId = row.codeid == null ? null : Number(row.codeid);
+      const notGrantableReason = rawCodeId === 3
+        ? 'cd_accounts_have_no_digital_vouchers'
+        : rawCodeId != null && ![1, 2].includes(rawCodeId)
+          ? 'unknown_effective_account_state'
+          : hasCurrentTierVoucher
         ? 'already_has_voucher_for_current_tier'
         : null;
       return {

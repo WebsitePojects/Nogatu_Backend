@@ -43,7 +43,7 @@ router.use(adminAuth, adminRights([1, 2, 3]));
 
 function normalizeVoucherStatus(raw) {
   const value = String(raw || 'all').toLowerCase();
-  return ['1', '2', '3', '4'].includes(value) ? Number(value) : 'all';
+  return ['1', '2', '3', '4', '5'].includes(value) ? Number(value) : 'all';
 }
 
 /**
@@ -189,7 +189,8 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
               SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS activeCount,
               SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) AS expiredCount,
               SUM(CASE WHEN status = 3 THEN 1 ELSE 0 END) AS fullyUsedCount,
-              SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) AS suspendedCount
+              SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END) AS suspendedCount,
+              SUM(CASE WHEN status = 5 THEN 1 ELSE 0 END) AS revokedCount
        FROM voucherstab`
     );
 
@@ -246,6 +247,7 @@ router.get('/', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
         expired: Number(countsRows[0]?.expiredCount || 0),
         fullyUsed: Number(countsRows[0]?.fullyUsedCount || 0),
         suspended: Number(countsRows[0]?.suspendedCount || 0),
+        revoked: Number(countsRows[0]?.revokedCount || 0),
       },
       pagination: {
         page,

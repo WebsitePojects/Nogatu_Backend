@@ -170,11 +170,15 @@ async function buildCodeFilter(req, adminRight) {
  */
 router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const { noOfCodes, productType, codeType } = req.body;
+    const { noOfCodes, productType, codeType, arNumber } = req.body;
+    const idempotencyKey = (typeof req.get === 'function' ? req.get('Idempotency-Key') : req.headers?.['idempotency-key']) || req.body?.idempotencyKey;
 
-    if (!noOfCodes || noOfCodes < 1 || noOfCodes > 1000) {
-      return res.status(400).json({ error: 'Number of codes must be 1-1000' });
+    const codeValidation = validateCodeGenerationRequest(productType, codeType);
+    if (!codeValidation.valid) return res.status(400).json({ error: codeValidation.error });
+    if (!Number.isInteger(Number(noOfCodes)) || Number(noOfCodes) < 1 || Number(noOfCodes) > 500) {
+      return res.status(400).json({ error: 'Number of codes must be a positive integer no greater than 500' });
     }
+    if (!idempotencyKey) return res.status(400).json({ error: 'Idempotency-Key header is required' });
 
     // productType/codeType were previously passed straight to the generator with no
     // validation at all. Validate at the boundary and fail closed: an unknown product
@@ -192,13 +196,15 @@ router.post('/generate', adminAuth, adminRights([1, 3]), async (req, res) => {
       {
         adminUsername: req.session.adminid || null,
         actorAdminId: req.session.adminNumericId || null,
-      }
+      },
+      { arNumber, idempotencyKey }
     );
 
     res.json({ success: true, count: codes.length, codes });
   } catch (err) {
     console.error('[Admin Codes] Generate error:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    const status = ['INVALID_CODE_GENERATION_REQUEST', 'IDEMPOTENCY_PAYLOAD_MISMATCH'].includes(err.code) ? 400 : err.code === 'GENERATION_IN_PROGRESS' ? 409 : 500;
+    res.status(status).json({ error: status === 500 ? 'Internal server error' : err.message });
   }
 });
 
