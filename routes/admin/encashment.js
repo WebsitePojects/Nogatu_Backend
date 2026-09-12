@@ -15,6 +15,7 @@ const {
   sendCsv,
 } = require('../../services/csvExport');
 const { resolvePayoutOption: resolveSinglePayoutOption } = require('../../services/payoutOptions');
+const { TAX_RATE } = require('../../utils/finance');
 
 const PACKAGE_LABELS = {
   10: 'Bronze',
@@ -25,7 +26,7 @@ const PACKAGE_LABELS = {
   60: 'Diamond',
 };
 
-function buildEncashmentWhereClause({ startDate = '', endDate = '', q = '' }) {
+function buildEncashmentWhereClause({ startDate = '', endDate = '', q = '', cashStatus = '' }) {
   let whereSql = `WHERE (p.transactiontype = 10 OR p.encashment1 > 0)`;
   const whereParams = [];
   const searchLike = `%${q}%`;
@@ -50,6 +51,11 @@ function buildEncashmentWhereClause({ startDate = '', endDate = '', q = '' }) {
       )
     `;
     whereParams.push(searchLike, searchLike, searchLike, searchLike);
+  }
+
+  if (cashStatus === 'paid' || cashStatus === 'pending') {
+    whereSql += ' AND p.cashstatus = ?';
+    whereParams.push(cashStatus === 'paid' ? 1 : 0);
   }
 
   return { whereSql, whereParams };
@@ -88,6 +94,7 @@ function mapEncashmentRow(r) {
   const payoutOption = payout?.label || 'N/A';
   const payoutRaw = String(r.paymentdetails || r.payoutdetails || '').trim();
   const payoutDetails = buildPayoutDisplay(payout?.label, payoutRaw);
+  const grossEncashment = Number(r.encashment1 || 0) + tax + fee + cdDeduction;
 
   return {
     pid: Number(r.pid),
@@ -95,7 +102,9 @@ function mapEncashmentRow(r) {
     username: r.username || 'N/A',
     fullname: fullName,
     encashment: Number(r.encashment1 || 0),
+    grossEncashment,
     tax,
+    taxRatePercent: Number((TAX_RATE * 100).toFixed(2)),
     fee,
     cdDeduction,
     deductions: tax + fee + cdDeduction,
@@ -144,7 +153,8 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     const startDate = (req.query.startDate || '').trim();
     const endDate = (req.query.endDate || '').trim();
     const q = (req.query.q || '').trim();
-    const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q });
+    const cashStatus = (req.query.cashStatus || '').trim().toLowerCase();
+    const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q, cashStatus });
 
     const [countRows] = await pool.query(
       `SELECT COUNT(*) as total FROM payouthistorytab p
@@ -176,7 +186,8 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
     const startDate = (req.query.startDate || '').trim();
     const endDate = (req.query.endDate || '').trim();
     const q = (req.query.q || '').trim();
-    const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q });
+    const cashStatus = (req.query.cashStatus || '').trim().toLowerCase();
+    const { whereSql, whereParams } = buildEncashmentWhereClause({ startDate, endDate, q, cashStatus });
     const records = await fetchEncashmentRows({ whereSql, whereParams });
     const summary = buildEncashmentSummary(records);
     const csv = buildSectionedCsv([
@@ -269,6 +280,7 @@ router.get('/:pid/details', adminAuth, adminRights([1, 3]), async (req, res) => 
     const grossEncashment = Number(row.transactiontype || 0) === 10
       ? netReceivable + deductions
       : 0;
+    const taxRatePercent = Number((TAX_RATE * 100).toFixed(2));
 
     const income = {
       directReferral: Number(row.income1 || 0),
@@ -307,6 +319,7 @@ router.get('/:pid/details', adminAuth, adminRights([1, 3]), async (req, res) => 
       netReceivable,
       deductions: {
         tax,
+        taxRatePercent,
         fee,
         cdDeduction,
         total: deductions,
