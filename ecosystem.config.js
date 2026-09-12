@@ -25,9 +25,7 @@ module.exports = {
       },
       max_memory_restart: '512M',
       restart_delay: 3000,
-      // Green is validated by its listener and HTTP health/readiness probes.
-      // Do not make staging worker availability depend on PM2's ready handshake.
-      wait_ready: false,
+      wait_ready: true,
       listen_timeout: 15000,
       kill_timeout: 5000,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
@@ -44,7 +42,7 @@ module.exports = {
       },
       max_memory_restart: '512M',
       restart_delay: 3000,
-      wait_ready: true,
+      // Green is validated by its listener and HTTP health/readiness probes.\r\n      // Do not make staging worker availability depend on PM2 readiness IPC.\r\n      wait_ready: false,
       listen_timeout: 15000,
       kill_timeout: 5000,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
