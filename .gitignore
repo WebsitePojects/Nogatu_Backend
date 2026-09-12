@@ -9,3 +9,4 @@ db/
 backups/
 
 *.zip
+.env.staging
