@@ -28,6 +28,10 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
   const safePage = Math.max(1, Number(page) || 1);
   const safePerPage = Math.min(200, Math.max(1, Number(perPage) || 50));
   const trace = await getLeadershipTraceability(uid);
+  const [[storedRow]] = await pool.query(
+    'SELECT ROUND(COALESCE(ttlincome3,0),2) AS storedLeadership FROM payouttotaltab WHERE uid = ?',
+    [uid]
+  );
   const [directCountRows] = await pool.query(
     'SELECT COUNT(*) AS total FROM usertab WHERE drefid = ?',
     [uid]
@@ -43,6 +47,23 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
     amount: row.leadershipBonus,
     directReferralCount: row.directReferralCount,
   }));
+  const traceableTotal = allRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const storedLeadership = Number(storedRow?.storedLeadership || 0);
+  const legacyAmount = Math.max(0, Number((storedLeadership - traceableTotal).toFixed(2)));
+  if (legacyAmount > 0) {
+    allRows.push({
+      uid: null,
+      rowType: 'legacy_reconciliation',
+      username: 'LEGACY-RECORD',
+      fullname: 'Legacy record — historical leadership income',
+      level: 0,
+      ratePercent: 0,
+      pairingIncome: 0,
+      amount: legacyAmount,
+      directReferralCount: 0,
+      note: 'Verified credited income from before per-event traceability; retained for reconciliation and not re-credited.',
+    });
+  }
   const levelRows = [...allRows].sort((left, right) =>
     Number(left.level || 0) - Number(right.level || 0)
     || String(left.fullname || left.username || '').localeCompare(String(right.fullname || right.username || ''))
@@ -54,7 +75,7 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
   const rows = allRows.slice(offset, offset + safePerPage);
 
   return {
-    formula: 'Leadership bonus is 5% of level 1 pairing income, 2% of level 2, and 1% of levels 3 to 5.',
+    formula: 'Leadership bonus is 5% of eligible level 1 pairing income, 2% of level 2, and 1% of levels 3 to 5. Legacy income without per-event traceability is shown separately for reconciliation.',
     rows,
     total,
     page: safePage,
@@ -63,6 +84,9 @@ async function buildLeadershipBreakdown(uid, page = 1, perPage = 50) {
     totalPages,
     summary: {
       totalSources: trace.totalSources,
+      traceableTotal,
+      legacyReconciliation: legacyAmount,
+      creditedLifetimeTotal: total,
       directReferralCount: Number(directCountRows[0]?.total || 0),
       byLevel: trace.byLevel,
     },
@@ -551,11 +575,12 @@ router.get('/breakdown/:metric/export', memberAuth, async (req, res) => {
       '#': index + 1,
       Username: row.username || '',
       Fullname: row.fullname || '',
-      Level: Number(row.level || 0),
-      RatePercent: Number(row.ratePercent || 0),
+      Level: row.rowType === 'legacy_reconciliation' ? 'Legacy reconciliation' : Number(row.level || 0),
+      RatePercent: row.rowType === 'legacy_reconciliation' ? '' : Number(row.ratePercent || 0),
       PairingIncome: Number(row.pairingIncome || 0),
       LeadershipBonus: Number(row.amount || 0),
       DirectReferrals: Number(row.directReferralCount || 0),
+      Note: row.note || '',
     }));
     exportRows.push({
       '#': '',

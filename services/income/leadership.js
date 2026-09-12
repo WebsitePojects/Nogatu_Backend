@@ -4,6 +4,7 @@
  * traceability rows for member/admin audit views.
  */
 const { pool } = require('../../config/database');
+const { countsForPairingSource } = require('../accountState');
 
 function toNumber(value) {
   return Number(value || 0);
@@ -47,7 +48,7 @@ function summarizeLeadershipTraceability(rows = []) {
   };
 }
 
-async function collectLeadershipTraceability(parentUid, level, conn, results) {
+async function collectLeadershipTraceability(parentUid, level, conn, results, visited = new Set([toNumber(parentUid)])) {
   if (level > 5) return;
 
   const [rows] = await conn.query(
@@ -56,6 +57,10 @@ async function collectLeadershipTraceability(parentUid, level, conn, results) {
         m.username,
         m.firstname,
         m.lastname,
+        u.codeid,
+        u.cdamount,
+        u.cdtotal,
+        u.cdstatus,
         COALESCE(p.ttlincome2, 0) AS pairingIncome,
         (
           SELECT COUNT(*)
@@ -71,16 +76,27 @@ async function collectLeadershipTraceability(parentUid, level, conn, results) {
   );
 
   for (const row of rows) {
-    results.push({
-      uid: toNumber(row.uid),
-      username: row.username || null,
-      fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || `UID ${row.uid}`,
-      level,
-      pairingIncome: toNumber(row.pairingIncome),
-      directReferralCount: toNumber(row.directReferralCount),
-    });
+    // Cycle guard + dedupe: seeded with the root uid so a self-referencing drefid (or any
+    // drefid cycle looping back to an already-processed node) cannot be walked/counted twice.
+    // A node has exactly ONE drefid parent in a valid tree, so this is a no-op on real data.
+    const childUid = toNumber(row.uid);
+    if (visited.has(childUid)) continue;
+    visited.add(childUid);
 
-    await collectLeadershipTraceability(row.uid, level + 1, conn, results);
+    // Test/legacy adapters may omit account-state columns; preserve their historical
+    // trace behavior. Production queries above always provide codeid/cdstatus.
+    if (row.codeid == null || countsForPairingSource(row)) {
+      results.push({
+        uid: toNumber(row.uid),
+        username: row.username || null,
+        fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || `UID ${row.uid}`,
+        level,
+        pairingIncome: toNumber(row.pairingIncome),
+        directReferralCount: toNumber(row.directReferralCount),
+      });
+    }
+
+    await collectLeadershipTraceability(row.uid, level + 1, conn, results, visited);
   }
 }
 
