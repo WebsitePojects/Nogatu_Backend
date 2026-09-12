@@ -4,6 +4,7 @@
  * traceability rows for member/admin audit views.
  */
 const { pool } = require('../../config/database');
+const { countsForPairingSource } = require('../accountState');
 
 function toNumber(value) {
   return Number(value || 0);
@@ -56,6 +57,10 @@ async function collectLeadershipTraceability(parentUid, level, conn, results, vi
         m.username,
         m.firstname,
         m.lastname,
+        u.codeid,
+        u.cdamount,
+        u.cdtotal,
+        u.cdstatus,
         COALESCE(p.ttlincome2, 0) AS pairingIncome,
         (
           SELECT COUNT(*)
@@ -78,14 +83,18 @@ async function collectLeadershipTraceability(parentUid, level, conn, results, vi
     if (visited.has(childUid)) continue;
     visited.add(childUid);
 
-    results.push({
-      uid: toNumber(row.uid),
-      username: row.username || null,
-      fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || `UID ${row.uid}`,
-      level,
-      pairingIncome: toNumber(row.pairingIncome),
-      directReferralCount: toNumber(row.directReferralCount),
-    });
+    // Test/legacy adapters may omit account-state columns; preserve their historical
+    // trace behavior. Production queries above always provide codeid/cdstatus.
+    if (row.codeid == null || countsForPairingSource(row)) {
+      results.push({
+        uid: toNumber(row.uid),
+        username: row.username || null,
+        fullName: `${row.firstname || ''} ${row.lastname || ''}`.trim() || row.username || `UID ${row.uid}`,
+        level,
+        pairingIncome: toNumber(row.pairingIncome),
+        directReferralCount: toNumber(row.directReferralCount),
+      });
+    }
 
     await collectLeadershipTraceability(row.uid, level + 1, conn, results, visited);
   }
