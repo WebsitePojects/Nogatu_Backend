@@ -37,7 +37,7 @@ module.exports = {
       exec_mode: 'cluster',
       instances: 2,
       env: {
-        NODE_ENV: 'staging',
+        NODE_ENV: 'development',
         PORT: 5003,
       },
       max_memory_restart: '512M',
