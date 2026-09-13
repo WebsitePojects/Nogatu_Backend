@@ -1,10 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  canonical,
   readCandidates,
   applyManifest,
   hashManifest,
+  assertExpected,
   assertExpectedHash,
+  assertManifestScope,
   assertProductionConfirmation,
 } = require('../../scripts/cdVoucherRevocation');
 
@@ -74,6 +77,43 @@ test('readCandidates fails closed when upgraded account state is unknown', async
   await assert.rejects(() => readCandidates(conn), /Unknown effective account state/);
 });
 
+test('manifest rows reject duplicate voucher ids and invalid statuses', () => {
+  assert.throws(
+    () => canonical([
+      { voucherId: 7, uid: 10, packageType: 30, remainingBalance: 99, status: 1 },
+      { voucherId: 7, uid: 11, packageType: 30, remainingBalance: 99, status: 1 },
+    ]),
+    /duplicate voucherId/
+  );
+
+  assert.throws(
+    () => canonical([{ voucherId: 7, uid: 10, packageType: 30, remainingBalance: 99, status: 5 }]),
+    /Invalid manifest status/
+  );
+});
+
+test('expected count and remaining total are both required', () => {
+  const manifest = [{ voucherId: 7, uid: 10, packageType: 30, remainingBalance: 99, status: 1 }];
+
+  assert.throws(() => assertExpected(manifest, null, 99), /expected-count is required/);
+  assert.throws(() => assertExpected(manifest, 1, null), /expected-remaining is required/);
+  assert.throws(() => assertExpected(manifest, 1, 100), /remaining total does not match/);
+  assert.doesNotThrow(() => assertExpected(manifest, 1, 99));
+});
+
+test('apply refuses when active candidates contain a row outside the manifest', () => {
+  assert.throws(
+    () => assertManifestScope(
+      [
+        { voucherId: 7, uid: 10, packageType: 30, remainingBalance: 99, status: 1 },
+        { voucherId: 8, uid: 11, packageType: 30, remainingBalance: 50, status: 1 },
+      ],
+      [{ voucherId: 7, uid: 10, packageType: 30, remainingBalance: 99, status: 1 }]
+    ),
+    /outside the supplied manifest/
+  );
+});
+
 function makeApplyConnection(options = {}) {
   const voucher = {
     id: 7,
@@ -106,9 +146,6 @@ function makeApplyConnection(options = {}) {
         throw new Error(`Wallet/cash query is forbidden in revocation test: ${sql}`);
       }
       if (sql.includes('SELECT uid, accttype')) return [[account]];
-      if (sql.includes('FROM upgradetab up')) {
-        return [options.upgradeCodeType ? [{ codetype: options.upgradeCodeType }] : []];
-      }
       if (sql.includes('FROM upgradetab u')) {
         return [options.upgradeCodeType ? [{ codetype: options.upgradeCodeType, productamount: 10000 }] : []];
       }
@@ -164,6 +201,15 @@ test('apply is resumable and does not duplicate revocation audit or touch wallet
   assert.equal(second.revoked, 0);
   assert.equal(conn.audits.length, 1);
   assert.equal(conn.voucher.status, 5);
+
+  const writeSql = conn.calls
+    .map((call) => call.sql)
+    .filter((sql) => /^(UPDATE|INSERT)/i.test(sql));
+  assert.deepEqual(writeSql, [
+    'UPDATE voucherstab SET status = 5, revoked_at = NOW(), revocation_reason = ?, revoked_by = ? WHERE id = ? AND status <> 5',
+    'INSERT INTO voucher_revocation_audittab (run_id, manifest_hash, voucher_id, uid, package_type, remaining_balance, voucher_status_before, effective_code_type, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ]);
+  assert.ok(!writeSql.some((sql) => /remaining_balance\s*=|payout|wallet|cash/i.test(sql)));
 });
 
 test('apply refuses an already revoked voucher without matching manifest audit', async () => {

@@ -29,7 +29,7 @@ function assertSafeInteger(value, field) {
 
 function assertSafeStatus(value, field) {
   const n = Number(value);
-  if (!Number.isInteger(n) || n < 0 || n > 9) throw new Error(`Invalid manifest ${field}`);
+  if (!Number.isInteger(n) || n < 1 || n > 4) throw new Error(`Invalid manifest ${field}`);
   return n;
 }
 
@@ -40,7 +40,7 @@ function assertSafeMoney(value, field) {
 }
 
 function canonical(rows) {
-  return rows
+  const normalized = rows
     .map((row) => ({
       voucherId: assertSafeInteger(row.voucherId, 'voucherId'),
       uid: assertSafeInteger(row.uid, 'uid'),
@@ -49,6 +49,14 @@ function canonical(rows) {
       status: assertSafeStatus(row.status, 'status'),
     }))
     .sort((a, b) => a.voucherId - b.voucherId);
+
+  for (let i = 1; i < normalized.length; i += 1) {
+    if (normalized[i].voucherId === normalized[i - 1].voucherId) {
+      throw new Error('Manifest contains duplicate voucherId rows');
+    }
+  }
+
+  return normalized;
 }
 
 function hashManifest(rows) {
@@ -113,11 +121,12 @@ function assertExpected(rows, expectedCount, expectedRemaining) {
   if (rows.length !== Number(expectedCount)) {
     throw new Error('Candidate count does not match --expected-count');
   }
-  if (expectedRemaining != null) {
-    const total = money(rows.reduce((sum, row) => sum + Number(row.remainingBalance || 0), 0));
-    if (total !== money(expectedRemaining)) {
-      throw new Error('Candidate remaining total does not match --expected-remaining');
-    }
+  if (expectedRemaining == null) {
+    throw new Error('--expected-remaining is required');
+  }
+  const total = money(rows.reduce((sum, row) => sum + Number(row.remainingBalance || 0), 0));
+  if (total !== money(expectedRemaining)) {
+    throw new Error('Candidate remaining total does not match --expected-remaining');
   }
 }
 
@@ -149,16 +158,8 @@ async function applyManifest(conn, manifest, manifestHashValue) {
       );
       if (!accountRows.length) throw new Error('Account disappeared during revocation');
 
-      const [upgradeRows] = await conn.query(
-        'SELECT c.codetype FROM upgradetab up INNER JOIN codestab c ON c.id = up.codeid WHERE up.uid = ? AND up.transtype = 1 ORDER BY up.transdate DESC, up.id DESC LIMIT 1',
-        [item.uid]
-      );
-
       const account = accountRows[0];
-      const policy = await resolveVoucherAccountPolicy(conn, item.uid, {
-        ...account,
-        upgrade_codetype: upgradeRows[0]?.codetype ?? 0,
-      });
+      const policy = await resolveVoucherAccountPolicy(conn, item.uid, account);
       if (!policy.known || policy.effectiveCodeType !== 'CD') {
         throw new Error('Effective account state changed or is unknown; refusing stale manifest row');
       }
