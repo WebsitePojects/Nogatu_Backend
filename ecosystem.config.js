@@ -4,12 +4,11 @@
  * Blue  (nogatu-mlm)       = live production,  port 5002, /var/www/nogatu
  * Green (nogatu-mlm-green) = staging candidate, port 5003, /var/www/nogatu-green
  *
- * Deploy flow:
- *   1. GitHub Actions deploys to green and runs health/smoke checks
- *   2. scripts/deploy/swap.sh switches Nginx upstream to :5003
- *   3. Blue stays warm as hot standby; rollback = swap.sh blue
+ * Green is staging-only. Production routing remains on blue port 5002 unless a separate
+ * promotion/swap is explicitly authorized after QA.
  *
- * Scale instances to 'max' (all CPU cores) for 100k-user production load.
+ * Routine staging commands must target green with --only nogatu-mlm-green. The live blue process
+ * currently runs as fork/1 on the VPS, so do not recreate it from this shared file during staging.
  */
 module.exports = {
   apps: [
