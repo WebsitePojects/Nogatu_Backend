@@ -52,6 +52,8 @@ const PACKAGES = { BRONZE: 10, SILVER: 20, GOLD: 30, PLATINUM: 40, GARNET: 50, D
 const CD = 3;
 const PD = 1;
 const FS = 2;
+const AR_NUMBER = 'AR-2026-09-13-001';
+const IDEMPOTENCY_KEY = 'generate-codes-test-001';
 
 // ── The rule ─────────────────────────────────────────────────────────────
 
@@ -157,6 +159,39 @@ test('generateCodes rejects BEFORE writing anything to the database', async () =
   assert.deepEqual(queries, [], 'a rejected CD request must issue ZERO queries');
 });
 
+test('generateCodes requires a non-empty AR number before writing anything to the database', async () => {
+  delete require.cache[codeGenPath];
+  const queries = [];
+  const { generateCodes } = withStubbedModules({
+    [path.join(repoRoot, 'config', 'database.js')]: {
+      pool: {
+        async query(sql) { queries.push(sql); return [[{ maxId: 1000 }]]; },
+        async getConnection() {
+          throw new Error('getConnection should not be reached without a valid AR number');
+        },
+      },
+    },
+  }, () => require(codeGenPath));
+
+  await assert.rejects(
+    () => generateCodes(
+      1,
+      PACKAGES.GOLD,
+      CD,
+      1,
+      { adminUsername: 'tester' },
+      { arNumber: '   ', idempotencyKey: IDEMPOTENCY_KEY }
+    ),
+    (err) => {
+      assert.equal(err.code, 'INVALID_CODE_GENERATION_REQUEST');
+      assert.match(err.message, /AR number is required/);
+      return true;
+    }
+  );
+  assert.deepEqual(queries, [], 'a request without a usable AR number must issue ZERO queries');
+  delete require.cache[codeGenPath];
+});
+
 // ── Route boundary: the UI is bypassed ───────────────────────────────────
 
 function loadCodesRouter() {
@@ -165,6 +200,22 @@ function loadCodesRouter() {
     [path.join(repoRoot, 'middleware', 'auth.js')]: {
       adminAuth: (req, res, next) => next(),
       adminRights: () => (req, res, next) => next(),
+    },
+    [codeGenPath]: {
+      validateCodeGenerationRequest,
+      async generateCodes(noOfCodes, productType, codeType, stockistId, adminContext, options = {}) {
+        if (typeof options.arNumber !== 'string' || !options.arNumber.trim()) {
+          const error = new Error('AR number is required and must be a non-empty string of at most 120 characters');
+          error.code = 'INVALID_CODE_GENERATION_REQUEST';
+          throw error;
+        }
+        if (typeof options.idempotencyKey !== 'string' || !options.idempotencyKey.trim()) {
+          const error = new Error('Idempotency-Key is required');
+          error.code = 'INVALID_CODE_GENERATION_REQUEST';
+          throw error;
+        }
+        return ['TESTCODE'];
+      },
     },
     [path.join(repoRoot, 'config', 'database.js')]: {
       pool: { query: async () => [[]], getConnection: async () => ({}) },
@@ -190,6 +241,16 @@ function createResponse() {
   };
 }
 
+async function withSilencedConsoleError(fn) {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    return await fn();
+  } finally {
+    console.error = original;
+  }
+}
+
 test('POST /generate returns 400 for a CD code on Bronze (raw request, no UI involved)', async () => {
   const router = loadCodesRouter();
   const handler = getRouteHandler(router, 'post', '/generate');
@@ -197,7 +258,16 @@ test('POST /generate returns 400 for a CD code on Bronze (raw request, no UI inv
 
   const res = createResponse();
   await handler(
-    { body: { noOfCodes: 10, productType: PACKAGES.BRONZE, codeType: CD }, session: { adminid: 'admin' } },
+    {
+      body: {
+        noOfCodes: 10,
+        productType: PACKAGES.BRONZE,
+        codeType: CD,
+        arNumber: AR_NUMBER,
+        idempotencyKey: IDEMPOTENCY_KEY,
+      },
+      session: { adminid: 'admin' },
+    },
     res
   );
 
@@ -205,13 +275,48 @@ test('POST /generate returns 400 for a CD code on Bronze (raw request, no UI inv
   assert.match(res.body.error, /CD Slot is only available for/);
 });
 
-test('POST /generate still accepts a CD code on Gold and Platinum', async () => {
+test('POST /generate requires an AR number even for allowed Gold and Platinum CD codes', async () => {
+  for (const tier of [PACKAGES.GOLD, PACKAGES.PLATINUM]) {
+    const router = loadCodesRouter();
+    const handler = getRouteHandler(router, 'post', '/generate');
+    const res = createResponse();
+    await withSilencedConsoleError(async () => {
+      await handler(
+        {
+          body: {
+            noOfCodes: 1,
+            productType: tier,
+            codeType: CD,
+            arNumber: '   ',
+            idempotencyKey: `${IDEMPOTENCY_KEY}-${tier}`,
+          },
+          session: { adminid: 'admin' },
+        },
+        res
+      );
+    });
+
+    assert.equal(res.statusCode, 400, `CD on product ${tier} without AR must be rejected`);
+    assert.match(res.body.error, /AR number is required/);
+  }
+});
+
+test('POST /generate still accepts a CD code on Gold and Platinum when AR is supplied', async () => {
   for (const tier of [PACKAGES.GOLD, PACKAGES.PLATINUM]) {
     const router = loadCodesRouter();
     const handler = getRouteHandler(router, 'post', '/generate');
     const res = createResponse();
     await handler(
-      { body: { noOfCodes: 1, productType: tier, codeType: CD }, session: { adminid: 'admin' } },
+      {
+        body: {
+          noOfCodes: 1,
+          productType: tier,
+          codeType: CD,
+          arNumber: AR_NUMBER,
+          idempotencyKey: `${IDEMPOTENCY_KEY}-${tier}`,
+        },
+        session: { adminid: 'admin' },
+      },
       res
     );
     // Not a 400: the request passes validation. (It proceeds into the generator,

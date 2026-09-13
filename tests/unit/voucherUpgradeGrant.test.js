@@ -29,10 +29,46 @@ const {
   UNUSED_VOUCHER_EXPIRY_MONTHS,
 } = require('../../services/voucher');
 
-// Small in-memory model of the two tables these functions touch (usertab, voucherstab).
+function accountState(overrides = {}) {
+  return {
+    uid: 1,
+    currentaccttype: 20,
+    accttype: 20,
+    codeid: 1,
+    cdamount: 0,
+    cdtotal: 0,
+    cdstatus: 0,
+    ...overrides,
+  };
+}
+
+function upgradeState(overrides = {}) {
+  return {
+    uid: 1,
+    producttype: 20,
+    upgradecodeid: 7001,
+    codetype: 1,
+    productamount: 5000,
+    ...overrides,
+  };
+}
+
+function voucherInsertCalls(conn) {
+  return conn.calls.filter((call) => /INSERT\s+INTO\s+voucherstab/i.test(call.sql));
+}
+
+// Small in-memory model of the tables these functions touch through the real
+// voucher/account-state policy path (usertab, upgradetab, codestab, voucherstab).
 // Any UPDATE/DELETE against voucherstab throws — that is how "grants are INSERT-only"
 // gets falsified, not just asserted after the fact.
-function makeConn({ account = null, vouchers = [] } = {}) {
+function makeConn(options = {}) {
+  const account = Object.prototype.hasOwnProperty.call(options, 'account')
+    ? options.account
+    : accountState();
+  const upgrade = Object.prototype.hasOwnProperty.call(options, 'upgrade')
+    ? options.upgrade
+    : null;
+  const vouchers = options.vouchers || [];
   const calls = [];
   const state = { vouchers: vouchers.map((v) => ({ ...v })), nextId: 9000 };
   return {
@@ -67,8 +103,13 @@ function makeConn({ account = null, vouchers = [] } = {}) {
         return [matches.map((v) => ({ id: v.id }))];
       }
 
+      if (/FROM\s+upgradetab/i.test(sql)) {
+        if (!upgrade) return [[]];
+        return [[{ uid: Number(params[0]), ...upgrade }]];
+      }
+
       if (/FROM\s+usertab/i.test(sql)) {
-        return [account ? [account] : []];
+        return [account ? [{ uid: Number(params[0]), ...account }] : []];
       }
 
       return [[]];
@@ -103,7 +144,11 @@ test('hasVoucherForPackage: true regardless of status (1/2/3) and remaining_bala
 // ── isEligibleForPackageVoucher ──
 
 test('eligible when the member has NO voucher at all', async () => {
-  const conn = makeConn({ account: { currentaccttype: 20, accttype: 10 }, vouchers: [] });
+  const conn = makeConn({
+    account: accountState({ currentaccttype: 20, accttype: 10, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 20, codetype: 1, productamount: 5000 }),
+    vouchers: [],
+  });
   const result = await isEligibleForPackageVoucher(conn, 42);
   assert.deepStrictEqual(result, {
     eligible: true, reason: 'eligible', currentTier: 20, joinedTier: 10, amount: 5000,
@@ -112,7 +157,8 @@ test('eligible when the member has NO voucher at all', async () => {
 
 test('SeniorDelia case: joined Bronze(10), voucher fully used at 10, now Silver(20) -> eligible', async () => {
   const conn = makeConn({
-    account: { currentaccttype: 20, accttype: 10 },
+    account: accountState({ currentaccttype: 20, accttype: 10, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 20, codetype: 1, productamount: 5000 }),
     vouchers: [{ id: 501, uid: 77, package_type: 10, status: 3, remaining_balance: 0 }],
   });
   const result = await isEligibleForPackageVoucher(conn, 77);
@@ -124,7 +170,8 @@ test('SeniorDelia case: joined Bronze(10), voucher fully used at 10, now Silver(
 
 test('NOT eligible when a voucher already exists at the CURRENT tier, status=3 fully used, remaining_balance=0', async () => {
   const conn = makeConn({
-    account: { currentaccttype: 20, accttype: 10 },
+    account: accountState({ currentaccttype: 20, accttype: 10, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 20, codetype: 1, productamount: 5000 }),
     vouchers: [{ id: 9, uid: 3, package_type: 20, status: 3, remaining_balance: 0 }],
   });
   const result = await isEligibleForPackageVoucher(conn, 3);
@@ -139,7 +186,8 @@ test('NOT eligible when a voucher already exists at the CURRENT tier, status=3 f
 
 test('NOT eligible when a voucher already exists at the current tier, status=1 active, remaining_balance>0', async () => {
   const conn = makeConn({
-    account: { currentaccttype: 30, accttype: 20 },
+    account: accountState({ currentaccttype: 30, accttype: 20, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 30, codetype: 1, productamount: 10000 }),
     vouchers: [{ id: 10, uid: 4, package_type: 30, status: 1, remaining_balance: 10000 }],
   });
   const result = await isEligibleForPackageVoucher(conn, 4);
@@ -148,10 +196,10 @@ test('NOT eligible when a voucher already exists at the current tier, status=1 a
 });
 
 test('NOT eligible for an unknown package type (not a PACKAGE_AMOUNTS key)', async () => {
-  const conn = makeConn({ account: { currentaccttype: 99, accttype: 0 }, vouchers: [] });
+  const conn = makeConn({ account: accountState({ currentaccttype: 99, accttype: 99, codeid: 1 }), vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 6);
   assert.deepStrictEqual(result, {
-    eligible: false, reason: 'unknown_package', currentTier: null, joinedTier: 0, amount: null,
+    eligible: false, reason: 'unknown_package', currentTier: null, joinedTier: 99, amount: null,
   });
 });
 
@@ -164,29 +212,65 @@ test('NOT eligible for a missing account (no usertab row)', async () => {
 });
 
 test('currentaccttype takes precedence over accttype', async () => {
-  const conn = makeConn({ account: { currentaccttype: 40, accttype: 10 }, vouchers: [] });
+  const conn = makeConn({
+    account: accountState({ currentaccttype: 40, accttype: 10, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 40, codetype: 1, productamount: 25000 }),
+    vouchers: [],
+  });
   const result = await isEligibleForPackageVoucher(conn, 8);
   assert.strictEqual(result.currentTier, 40);
   assert.strictEqual(result.amount, 25000);
 });
 
 test('falls back to accttype when currentaccttype is 0', async () => {
-  const conn = makeConn({ account: { currentaccttype: 0, accttype: 30 }, vouchers: [] });
+  const conn = makeConn({ account: accountState({ currentaccttype: 0, accttype: 30, codeid: 1 }), vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 9);
   assert.strictEqual(result.currentTier, 30);
 });
 
 test('falls back to accttype when currentaccttype is null', async () => {
-  const conn = makeConn({ account: { currentaccttype: null, accttype: 50 }, vouchers: [] });
+  const conn = makeConn({ account: accountState({ currentaccttype: null, accttype: 50, codeid: 1 }), vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 10);
   assert.strictEqual(result.currentTier, 50);
 });
 
 test('unknown_package when BOTH currentaccttype and accttype are 0/null (fail closed)', async () => {
-  const conn = makeConn({ account: { currentaccttype: 0, accttype: null }, vouchers: [] });
+  const conn = makeConn({ account: accountState({ currentaccttype: 0, accttype: null, codeid: 1 }), vouchers: [] });
   const result = await isEligibleForPackageVoucher(conn, 11);
   assert.deepStrictEqual(result, {
     eligible: false, reason: 'unknown_package', currentTier: null, joinedTier: 0, amount: null,
+  });
+});
+
+test('eligible for a known effective FS account state', async () => {
+  const conn = makeConn({ account: accountState({ currentaccttype: 20, accttype: 20, codeid: 2 }), vouchers: [] });
+  const result = await isEligibleForPackageVoucher(conn, 12);
+  assert.deepStrictEqual(result, {
+    eligible: true, reason: 'eligible', currentTier: 20, joinedTier: 20, amount: 5000,
+  });
+});
+
+test('NOT eligible for an unknown effective account state (fail closed)', async () => {
+  const conn = makeConn({ account: accountState({ currentaccttype: 20, accttype: 20, codeid: 99 }), vouchers: [] });
+  const result = await isEligibleForPackageVoucher(conn, 13);
+  assert.deepStrictEqual(result, {
+    eligible: false, reason: 'unknown_effective_account_state', currentTier: null, joinedTier: null, amount: null,
+  });
+});
+
+test('NOT eligible when the effective upgrade state is still CD', async () => {
+  const conn = makeConn({
+    account: accountState({ currentaccttype: 30, accttype: 10, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 30, codetype: 3, productamount: 10000 }),
+    vouchers: [],
+  });
+  const result = await isEligibleForPackageVoucher(conn, 14);
+  assert.deepStrictEqual(result, {
+    eligible: false,
+    reason: 'cd_accounts_have_no_digital_vouchers',
+    currentTier: null,
+    joinedTier: null,
+    amount: null,
   });
 });
 
@@ -201,12 +285,13 @@ test('isEligibleForPackageVoucher throws (does not silently use the pool) when c
 test('issuePackageVoucher inserts the correct amount and expiry for each of the six tiers', async () => {
   for (const [tierStr, amount] of Object.entries(PACKAGE_AMOUNTS)) {
     const tier = Number(tierStr);
-    const conn = makeConn();
+    const conn = makeConn({ account: accountState({ currentaccttype: tier, accttype: tier, codeid: 1 }) });
     const insertId = await issuePackageVoucher(conn, 123, tier);
     assert.strictEqual(typeof insertId, 'number');
 
-    assert.strictEqual(conn.calls.length, 1);
-    const call = conn.calls[0];
+    const inserts = voucherInsertCalls(conn);
+    assert.strictEqual(inserts.length, 1);
+    const call = inserts[0];
     assert.match(call.sql, /INSERT\s+INTO\s+voucherstab/i);
     const [uid, packageType, voucherAmount, remainingBalance, expiryMonths] = call.params;
     assert.strictEqual(uid, 123);
@@ -218,10 +303,10 @@ test('issuePackageVoucher inserts the correct amount and expiry for each of the 
 });
 
 test('issuePackageVoucher accepts packageType as a numeric-looking STRING (object key coercion)', async () => {
-  const conn = makeConn();
+  const conn = makeConn({ account: accountState({ currentaccttype: 20, accttype: 20, codeid: 1 }) });
   const insertId = await issuePackageVoucher(conn, 5, '20');
   assert.strictEqual(typeof insertId, 'number');
-  const [, packageType, voucherAmount, remainingBalance, expiryMonths] = conn.calls[0].params;
+  const [, packageType, voucherAmount, remainingBalance, expiryMonths] = voucherInsertCalls(conn)[0].params;
   // packageType is passed through RAW (same as legacy issueVoucher) — MySQL coerces
   // the bound string to the INT column; Node-side lookups already resolved correctly.
   assert.strictEqual(packageType, '20');
@@ -238,15 +323,15 @@ test('issuePackageVoucher returns null for an unrecognized package type, with no
 });
 
 test('issuePackageVoucher works when called WITHOUT the options argument (no default-on-missing-name bug)', async () => {
-  const conn = makeConn();
+  const conn = makeConn({ account: accountState({ currentaccttype: 10, accttype: 10, codeid: 1 }) });
   const insertId = await issuePackageVoucher(conn, 5, 10);
   assert.strictEqual(typeof insertId, 'number');
 });
 
 test('issuePackageVoucher issues ONLY an INSERT — no UPDATE/DELETE against voucherstab', async () => {
-  const conn = makeConn();
+  const conn = makeConn({ account: accountState({ currentaccttype: 10, accttype: 10, codeid: 1 }) });
   await issuePackageVoucher(conn, 1, 10);
-  assert.strictEqual(conn.calls.length, 1);
+  assert.strictEqual(voucherInsertCalls(conn).length, 1);
   for (const call of conn.calls) {
     assert.doesNotMatch(call.sql, /UPDATE\s+voucherstab/i);
     assert.doesNotMatch(call.sql, /DELETE\s+FROM\s+voucherstab/i);
@@ -254,7 +339,7 @@ test('issuePackageVoucher issues ONLY an INSERT — no UPDATE/DELETE against vou
 });
 
 test('calling issuePackageVoucher twice does NOT modify the first row (additive, not replace)', async () => {
-  const conn = makeConn();
+  const conn = makeConn({ account: accountState({ currentaccttype: 20, accttype: 20, codeid: 1 }) });
   const firstId = await issuePackageVoucher(conn, 1, 10);
   const firstRowSnapshot = { ...conn.state.vouchers.find((v) => v.id === firstId) };
 
@@ -263,10 +348,29 @@ test('calling issuePackageVoucher twice does NOT modify the first row (additive,
   assert.notStrictEqual(firstId, secondId);
   assert.strictEqual(conn.state.vouchers.length, 2);
   assert.deepStrictEqual(conn.state.vouchers.find((v) => v.id === firstId), firstRowSnapshot);
-  assert.strictEqual(conn.calls.length, 2);
-  for (const call of conn.calls) {
+  const inserts = voucherInsertCalls(conn);
+  assert.strictEqual(inserts.length, 2);
+  for (const call of inserts) {
     assert.match(call.sql, /INSERT\s+INTO\s+voucherstab/i);
   }
+});
+
+test('issuePackageVoucher blocks an effective CD account and inserts no voucher row', async () => {
+  const conn = makeConn({
+    account: accountState({ currentaccttype: 30, accttype: 10, codeid: 1 }),
+    upgrade: upgradeState({ producttype: 30, codetype: 3, productamount: 10000 }),
+  });
+
+  await assert.rejects(
+    () => issuePackageVoucher(conn, 1, 30),
+    (err) => {
+      assert.strictEqual(err.code, 'CD_VOUCHER_POLICY_BLOCKED');
+      assert.strictEqual(err.effectiveCodeType, 'CD');
+      return true;
+    }
+  );
+  assert.strictEqual(voucherInsertCalls(conn).length, 0);
+  assert.strictEqual(conn.state.vouchers.length, 0);
 });
 
 test('issuePackageVoucher throws (does not silently use the pool) when called without a conn', async () => {
