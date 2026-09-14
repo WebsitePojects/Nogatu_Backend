@@ -44,6 +44,7 @@ const {
 const { requestId } = require('./utils/security');
 
 const rateLimit = require('express-rate-limit');
+const { resolveSessionCookieConfig } = require('./utils/sessionCookie');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const readinessState = {
@@ -234,12 +235,7 @@ app.use(session({
   store: sessionStore,
   resave: false,
   saveUninitialized: false,
-  cookie: {
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-  },
+  cookie: resolveSessionCookieConfig(process.env),
 }));
 
 app.use((req, res, next) => {

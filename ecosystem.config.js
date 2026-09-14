@@ -38,6 +38,8 @@ module.exports = {
       env: {
         NODE_ENV: 'development',
         PORT: 5003,
+        SESSION_COOKIE_SECURE: 'true',
+        SESSION_COOKIE_SAMESITE: 'none',
       },
       max_memory_restart: '512M',
       restart_delay: 3000,
