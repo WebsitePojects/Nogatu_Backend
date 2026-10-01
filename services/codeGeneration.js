@@ -146,122 +146,153 @@ function buildGenerationRequestHash({ noOfCodes, productType, codeType, stockist
     .digest('hex');
 }
 
-async function generateCodes(noOfCodes, productType, codeType, stockistId, adminContext, options = {}) {
+const CODE_GENERATION_LOCK = 'nogatu_code_generation';
+
+function invalidRequest(message, code = 'INVALID_CODE_GENERATION_REQUEST') {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * Validates and normalises a generation request. Shared by generateCodes() and the AR release so
+ * both enforce the same CD restriction, count cap and key format.
+ */
+function prepareGenerationRequest(noOfCodes, productType, codeType, stockistId, adminContext, options = {}) {
   // Re-validated here, not only at the route, so no future caller can bypass the
   // CD restriction by reaching the generator directly.
   const validation = validateCodeGenerationRequest(productType, codeType);
-  if (!validation.valid) {
-    const error = new Error(validation.error);
-    error.code = 'INVALID_CODE_GENERATION_REQUEST';
-    throw error;
-  }
+  if (!validation.valid) throw invalidRequest(validation.error);
 
   const count = Number(noOfCodes);
   if (!Number.isInteger(count) || count < 1 || count > 500) {
-    const error = new Error('Number of codes must be a positive integer no greater than 500');
-    error.code = 'INVALID_CODE_GENERATION_REQUEST';
-    throw error;
+    throw invalidRequest('Number of codes must be a positive integer no greater than 500');
   }
   const arNumber = normalizeRequiredText(options.arNumber, 'AR number');
   const idempotencyKey = normalizeRequiredText(options.idempotencyKey, 'Idempotency-Key', 64);
-  const keyPattern = /^[A-Za-z0-9_-]{8,64}$/;
-  if (!keyPattern.test(idempotencyKey)) {
-    const error = new Error('Idempotency-Key must contain 8-64 letters, numbers, hyphens, or underscores');
-    error.code = 'INVALID_CODE_GENERATION_REQUEST';
-    throw error;
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(idempotencyKey)) {
+    throw invalidRequest('Idempotency-Key must contain 8-64 letters, numbers, hyphens, or underscores');
   }
 
   const normalizedAdmin = normalizeAdminContext(adminContext);
-  const requestHash = buildGenerationRequestHash({ noOfCodes: count, productType: Number(productType), codeType: Number(codeType), stockistId: Number(stockistId), arNumber });
+  return {
+    count,
+    productType: Number(productType),
+    codeType: Number(codeType),
+    stockistId: Number(stockistId),
+    arNumber,
+    idempotencyKey,
+    normalizedAdmin,
+    // Admin generation always has an actor scope; use zero when an older session
+    // omitted the numeric id so the durable unique key cannot become NULL-scoped.
+    actorAdminId: normalizedAdmin.actorAdminId || 0,
+    requestHash: buildGenerationRequestHash({
+      noOfCodes: count, productType: Number(productType), codeType: Number(codeType),
+      stockistId: Number(stockistId), arNumber,
+    }),
+  };
+}
+
+async function acquireCodeGenerationLock(conn) {
+  const [lockRows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', [CODE_GENERATION_LOCK]);
+  return Number(lockRows[0]?.lockState || 0) === 1;
+}
+
+async function releaseCodeGenerationLock(conn) {
+  await conn.query('SELECT RELEASE_LOCK(?)', [CODE_GENERATION_LOCK]);
+}
+
+/**
+ * Core allocation. MUST run inside an open transaction on `conn` while the caller holds the
+ * generation lock (MAX(id)-based numbering is only collision-free under that lock).
+ *
+ * Returns { replayed: true, codes } when this idempotency key already completed (codes only, no
+ * row ids), or { replayed: false, codes, rows } with the freshly inserted { id, code } rows.
+ */
+async function allocateCodesInTransaction(conn, request) {
+  const {
+    count, productType, codeType, stockistId, arNumber, idempotencyKey,
+    normalizedAdmin, actorAdminId, requestHash,
+  } = request;
+
+  const replayOrReject = (row) => {
+    if (row?.request_hash !== requestHash) {
+      throw invalidRequest('This idempotency key was already used for a different generation request', 'IDEMPOTENCY_PAYLOAD_MISMATCH');
+    }
+    if (row?.status === 'completed') return { replayed: true, codes: JSON.parse(row.codes_json || '[]') };
+    throw invalidRequest('This generation request is already being processed', 'GENERATION_IN_PROGRESS');
+  };
+
+  const [existingRows] = await conn.query(
+    'SELECT * FROM code_generation_batchtab WHERE actor_admin_id <=> ? AND idempotency_key = ? LIMIT 1 FOR UPDATE',
+    [actorAdminId, idempotencyKey]
+  );
+  if (existingRows.length) return replayOrReject(existingRows[0]);
+
+  try {
+    await conn.query(
+      `INSERT INTO code_generation_batchtab
+        (idempotency_key, actor_admin_id, actor_admin, ar_number, request_hash, no_of_codes, product_type, code_type, stockist_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [idempotencyKey, actorAdminId, normalizedAdmin.adminUsername, arNumber, requestHash, count, productType, codeType, stockistId]
+    );
+  } catch (error) {
+    if (error.code !== 'ER_DUP_ENTRY') throw error;
+    const [duplicateRows] = await conn.query(
+      'SELECT request_hash, status, codes_json FROM code_generation_batchtab WHERE actor_admin_id <=> ? AND idempotency_key = ? LIMIT 1 FOR UPDATE',
+      [actorAdminId, idempotencyKey]
+    );
+    return replayOrReject(duplicateRows[0]);
+  }
+
+  const [[batch]] = await conn.query(
+    'SELECT id FROM code_generation_batchtab WHERE actor_admin_id <=> ? AND idempotency_key = ? LIMIT 1 FOR UPDATE',
+    [actorAdminId, idempotencyKey]
+  );
+  const [maxRows] = await conn.query('SELECT MAX(id) AS maxId FROM codestab');
+  const baseOffset = productType >= 1 && productType <= 99 ? 6100000 : 710000;
+  let nextNum = Number(maxRows[0]?.maxId || 0) + baseOffset;
+  const rows = [];
+  for (let i = 0; i < count; i += 1) {
+    let code = buildGeneratedCode(nextNum, productType, codeType);
+    while (true) {
+      const [existingCode] = await conn.query('SELECT id FROM codestab WHERE code = ? LIMIT 1', [code]);
+      if (!existingCode.length) break;
+      nextNum += 1;
+      code = buildGeneratedCode(nextNum, productType, codeType);
+    }
+    const codeId = await codeInsert(conn, code, productType, codeType, stockistId, normalizedAdmin);
+    await conn.query(
+      'INSERT INTO code_generation_batch_codetab (batch_id, code_id, code, ar_number) VALUES (?, ?, ?, ?)',
+      [batch.id, codeId, code, arNumber]
+    );
+    rows.push({ id: codeId, code });
+    nextNum += 1;
+  }
+  const codes = rows.map((r) => r.code);
+  await conn.query(
+    `UPDATE code_generation_batchtab SET status = 'completed', codes_json = ?, completed_at = NOW(6) WHERE id = ? LIMIT 1`,
+    [JSON.stringify(codes), batch.id]
+  );
+  return { replayed: false, codes, rows };
+}
+
+async function generateCodes(noOfCodes, productType, codeType, stockistId, adminContext, options = {}) {
+  const request = prepareGenerationRequest(noOfCodes, productType, codeType, stockistId, adminContext, options);
   const conn = await pool.getConnection();
   let txStarted = false;
   let lockAcquired = false;
-  // Admin generation always has an actor scope; use zero when an older session
-  // omitted the numeric id so the durable unique key cannot become NULL-scoped.
-  const actorAdminId = normalizedAdmin.actorAdminId || 0;
   try {
-    const [lockRows] = await conn.query('SELECT GET_LOCK(?, 10) AS lockState', ['nogatu_code_generation']);
-    lockAcquired = Number(lockRows[0]?.lockState || 0) === 1;
+    lockAcquired = await acquireCodeGenerationLock(conn);
     if (!lockAcquired) throw new Error('Unable to allocate codes right now. Please retry.');
     await conn.beginTransaction();
     txStarted = true;
-    const [existingRows] = await conn.query(
-      'SELECT * FROM code_generation_batchtab WHERE actor_admin_id <=> ? AND idempotency_key = ? LIMIT 1 FOR UPDATE',
-      [actorAdminId, idempotencyKey]
-    );
-    if (existingRows.length) {
-      const existing = existingRows[0];
-      if (existing.request_hash !== requestHash) {
-        const error = new Error('This idempotency key was already used for a different generation request');
-        error.code = 'IDEMPOTENCY_PAYLOAD_MISMATCH';
-        throw error;
-      }
-      if (existing.status === 'completed') {
-        await conn.rollback();
-        txStarted = false;
-        return JSON.parse(existing.codes_json || '[]');
-      }
-      const error = new Error('This generation request is already being processed');
-      error.code = 'GENERATION_IN_PROGRESS';
-      throw error;
+    const result = await allocateCodesInTransaction(conn, request);
+    if (result.replayed) {
+      await conn.rollback();
+    } else {
+      await conn.commit();
     }
-    try {
-      await conn.query(
-        `INSERT INTO code_generation_batchtab
-          (idempotency_key, actor_admin_id, actor_admin, ar_number, request_hash, no_of_codes, product_type, code_type, stockist_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [idempotencyKey, actorAdminId, normalizedAdmin.adminUsername, arNumber, requestHash, count, Number(productType), Number(codeType), Number(stockistId)]
-      );
-    } catch (error) {
-      if (error.code === 'ER_DUP_ENTRY') {
-        const [duplicateRows] = await conn.query(
-          'SELECT request_hash, status, codes_json FROM code_generation_batchtab WHERE actor_admin_id <=> ? AND idempotency_key = ? LIMIT 1 FOR UPDATE',
-          [actorAdminId, idempotencyKey]
-        );
-        const duplicate = duplicateRows[0];
-        if (duplicate?.request_hash !== requestHash) {
-          throw Object.assign(new Error('This idempotency key was already used for a different generation request'), { code: 'IDEMPOTENCY_PAYLOAD_MISMATCH' });
-        }
-        if (duplicate?.status === 'completed') {
-          await conn.rollback();
-          txStarted = false;
-          return JSON.parse(duplicate.codes_json || '[]');
-        }
-        throw Object.assign(new Error('This generation request is already being processed'), { code: 'GENERATION_IN_PROGRESS' });
-      }
-      throw error;
-    }
-    const [[batch]] = await conn.query(
-      'SELECT id FROM code_generation_batchtab WHERE actor_admin_id <=> ? AND idempotency_key = ? LIMIT 1 FOR UPDATE',
-      [actorAdminId, idempotencyKey]
-    );
-    const [maxRows] = await conn.query('SELECT MAX(id) AS maxId FROM codestab');
-    const baseOffset = Number(productType) >= 1 && Number(productType) <= 99 ? 6100000 : 710000;
-    let nextNum = Number(maxRows[0]?.maxId || 0) + baseOffset;
-    const generatedCodes = [];
-    for (let i = 0; i < count; i += 1) {
-      let code = buildGeneratedCode(nextNum, productType, codeType);
-      while (true) {
-        const [existingCode] = await conn.query('SELECT id FROM codestab WHERE code = ? LIMIT 1', [code]);
-        if (!existingCode.length) break;
-        nextNum += 1;
-        code = buildGeneratedCode(nextNum, productType, codeType);
-      }
-      const codeId = await codeInsert(conn, code, productType, codeType, stockistId, normalizedAdmin);
-      await conn.query(
-        'INSERT INTO code_generation_batch_codetab (batch_id, code_id, code, ar_number) VALUES (?, ?, ?, ?)',
-        [batch.id, codeId, code, arNumber]
-      );
-      generatedCodes.push(code);
-      nextNum += 1;
-    }
-    await conn.query(
-      `UPDATE code_generation_batchtab SET status = 'completed', codes_json = ?, completed_at = NOW(6) WHERE id = ? LIMIT 1`,
-      [JSON.stringify(generatedCodes), batch.id]
-    );
-    await conn.commit();
     txStarted = false;
-    return generatedCodes;
+    return result.codes;
   } catch (error) {
     if (txStarted) await conn.rollback();
     throw error;
@@ -269,7 +300,7 @@ async function generateCodes(noOfCodes, productType, codeType, stockistId, admin
     let reusable = true;
     if (lockAcquired) {
       try {
-        await conn.query('SELECT RELEASE_LOCK(?)', ['nogatu_code_generation']);
+        await releaseCodeGenerationLock(conn);
       } catch (releaseError) {
         reusable = false;
         conn.destroy();
@@ -318,6 +349,10 @@ async function codeInsert(conn, code, productType, codeType, stockistId, adminCo
 
 module.exports = {
   generateCodes,
+  prepareGenerationRequest,
+  allocateCodesInTransaction,
+  acquireCodeGenerationLock,
+  releaseCodeGenerationLock,
   validateCodeGenerationRequest,
   isCdEligibleProductType,
   CD_ELIGIBLE_PRODUCT_TYPES,

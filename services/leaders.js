@@ -87,4 +87,53 @@ async function findLeadersForMember(memberUid, conn = null) {
   return { unilevel, binary };
 }
 
-module.exports = { LEADERS, LEADER_BY_UID, findLeadersForMember, findNearestLeader };
+// Bounds the IN-list of a single batched walk.
+const BATCH_SIZE = 500;
+// Code constants, never user input, so they are inlined rather than bound.
+const LEADER_UID_LIST = LEADERS.map((l) => Number(l.uid)).join(', ');
+
+// Same walk as ancestorSql, for many members at once. `origin` carries the member each row
+// belongs to, and a chain stops climbing once it reaches a leader above the member, because only
+// the nearest one is reported (the member's own row, depth 0, always climbs).
+function batchAncestorSql(parentColumn, count) {
+  const placeholders = new Array(count).fill('?').join(', ');
+  return `
+    WITH RECURSIVE chain AS (
+      SELECT uid AS origin, uid, ${parentColumn} AS parent_uid, 0 AS depth
+        FROM usertab WHERE uid IN (${placeholders})
+      UNION ALL
+      SELECT c.origin, p.uid, p.${parentColumn}, c.depth + 1
+        FROM usertab p
+        JOIN chain c ON p.uid = c.parent_uid AND p.uid <> c.uid
+       WHERE c.depth < ${MAX_DEPTH} AND (c.depth = 0 OR c.uid NOT IN (${LEADER_UID_LIST}))
+    )
+    SELECT origin, uid, depth FROM chain
+     WHERE depth > 0 AND uid IN (${LEADER_UID_LIST})
+     ORDER BY origin, depth ASC`;
+}
+
+/**
+ * findLeadersForMember for a whole set of members: Map<uid, { unilevel, binary }>.
+ * Uids that are not positive integers are dropped; every remaining uid has an entry.
+ */
+async function findLeadersForMembers(memberUids, conn = null) {
+  const uids = [...new Set((memberUids || []).map(Number).filter((u) => Number.isInteger(u) && u > 0))];
+  const result = new Map(uids.map((u) => [u, { unilevel: null, binary: null }]));
+  if (!uids.length) return result;
+
+  const db = conn || getPool();
+  for (let i = 0; i < uids.length; i += BATCH_SIZE) {
+    const chunk = uids.slice(i, i + BATCH_SIZE);
+    for (const [tree, column] of [['unilevel', 'drefid'], ['binary', 'refid']]) {
+      const [rows] = await db.query(batchAncestorSql(column, chunk.length), chunk);
+      for (const row of rows) {               // nearest-first within each origin
+        const entry = result.get(Number(row.origin));
+        const leader = LEADER_BY_UID.get(Number(row.uid));
+        if (entry && leader && !entry[tree]) entry[tree] = { ...leader, depth: Number(row.depth) };
+      }
+    }
+  }
+  return result;
+}
+
+module.exports = { LEADERS, LEADER_BY_UID, findLeadersForMember, findLeadersForMembers, findNearestLeader };
