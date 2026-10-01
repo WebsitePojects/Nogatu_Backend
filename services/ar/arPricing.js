@@ -38,6 +38,8 @@ const MAX_QTY_PER_LINE = 500; // the code generator's per-batch cap
 // One approval mints every code while holding the global code-generation lock, which every other
 // Generate Codes caller waits on for only 10s. Bounding the whole AR keeps that lock short.
 const MAX_CODES_PER_AR = 500;
+// A split order becomes at most this many consecutive ARs (5,000 codes).
+const MAX_SPLIT_PARTS = 10;
 
 const isPackageType = (pt) => [10, 20, 30, 40, 50, 60].includes(pt);
 const isProductType = (pt) => Number.isInteger(pt) && pt >= 100 && pt <= 109;
@@ -87,7 +89,7 @@ function priceReceipt({ mode, items, priceList, discounts, stockistType = null }
   for (const [pt, qty] of merged) {
     if (rule.kind === 'package' && !isPackageType(pt)) throw arError(`${pt} is not a package; this AR is for packages`);
     if (rule.kind === 'product' && !isProductType(pt)) throw arError(`${pt} is not a product; this AR is for products`);
-    if (qty > MAX_QTY_PER_LINE) throw arError(`Quantity per item is limited to ${MAX_QTY_PER_LINE}`);
+    if (qty > MAX_QTY_PER_LINE) throw arError(`Quantity per item is limited to ${MAX_QTY_PER_LINE} per AR. Save it as a split order.`);
 
     const row = priceList.get(pt);
     if (!row || !Number(row.active)) throw arError(`Item ${pt} is not on the active price list`, 'AR_PRICE_MISSING');
@@ -121,7 +123,7 @@ function priceReceipt({ mode, items, priceList, discounts, stockistType = null }
   if (rule.generatesCodes) {
     const codes = lines.reduce((sum, line) => sum + line.qty, 0);
     if (codes > MAX_CODES_PER_AR) {
-      throw arError(`One AR can release at most ${MAX_CODES_PER_AR} codes. Split this sale into more ARs.`);
+      throw arError(`One AR can release at most ${MAX_CODES_PER_AR} codes. Save it as a split order.`);
     }
   }
 
@@ -133,6 +135,45 @@ function priceReceipt({ mode, items, priceList, discounts, stockistType = null }
     total: toPesos(subtotal - discountTotal),
     generatesCodes: rule.generatesCodes,
   };
+}
+
+/**
+ * Splits a code-generating order into parts of at most MAX_CODES_PER_AR codes, filling each part
+ * before starting the next. A product can span two parts (e.g. 750 Gold = 500 + 250). Pricing is
+ * per unit, so the parts always add up to exactly what the unsplit order would cost.
+ */
+function splitOrder(items) {
+  if (!Array.isArray(items) || items.length === 0) throw arError('An AR needs at least one item');
+  const maxCodes = MAX_CODES_PER_AR * MAX_SPLIT_PARTS;
+  const merged = new Map();
+  for (const raw of items) {
+    const pt = Number(raw?.producttype);
+    const qty = Number(raw?.qty);
+    if (!Number.isInteger(pt)) throw arError('Each item needs a valid product');
+    if (!Number.isInteger(qty) || qty < 1) throw arError('Quantity must be a whole number of at least 1');
+    merged.set(pt, (merged.get(pt) || 0) + qty);
+    if (merged.get(pt) > maxCodes) break;
+  }
+  const total = [...merged.values()].reduce((sum, qty) => sum + qty, 0);
+  if (total > maxCodes) {
+    throw arError(`One order can release at most ${maxCodes} codes (${MAX_SPLIT_PARTS} ARs of ${MAX_CODES_PER_AR})`);
+  }
+
+  const parts = [];
+  let current = [];
+  let room = MAX_CODES_PER_AR;
+  for (const [pt, qty] of [...merged].sort((a, b) => a[0] - b[0])) {
+    let left = qty;
+    while (left > 0) {
+      if (room === 0) { parts.push(current); current = []; room = MAX_CODES_PER_AR; }
+      const take = Math.min(left, room);
+      current.push({ producttype: pt, qty: take });
+      left -= take;
+      room -= take;
+    }
+  }
+  parts.push(current);
+  return parts;
 }
 
 /** Numeric-only AR number: 4-digit year + 6-digit (or longer) global sequence, e.g. 2026001236. */
@@ -171,9 +212,11 @@ module.exports = {
   STOCKIST_TYPES,
   MAX_QTY_PER_LINE,
   MAX_CODES_PER_AR,
+  MAX_SPLIT_PARTS,
   isPackageType,
   isProductType,
   priceReceipt,
+  splitOrder,
   formatArNo,
   isValidArNo,
   isRealIsoDate,

@@ -19,7 +19,7 @@ const {
   releaseCodeGenerationLock,
 } = require('../codeGeneration');
 const {
-  MODES, STOCKIST_TYPES, priceReceipt, formatArNo, isValidArNo, isRealIsoDate, manilaYear, validatePayment,
+  MODES, STOCKIST_TYPES, priceReceipt, splitOrder, formatArNo, isValidArNo, isRealIsoDate, manilaYear, validatePayment,
   toCentavos, arError,
 } = require('./arPricing');
 const { isInBinaryNetwork } = require('./arNetwork');
@@ -121,12 +121,12 @@ async function insertReceipt(conn, row, lines) {
     `INSERT INTO ar_receipttab
       (ar_no, ar_year, ar_seq, center_id, mode, status, is_legacy, legacy_date, buyer_uid, buyer_name,
        recipient_uid, stockist_type, subtotal, discount_total, total, payment_method, payment_ref, notes,
-       prepared_by_admin_id, prepared_by, released_by, client_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       prepared_by_admin_id, prepared_by, released_by, client_key, split_group, split_part, split_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [row.ar_no, row.ar_year, row.ar_seq, row.center_id, row.mode, row.status, row.is_legacy, row.legacy_date,
      row.buyer_uid, row.buyer_name, row.recipient_uid, row.stockist_type, row.subtotal, row.discount_total,
      row.total, row.payment_method, row.payment_ref, row.notes, row.prepared_by_admin_id, row.prepared_by,
-     row.released_by, row.client_key ?? null]
+     row.released_by, row.client_key ?? null, row.split_group ?? null, row.split_part ?? null, row.split_count ?? null]
   );
   const arId = Number(result.insertId);
   for (const line of lines) {
@@ -139,14 +139,28 @@ async function insertReceipt(conn, row, lines) {
   return arId;
 }
 
-/** The AR an admin already created for this intent, or null. */
+/** The AR (or every part of a split order) an admin already created for this intent, or null. */
 async function findByClientKey(db, adminId, clientKey) {
   const [rows] = await db.query(
-    'SELECT id, ar_no, status, total FROM ar_receipttab WHERE prepared_by_admin_id = ? AND client_key = ? LIMIT 1',
+    'SELECT id, ar_no, status, total, split_group FROM ar_receipttab WHERE prepared_by_admin_id = ? AND client_key = ? LIMIT 1',
     [adminId, clientKey]
   );
-  const row = rows[0];
-  return row ? { id: Number(row.id), arNo: row.ar_no, status: row.status, total: Number(row.total), replayed: true } : null;
+  const first = rows[0];
+  if (!first) return null;
+  let parts = [first];
+  if (first.split_group) {
+    [parts] = await db.query(
+      'SELECT id, ar_no, status, total FROM ar_receipttab WHERE prepared_by_admin_id = ? AND split_group = ? ORDER BY split_part',
+      [adminId, first.split_group]
+    );
+  }
+  return { ...summarize(parts.map((p) => ({ id: Number(p.id), arNo: p.ar_no, status: p.status, total: Number(p.total) }))), replayed: true };
+}
+
+/** Response for a create: the first AR's fields (unchanged shape) plus every part and their sum. */
+function summarize(parts) {
+  const groupCentavos = parts.reduce((sum, p) => sum + toCentavos(p.total), 0);
+  return { ...parts[0], parts, groupTotal: groupCentavos / 100 };
 }
 
 const isClientKeyCollision = (error) => error?.code === 'ER_DUP_ENTRY'
@@ -163,6 +177,10 @@ const cleanText = (value, max) => {
 /**
  * Cashier / Super Admin creates an AR. Code-generating modes wait for approval; SRP and voucher
  * ARs are complete on creation (nothing of value is released by them).
+ *
+ * With `split: true` a code-generating order above one AR's code limit is saved as consecutive ARs
+ * (Part 1 of N...) in ONE transaction: the cashier enters it once, and either every part exists or
+ * none does. Each part is approved on its own, so no single approval mints more than 500 codes.
  */
 async function createReceipt(session, body = {}, clientKey = '') {
   const admin = adminFrom(session);
@@ -174,9 +192,11 @@ async function createReceipt(session, body = {}, clientKey = '') {
   if (!CLIENT_KEY_RE.test(key)) throw arError('This request is missing its key. Reload the page and try again.', 'AR_KEY_REQUIRED');
   const previous = await findByClientKey(pool, admin.id, key);
   if (previous) return previous;
+
   const rule = MODES[body.mode];
   if (!rule) throw arError(`Unknown AR mode: ${body.mode}`);
   validatePayment(body.mode, body.paymentMethod);
+  const itemParts = rule.generatesCodes && body.split === true ? splitOrder(body.items) : [body.items];
 
   const conn = await pool.getConnection();
   try {
@@ -205,29 +225,40 @@ async function createReceipt(session, body = {}, clientKey = '') {
     }
 
     const { priceList, discounts } = await loadPricing(conn);
-    const priced = priceReceipt({ mode: body.mode, items: body.items, priceList, discounts, stockistType });
+    const pricedParts = itemParts.map((items) => priceReceipt({ mode: body.mode, items, priceList, discounts, stockistType }));
 
     const year = manilaYear();
-    const { arNo, seq } = await takeNextArNumber(conn, year);
-    const status = priced.generatesCodes ? 'pending_approval' : 'completed';
-    const arId = await insertReceipt(conn, {
-      ar_no: arNo, ar_year: year, ar_seq: seq, center_id: centerId, mode: body.mode, status,
-      is_legacy: 0, legacy_date: null, buyer_uid: buyer?.uid || null, buyer_name: buyerName,
-      recipient_uid: recipient?.uid || null, stockist_type: stockistType,
-      subtotal: priced.subtotal, discount_total: priced.discount_total, total: priced.total,
-      payment_method: body.paymentMethod, payment_ref: cleanText(body.paymentRef, 120),
-      notes: cleanText(body.notes, 500), prepared_by_admin_id: admin.id, prepared_by: admin.username,
-      released_by: cleanText(body.releasedBy, 120), client_key: key,
-    }, priced.lines);
+    const status = rule.generatesCodes ? 'pending_approval' : 'completed';
+    const count = pricedParts.length;
+    const created = [];
+    for (const [index, priced] of pricedParts.entries()) {
+      const { arNo, seq } = await takeNextArNumber(conn, year);
+      const arId = await insertReceipt(conn, {
+        ar_no: arNo, ar_year: year, ar_seq: seq, center_id: centerId, mode: body.mode, status,
+        is_legacy: 0, legacy_date: null, buyer_uid: buyer?.uid || null, buyer_name: buyerName,
+        recipient_uid: recipient?.uid || null, stockist_type: stockistType,
+        subtotal: priced.subtotal, discount_total: priced.discount_total, total: priced.total,
+        payment_method: body.paymentMethod, payment_ref: cleanText(body.paymentRef, 120),
+        notes: cleanText(body.notes, 500), prepared_by_admin_id: admin.id, prepared_by: admin.username,
+        released_by: cleanText(body.releasedBy, 120),
+        // Only the first part carries the key, so the UNIQUE index still sees one row per intent.
+        client_key: index === 0 ? key : null,
+        split_group: count > 1 ? key : null, split_part: count > 1 ? index + 1 : null, split_count: count > 1 ? count : null,
+      }, priced.lines);
+      await writeAudit(conn, {
+        entity: 'ar', entityId: arId, action: 'create', admin,
+        after: { arNo, status, total: priced.total, ...(count > 1 ? { part: `${index + 1}/${count}` } : {}) },
+      });
+      created.push({ id: arId, arNo, status, total: priced.total });
+    }
 
-    await writeAudit(conn, { entity: 'ar', entityId: arId, action: 'create', after: { arNo, status, total: priced.total }, admin });
     await conn.commit();
-    return { id: arId, arNo, status, total: priced.total };
+    return summarize(created);
   } catch (error) {
     await conn.rollback();
     if (isClientKeyCollision(error)) {
       // A concurrent request with the same key committed first. Its rollback here also returned the
-      // AR number this attempt took, so hand back the winner rather than an error.
+      // AR numbers this attempt took, so hand back the winner rather than an error.
       const winner = await findByClientKey(pool, admin.id, key);
       if (winner) return winner;
     }
@@ -348,34 +379,121 @@ async function approveReceipt(session, arId) {
   }
 }
 
-/** Voids a pending AR. Cashiers may void only their own; Super Admin may void any pending AR. */
+/**
+ * Voids an AR. Cashiers may void only a pending AR they prepared. Super Admin may void any pending or
+ * completed AR. Voiding a completed AR does NOT take back codes it already released: they belong to
+ * the recipient. The AR simply drops out of reports. Any open flag on it is resolved as voided.
+ */
 async function voidReceipt(session, arId, reason) {
   const admin = adminFrom(session);
   requireRights(admin, [RIGHTS.SUPER_ADMIN, RIGHTS.CASHIER]);
   const why = cleanText(reason, 255);
   if (!why) throw arError('A reason is required to void an AR');
+  return inTransaction(async (conn) => {
+    await voidInTransaction(conn, admin, arId, why);
+    await closeOpenFlag(conn, admin, arId, 'voided', why);
+    return { id: Number(arId), status: 'void' };
+  });
+}
 
+async function voidInTransaction(conn, admin, arId, why) {
+  const isSuper = admin.rights === RIGHTS.SUPER_ADMIN ? 1 : 0;
+  const [cas] = await conn.query(
+    `UPDATE ar_receipttab
+        SET status = 'void', void_reason = ?, voided_by = ?, voided_at = NOW(6)
+      WHERE id = ? AND ((? = 1 AND status IN ('pending_approval', 'completed'))
+                        OR (status = 'pending_approval' AND prepared_by_admin_id = ?))`,
+    [why, admin.username, Number(arId), isSuper, admin.id]
+  );
+  if (cas.affectedRows !== 1) {
+    throw arError(isSuper ? 'This AR is already void or does not exist' : 'Only a pending AR you prepared can be voided', 'AR_WRONG_STATUS');
+  }
+  await writeAudit(conn, { entity: 'ar', entityId: arId, action: 'void', after: { reason: why }, admin });
+}
+
+/** Resolves the AR's open flag, if it has one. Returns whether a flag was closed. */
+async function closeOpenFlag(conn, admin, arId, resolution, note) {
+  const [res] = await conn.query(
+    `UPDATE ar_flagtab
+        SET open_ar_id = NULL, resolution = ?, resolution_note = ?, resolved_by_admin_id = ?, resolved_by = ?, resolved_at = NOW(6)
+      WHERE open_ar_id = ?`,
+    [resolution, note, admin.id, admin.username, Number(arId)]
+  );
+  if (res.affectedRows === 1) {
+    await writeAudit(conn, { entity: 'ar_flag', entityId: arId, action: `resolve_${resolution}`, after: { note }, admin });
+  }
+  return res.affectedRows === 1;
+}
+
+async function inTransaction(work) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [cas] = await conn.query(
-      `UPDATE ar_receipttab
-          SET status = 'void', void_reason = ?, voided_by = ?, voided_at = NOW(6)
-        WHERE id = ? AND status = 'pending_approval' AND (? = 1 OR prepared_by_admin_id = ?)`,
-      [why, admin.username, Number(arId), admin.rights === RIGHTS.SUPER_ADMIN ? 1 : 0, admin.id]
-    );
-    if (cas.affectedRows !== 1) {
-      throw arError('Only a pending AR you prepared can be voided', 'AR_WRONG_STATUS');
-    }
-    await writeAudit(conn, { entity: 'ar', entityId: arId, action: 'void', after: { reason: why }, admin });
+    const result = await work(conn);
     await conn.commit();
-    return { id: Number(arId), status: 'void' };
+    return result;
   } catch (error) {
     await conn.rollback();
     throw error;
   } finally {
     conn.release();
   }
+}
+
+/**
+ * A cashier (own center) or Super Admin marks a COMPLETED AR as having a mistake, e.g. found after the
+ * items were delivered. It changes nothing on the AR; it only puts it in front of a Super Admin, who
+ * decides whether to void it or keep it. One open flag per AR (UNIQUE open_ar_id).
+ */
+async function flagReceipt(session, arId, reason) {
+  const admin = adminFrom(session);
+  requireRights(admin, [RIGHTS.SUPER_ADMIN, RIGHTS.CASHIER]);
+  const why = cleanText(reason, 500);
+  if (!why) throw arError('Describe the mistake so the Super Admin can review it');
+  const id = Number(arId);
+  if (!Number.isInteger(id) || id <= 0) throw arError('Invalid AR id');
+
+  return inTransaction(async (conn) => {
+    // Row lock: a void racing this flag must not leave an open flag on a void AR.
+    const [[receipt]] = await conn.query('SELECT id, ar_no, status, center_id FROM ar_receipttab WHERE id = ? LIMIT 1 FOR UPDATE', [id]);
+    if (admin.rights === RIGHTS.CASHIER) {
+      const [[me]] = await conn.query('SELECT ar_center_id FROM accesstab WHERE id = ? LIMIT 1', [admin.id]);
+      if (!receipt || Number(me?.ar_center_id || 0) !== Number(receipt.center_id)) throw arError('AR not found', 'AR_NOT_FOUND');
+    }
+    if (!receipt) throw arError('AR not found', 'AR_NOT_FOUND');
+    if (receipt.status !== 'completed') {
+      throw arError(receipt.status === 'void' ? 'This AR is already void' : 'A pending AR can be voided instead of flagged', 'AR_WRONG_STATUS');
+    }
+    try {
+      const [ins] = await conn.query(
+        'INSERT INTO ar_flagtab (ar_id, open_ar_id, reason, raised_by_admin_id, raised_by) VALUES (?, ?, ?, ?, ?)',
+        [id, id, why, admin.id, admin.username]
+      );
+      await writeAudit(conn, { entity: 'ar_flag', entityId: id, action: 'raise', after: { reason: why }, admin });
+      return { id, flagId: Number(ins.insertId), flagged: true };
+    } catch (error) {
+      if (error?.code === 'ER_DUP_ENTRY') throw arError(`AR ${receipt.ar_no} already has an open flag`, 'AR_ALREADY_FLAGGED');
+      throw error;
+    }
+  });
+}
+
+/** Super Admin decides on a flagged AR: void it, or keep it as is. Both close the flag. */
+async function resolveFlag(session, arId, body = {}) {
+  const admin = adminFrom(session);
+  requireRights(admin, [RIGHTS.SUPER_ADMIN]);
+  const resolution = String(body.resolution || '');
+  if (!['kept', 'voided'].includes(resolution)) throw arError('Choose whether to void the AR or keep it');
+  const note = cleanText(body.note, resolution === 'voided' ? 255 : 500);
+  if (!note) throw arError(resolution === 'voided' ? 'A reason is required to void an AR' : 'Add a note explaining why the AR is kept');
+
+  return inTransaction(async (conn) => {
+    if (resolution === 'voided') await voidInTransaction(conn, admin, arId, note);
+    if (!(await closeOpenFlag(conn, admin, arId, resolution, note))) {
+      throw arError('This AR has no open flag (someone may have resolved it already)', 'AR_NO_OPEN_FLAG');
+    }
+    return { id: Number(arId), resolution, status: resolution === 'voided' ? 'void' : 'completed' };
+  });
 }
 
 /**
@@ -483,6 +601,8 @@ module.exports = {
   createReceipt,
   approveReceipt,
   voidReceipt,
+  flagReceipt,
+  resolveFlag,
   createLegacyReceipt,
   seedSequence,
   // exported for tests

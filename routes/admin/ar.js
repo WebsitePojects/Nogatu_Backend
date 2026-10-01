@@ -26,6 +26,8 @@ const STATUS_BY_CODE = {
   AR_DUPLICATE_NUMBER: 409,
   AR_SEQUENCE_LOCKED: 409,
   AR_RELEASE_CONFLICT: 409,
+  AR_ALREADY_FLAGGED: 409,
+  AR_NO_OPEN_FLAG: 409,
   AR_BUSY: 503,
 };
 
@@ -83,6 +85,10 @@ router.post('/receipts/:id/approve', adminAuth, adminRights(SUPER), idempotent('
   handle((req) => receipts.approveReceipt(req.session, req.params.id)));
 router.post('/receipts/:id/void', adminAuth, adminRights(SELLERS), idempotent('admin.ar.void'),
   handle((req) => receipts.voidReceipt(req.session, req.params.id, req.body?.reason)));
+router.post('/receipts/:id/flag', adminAuth, adminRights(SELLERS), idempotent('admin.ar.flag'),
+  handle((req) => receipts.flagReceipt(req.session, req.params.id, req.body?.reason)));
+router.post('/receipts/:id/flag/resolve', adminAuth, adminRights(SUPER), idempotent('admin.ar.flag.resolve'),
+  handle((req) => receipts.resolveFlag(req.session, req.params.id, req.body)));
 router.post('/receipts/:id/print', adminAuth, adminRights(SELLERS),
   handle((req) => queries.recordPrint(adminOf(req), req.params.id)));
 router.post('/legacy', adminAuth, adminRights(SUPER), idempotent('admin.ar.legacy'),

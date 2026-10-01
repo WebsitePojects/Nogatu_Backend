@@ -48,6 +48,10 @@ async function listReceipts(admin, query = {}) {
   }
   if (query.from && ISO_DATE.test(query.from)) { where.push(`${BUSINESS_DATE} >= ?`); params.push(query.from); }
   if (query.to && ISO_DATE.test(query.to)) { where.push(`${BUSINESS_DATE} <= ?`); params.push(query.to); }
+  if (query.flagged !== undefined && query.flagged !== '') {
+    if (String(query.flagged) !== '1') throw arError('Unknown flag filter');
+    where.push('f.id IS NOT NULL');
+  }
   if (query.search) {
     const term = `%${String(query.search).trim().slice(0, 60)}%`;
     where.push('(r.ar_no LIKE ? OR r.buyer_name LIKE ? OR m.username LIKE ?)');
@@ -60,18 +64,21 @@ async function listReceipts(admin, query = {}) {
     `SELECT r.id, r.ar_no, r.mode, r.status, r.is_legacy, ${BUSINESS_DATE} AS business_date, r.created_at,
             r.buyer_name, m.username AS buyer_username, rm.username AS recipient_username,
             r.total, r.discount_total, r.payment_method, r.prepared_by, r.approved_by, r.release_error,
-            c.name AS center_name
+            c.name AS center_name, r.split_part, r.split_count,
+            f.reason AS flag_reason, f.raised_by AS flag_raised_by, f.raised_at AS flag_raised_at
        FROM ar_receipttab r
        JOIN ar_centertab c ON c.id = r.center_id
        LEFT JOIN memberstab m ON m.uid = r.buyer_uid
        LEFT JOIN memberstab rm ON rm.uid = r.recipient_uid
+       LEFT JOIN ar_flagtab f ON f.open_ar_id = r.id
       WHERE ${where.join(' AND ')}
       ORDER BY r.id DESC
       LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
   const [[count]] = await pool.query(
-    `SELECT COUNT(*) AS n FROM ar_receipttab r LEFT JOIN memberstab m ON m.uid = r.buyer_uid WHERE ${where.join(' AND ')}`,
+    `SELECT COUNT(*) AS n FROM ar_receipttab r LEFT JOIN memberstab m ON m.uid = r.buyer_uid
+       LEFT JOIN ar_flagtab f ON f.open_ar_id = r.id WHERE ${where.join(' AND ')}`,
     params
   );
   return { rows, total: Number(count.n), limit, offset };
@@ -92,7 +99,26 @@ async function getReceipt(admin, arId) {
   if (!receipt || (scope !== null && receipt.center_id !== scope)) throw arError('AR not found', 'AR_NOT_FOUND');
   const [items] = await pool.query('SELECT * FROM ar_itemtab WHERE ar_id = ? ORDER BY id', [receipt.id]);
   const [[codes]] = await pool.query('SELECT COUNT(*) AS n FROM ar_code_linktab WHERE ar_id = ?', [receipt.id]);
-  return { ...receipt, items, codes_released: Number(codes.n) };
+  const [flags] = await pool.query(
+    `SELECT id, reason, raised_by, raised_at, resolution, resolution_note, resolved_by, resolved_at,
+            open_ar_id IS NOT NULL AS is_open
+       FROM ar_flagtab WHERE ar_id = ? ORDER BY id`,
+    [receipt.id]
+  );
+  let parts = [];
+  if (receipt.split_group) {
+    [parts] = await pool.query(
+      `SELECT id, ar_no, status, split_part, total FROM ar_receipttab
+        WHERE prepared_by_admin_id = ? AND split_group = ? ORDER BY split_part`,
+      [receipt.prepared_by_admin_id, receipt.split_group]
+    );
+  }
+  const { client_key: _key, split_group: _group, ...visible } = receipt; // internal request keys
+  return {
+    ...visible, items, codes_released: Number(codes.n), parts,
+    flags: flags.map((f) => ({ ...f, is_open: Boolean(f.is_open) })),
+    open_flag: flags.find((f) => f.is_open) || null,
+  };
 }
 
 async function recordPrint(admin, arId) {

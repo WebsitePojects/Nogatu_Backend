@@ -40,10 +40,10 @@ function createFakeDb(seed = {}) {
     stockists: seed.stockists || [],      // { uid, stockist_type }
     prices: seed.prices || [],            // ar_price_listtab rows
     discounts: seed.discounts || [],      // { stockist_type, producttype, peso_discount }
-    receipts: [], items: [], links: [], codes: [], batches: [], batchCodes: [],
+    receipts: [], items: [], links: [], codes: [], batches: [], batchCodes: [], flags: [],
     history: [], events: [], audits: [],
   };
-  let nextIds = { receipt: 1, item: 1, code: 9000, batch: 1 };
+  let nextIds = { receipt: 1, item: 1, code: 9000, batch: 1, flag: 1 };
   // Test hooks live OUTSIDE the snapshot, so a rollback cannot re-arm them.
   const hooks = { failCodeCasOnce: false };
   const rowLock = mutex();
@@ -125,7 +125,7 @@ function createFakeDb(seed = {}) {
       if (q.startsWith('INSERT INTO ar_receipttab')) {
         const cols = ['ar_no', 'ar_year', 'ar_seq', 'center_id', 'mode', 'status', 'is_legacy', 'legacy_date', 'buyer_uid', 'buyer_name',
           'recipient_uid', 'stockist_type', 'subtotal', 'discount_total', 'total', 'payment_method', 'payment_ref', 'notes',
-          'prepared_by_admin_id', 'prepared_by', 'released_by', 'client_key'];
+          'prepared_by_admin_id', 'prepared_by', 'released_by', 'client_key', 'split_group', 'split_part', 'split_count'];
         if (db.receipts.some((r) => r.ar_no === p[0])) throw Object.assign(new Error('dup ar_no'), { code: 'ER_DUP_ENTRY' });
         const [adminId, key] = [p[18], p[21]];
         if (key != null && db.receipts.some((r) => r.prepared_by_admin_id === adminId && r.client_key === key)) {
@@ -136,8 +136,15 @@ function createFakeDb(seed = {}) {
         db.receipts.push(row);
         return [{ insertId: row.id }];
       }
-      if (q.startsWith('SELECT id, ar_no, status, total FROM ar_receipttab WHERE prepared_by_admin_id = ? AND client_key = ?')) {
+      if (q.startsWith('SELECT id, ar_no, status, total, split_group FROM ar_receipttab WHERE prepared_by_admin_id = ? AND client_key = ?')) {
         return [db.receipts.filter((r) => r.prepared_by_admin_id === p[0] && r.client_key === p[1]).map((r) => ({ ...r }))];
+      }
+      if (q.startsWith('SELECT id, ar_no, status, total FROM ar_receipttab WHERE prepared_by_admin_id = ? AND split_group = ?')) {
+        return [db.receipts.filter((r) => r.prepared_by_admin_id === p[0] && r.split_group === p[1])
+          .sort((a, b) => a.split_part - b.split_part).map((r) => ({ ...r }))];
+      }
+      if (q.startsWith('SELECT id, ar_no, status, center_id FROM ar_receipttab WHERE id')) {
+        return [db.receipts.filter((r) => r.id === p[0]).map((r) => ({ ...r }))];
       }
       if (q.startsWith('SELECT * FROM ar_receipttab WHERE id')) return [db.receipts.filter((r) => r.id === p[0]).map((r) => ({ ...r }))];
       if (q.startsWith("UPDATE ar_receipttab SET status = 'completed'")) {
@@ -148,7 +155,8 @@ function createFakeDb(seed = {}) {
       }
       if (q.startsWith("UPDATE ar_receipttab SET status = 'void'")) {
         const [reason, by, id, isSuper, adminId] = p;
-        const r = db.receipts.find((x) => x.id === id && x.status === 'pending_approval' && (isSuper === 1 || x.prepared_by_admin_id === adminId));
+        const r = db.receipts.find((x) => x.id === id && ((isSuper === 1 && ['pending_approval', 'completed'].includes(x.status))
+          || (x.status === 'pending_approval' && x.prepared_by_admin_id === adminId)));
         if (!r) return [{ affectedRows: 0 }];
         Object.assign(r, { status: 'void', void_reason: reason, voided_by: by });
         return [{ affectedRows: 1 }];
@@ -207,6 +215,21 @@ function createFakeDb(seed = {}) {
       }
       if (q.startsWith('INSERT INTO codehistorytab')) { db.history.push(p); return [{}]; }
       if (q.startsWith('INSERT IGNORE INTO activation_code_usagetab')) { db.events.push({ code: p[0], type: p[2], to: p[4] }); return [{}]; }
+      // ── flags (UNIQUE open_ar_id: one open flag per AR)
+      if (q.startsWith('INSERT INTO ar_flagtab')) {
+        const [ar_id, open_ar_id, reason, byId, by] = p;
+        if (db.flags.some((f) => f.open_ar_id === open_ar_id)) throw Object.assign(new Error('dup open flag'), { code: 'ER_DUP_ENTRY' });
+        const row = { id: nextIds.flag++, ar_id, open_ar_id, reason, raised_by_admin_id: byId, raised_by: by, resolution: null };
+        db.flags.push(row);
+        return [{ insertId: row.id }];
+      }
+      if (q.startsWith('UPDATE ar_flagtab SET open_ar_id = NULL')) {
+        const [resolution, note, byId, by, arId] = p;
+        const f = db.flags.find((x) => x.open_ar_id === arId);
+        if (!f) return [{ affectedRows: 0 }];
+        Object.assign(f, { open_ar_id: null, resolution, resolution_note: note, resolved_by_admin_id: byId, resolved_by: by });
+        return [{ affectedRows: 1 }];
+      }
       if (q.startsWith('INSERT INTO ar_audittab')) { db.audits.push({ entity: p[0], id: p[1], action: p[2] }); return [{}]; }
 
       throw new Error(`fake db: unhandled SQL: ${q.slice(0, 90)}`);

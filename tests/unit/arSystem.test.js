@@ -265,7 +265,7 @@ test('the network is re-checked at approval: a recipient moved out of the leg is
 });
 
 // ── Void, legacy, sequence ──────────────────────────────────────────────────
-test('void: a cashier may void only their own pending AR; completed ARs cannot be voided', async () => {
+test('void: a cashier may void only their own pending AR; only Super Admin may void a completed AR', async () => {
   const { db, receipts } = setup();
   const { id } = await createAr(receipts, CASHIER, packageAr());
   await assert.rejects(() => receipts.voidReceipt(OTHER_CASHIER, id, 'mistake'), rejectsWith('AR_WRONG_STATUS'));
@@ -275,7 +275,10 @@ test('void: a cashier may void only their own pending AR; completed ARs cannot b
   await assert.rejects(() => receipts.approveReceipt(SUPER, id), rejectsWith('AR_WRONG_STATUS'));
 
   const done = await createAr(receipts, CASHIER, { mode: 'cash_srp', items: [{ producttype: 100, qty: 1 }], paymentMethod: 'cash' });
-  await assert.rejects(() => receipts.voidReceipt(SUPER, done.id, 'late'), rejectsWith('AR_WRONG_STATUS'));
+  await assert.rejects(() => receipts.voidReceipt(CASHIER, done.id, 'late'), rejectsWith('AR_WRONG_STATUS'));
+  await receipts.voidReceipt(SUPER, done.id, 'delivered to the wrong branch');
+  assert.equal(db.receipts.find((r) => r.id === done.id).status, 'void');
+  await assert.rejects(() => receipts.voidReceipt(SUPER, done.id, 'again'), rejectsWith('AR_WRONG_STATUS'));
 });
 
 test('legacy ARs: digits only, no duplicates, never generate codes, and skip the live sequence', async () => {
@@ -384,4 +387,146 @@ test('pricing: isRealIsoDate accepts real days only', () => {
   for (const bad of ['2026-02-29', '2026-13-01', '2026-1-01', '', null, '2026-02-31']) {
     assert.equal(pricing.isRealIsoDate(bad), false, String(bad));
   }
+});
+
+// ── Split orders (one Save -> consecutive ARs of at most 500 codes) ─────────
+
+test('splitOrder fills each part to 500 before starting the next, and a product may span parts', () => {
+  const parts = pricing.splitOrder([{ producttype: 30, qty: 750 }, { producttype: 60, qty: 300 }, { producttype: 30, qty: 50 }]);
+  assert.deepEqual(parts.map((p) => p.reduce((s, l) => s + l.qty, 0)), [500, 500, 100]);
+  assert.deepEqual(parts[0], [{ producttype: 30, qty: 500 }]);
+  assert.deepEqual(parts[1], [{ producttype: 30, qty: 300 }, { producttype: 60, qty: 200 }]);
+  assert.deepEqual(parts[2], [{ producttype: 60, qty: 100 }]);
+  assert.deepEqual(pricing.splitOrder([{ producttype: 30, qty: 500 }]).length, 1);
+  assert.throws(() => pricing.splitOrder([{ producttype: 30, qty: 5001 }]), /at most 5000 codes/);
+  assert.throws(() => pricing.splitOrder([{ producttype: 30, qty: 1e15 }]), /at most 5000 codes/);
+  assert.throws(() => pricing.splitOrder([{ producttype: 30, qty: 1.5 }]), /whole number/);
+});
+
+test('a split order is saved as consecutive numbered parts whose totals add up to the unsplit price', async () => {
+  const { db, receipts } = setup();
+  const out = await createAr(receipts, CASHIER, packageAr({ split: true, items: [{ producttype: 30, qty: 600 }, { producttype: 60, qty: 450 }] }));
+  assert.equal(out.parts.length, 3);
+  assert.deepEqual(db.receipts.map((r) => [r.ar_seq, r.split_part, r.split_count]), [[1001, 1, 3], [1002, 2, 3], [1003, 3, 3]]);
+  assert.ok(db.receipts.every((r) => r.status === 'pending_approval' && r.split_group === db.receipts[0].split_group));
+  assert.equal(db.receipts.filter((r) => r.client_key).length, 1, 'only part 1 carries the key');
+  // leader1 is a Provincial stockist: Gold 10,000 - 500, Diamond 150,000 - 4,000.
+  const expected = 600 * 9500 + 450 * 146000;
+  assert.equal(out.groupTotal, expected);
+  assert.equal(db.receipts.reduce((s, r) => s + r.total, 0), expected);
+  for (const r of db.receipts) {
+    const codes = db.items.filter((i) => i.ar_id === r.id).reduce((s, i) => s + i.qty, 0);
+    assert.ok(codes <= 500, `part ${r.split_part} has ${codes} codes`);
+  }
+});
+
+test('a split order is all-or-nothing: a refused part leaves no AR and no number taken', async () => {
+  const { db, receipts } = setup();
+  // Item 102 is inactive, so the LAST part fails pricing after earlier parts were priced.
+  await assert.rejects(() => createAr(receipts, CASHIER, { mode: 'cash_member', buyerUsername: 'leader1', split: true,
+    items: [{ producttype: 100, qty: 900 }, { producttype: 102, qty: 1 }], paymentMethod: 'cash' }), rejectsWith('AR_PRICE_MISSING'));
+  assert.equal(db.receipts.length, 0);
+  assert.equal(db.seq.next_seq, 1001);
+});
+
+test('without split: true an order above 500 codes is refused; non-code modes ignore split', async () => {
+  const { db, receipts } = setup();
+  await assert.rejects(() => createAr(receipts, CASHIER, packageAr({ items: [{ producttype: 30, qty: 501 }] })), /split order/);
+  const srp = await createAr(receipts, CASHIER, { mode: 'cash_srp', split: true, items: [{ producttype: 100, qty: 3 }], paymentMethod: 'cash' });
+  assert.equal(srp.parts.length, 1);
+  assert.equal(db.receipts[0].split_group, null);
+});
+
+test('replaying a split order returns every part and creates nothing, sequential and concurrent', async () => {
+  const { db, receipts } = setup();
+  const body = packageAr({ split: true, items: [{ producttype: 30, qty: 700 }] });
+  const key = nextKey();
+  const [a, b] = await Promise.all([receipts.createReceipt(CASHIER, body, key), receipts.createReceipt(CASHIER, body, key)]);
+  const c = await receipts.createReceipt(CASHIER, body, key);
+  for (const r of [a, b, c]) assert.deepEqual(r.parts.map((p) => p.arNo), a.parts.map((p) => p.arNo));
+  assert.equal(c.replayed, true);
+  assert.equal(db.receipts.length, 2);
+  assert.equal(db.seq.next_seq, 1003);
+});
+
+// ── Flags (cashier marks a completed AR; Super Admin voids or keeps) ─────────
+
+async function completedSrp(receipts, session = CASHIER) {
+  return createAr(receipts, session, { mode: 'cash_srp', buyerName: 'Juan', items: [{ producttype: 100, qty: 1 }], paymentMethod: 'cash' });
+}
+
+test('flag: a cashier flags a completed AR of their center; it changes nothing on the AR', async () => {
+  const { db, receipts } = setup();
+  const { id } = await completedSrp(receipts);
+  const before = JSON.stringify(db.receipts[0]);
+  await assert.rejects(() => receipts.flagReceipt(CASHIER, id, '  '), /Describe the mistake/);
+  await assert.rejects(() => receipts.flagReceipt(OTHER_CASHIER, id, 'not mine'), rejectsWith('AR_NOT_FOUND'));
+  const out = await receipts.flagReceipt(CASHIER, id, 'qty should have been 2');
+  assert.equal(out.flagged, true);
+  assert.equal(JSON.stringify(db.receipts[0]), before, 'flagging must not touch the AR');
+  await assert.rejects(() => receipts.flagReceipt(SUPER, id, 'again'), rejectsWith('AR_ALREADY_FLAGGED'));
+  assert.equal(db.flags.length, 1);
+});
+
+test('flag: a double tap leaves one open flag (concurrent)', async () => {
+  const { db, receipts } = setup();
+  const { id } = await completedSrp(receipts);
+  const results = await Promise.allSettled([receipts.flagReceipt(CASHIER, id, 'x1'), receipts.flagReceipt(CASHIER, id, 'x1')]);
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.equal(db.flags.length, 1);
+});
+
+test('flag: pending or void ARs cannot be flagged (void the pending one instead)', async () => {
+  const { receipts } = setup();
+  const pending = await createAr(receipts, CASHIER, packageAr());
+  await assert.rejects(() => receipts.flagReceipt(CASHIER, pending.id, 'oops'), rejectsWith('AR_WRONG_STATUS'));
+  await receipts.voidReceipt(CASHIER, pending.id, 'oops');
+  await assert.rejects(() => receipts.flagReceipt(SUPER, pending.id, 'oops'), rejectsWith('AR_WRONG_STATUS'));
+});
+
+test('resolve: Super Admin keeps a flagged AR (note required) and the AR is unchanged', async () => {
+  const { db, receipts } = setup();
+  const { id } = await completedSrp(receipts);
+  await receipts.flagReceipt(CASHIER, id, 'typo in notes');
+  await assert.rejects(() => receipts.resolveFlag(CASHIER, id, { resolution: 'kept', note: 'fine' }), rejectsWith('AR_FORBIDDEN'));
+  await assert.rejects(() => receipts.resolveFlag(SUPER, id, { resolution: 'delete', note: 'x' }), /void the AR or keep it/);
+  await assert.rejects(() => receipts.resolveFlag(SUPER, id, { resolution: 'kept', note: '' }), /Add a note/);
+  const out = await receipts.resolveFlag(SUPER, id, { resolution: 'kept', note: 'typo only, amounts right' });
+  assert.equal(out.status, 'completed');
+  assert.equal(db.receipts[0].status, 'completed');
+  assert.equal(db.flags[0].resolution, 'kept');
+  assert.equal(db.flags[0].open_ar_id, null);
+  await assert.rejects(() => receipts.resolveFlag(SUPER, id, { resolution: 'kept', note: 'again' }), rejectsWith('AR_NO_OPEN_FLAG'));
+  // Resolved flags stay as history and a new mistake can be flagged.
+  await receipts.flagReceipt(CASHIER, id, 'found another issue');
+  assert.equal(db.flags.length, 2);
+});
+
+test('resolve: Super Admin voids a flagged AR; void and flag close together', async () => {
+  const { db, receipts } = setup();
+  const { id } = await completedSrp(receipts);
+  await receipts.flagReceipt(CASHIER, id, 'charged twice');
+  const out = await receipts.resolveFlag(SUPER, id, { resolution: 'voided', note: 'duplicate sale' });
+  assert.equal(out.status, 'void');
+  assert.equal(db.receipts[0].status, 'void');
+  assert.equal(db.receipts[0].void_reason, 'duplicate sale');
+  assert.equal(db.flags[0].resolution, 'voided');
+});
+
+test('resolve: a lost race (already void) rolls the flag resolution back too', async () => {
+  const { db, receipts } = setup();
+  const { id } = await completedSrp(receipts);
+  await receipts.flagReceipt(CASHIER, id, 'charged twice');
+  db.receipts[0].status = 'void'; // someone voided it a moment earlier without going through the flag
+  await assert.rejects(() => receipts.resolveFlag(SUPER, id, { resolution: 'voided', note: 'dup' }), rejectsWith('AR_WRONG_STATUS'));
+  assert.equal(db.flags[0].open_ar_id, id, 'flag must still be open after the rollback');
+});
+
+test('a plain Super Admin void also closes an open flag', async () => {
+  const { db, receipts } = setup();
+  const { id } = await completedSrp(receipts);
+  await receipts.flagReceipt(CASHIER, id, 'wrong product');
+  await receipts.voidReceipt(SUPER, id, 'wrong product sold');
+  assert.equal(db.flags[0].resolution, 'voided');
+  assert.equal(db.flags[0].open_ar_id, null);
 });
