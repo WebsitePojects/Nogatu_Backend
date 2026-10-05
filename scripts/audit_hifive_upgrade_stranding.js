@@ -37,18 +37,9 @@
 const { loadBackendEnv } = require('./env');
 loadBackendEnv();
 const { pool } = require('../config/database');
-const { getEffectiveAccountState } = require('../services/accountState');
-const { countsForDirectReferralSource } = require('../services/income/directReferral');
-
-const TIERS = [
-  { code: 10, key: 'bronze',   name: 'Bronze' },
-  { code: 20, key: 'silver',   name: 'Silver' },
-  { code: 30, key: 'gold',     name: 'Gold' },
-  { code: 40, key: 'platinum', name: 'Platinum' },
-  { code: 50, key: 'garnet',   name: 'Garnet' },
-  { code: 60, key: 'diamond',  name: 'Diamond' },
-];
-const TIER_BY_CODE = Object.fromEntries(TIERS.map((t) => [t.code, t]));
+const {
+  TIERS, TIER_BY_CODE, loadEligibleDirects, loadUpgradesByUid, replayTimeline,
+} = require('../services/income/hifiveHighWaterReplay');
 
 const onlyUidArg = process.argv.indexOf('--uid');
 const ONLY_UID = onlyUidArg > -1 ? Number(process.argv[onlyUidArg + 1]) : null;
@@ -67,42 +58,6 @@ async function loadRewards() {
     if (tier) rewards[tier.key] = Number(r.amount || 0);
   }
   return rewards;
-}
-
-/**
- * Replay a member's directs chronologically and return the highest simultaneous count each tier
- * ever reached, alongside the count as the live engine sees it today.
- */
-function replayTimeline(directs, upgradesByUid) {
-  const events = [];
-  for (const d of directs) {
-    const joinTier = Number(d.accttype) || 0;
-    if (TIER_BY_CODE[joinTier]) {
-      events.push({ ts: new Date(d.datereg).getTime(), uid: d.uid, to: joinTier });
-    }
-    for (const up of (upgradesByUid.get(Number(d.uid)) || [])) {
-      if (TIER_BY_CODE[up.tier]) {
-        events.push({ ts: new Date(up.transdate).getTime(), uid: d.uid, to: up.tier });
-      }
-    }
-  }
-  // Ties are broken by tier so a same-instant leave/join nets out deterministically.
-  events.sort((a, b) => a.ts - b.ts || a.to - b.to);
-
-  const live = new Map();               // uid -> tier held right now in the replay
-  const counts = Object.fromEntries(TIERS.map((t) => [t.key, 0]));
-  const highWater = Object.fromEntries(TIERS.map((t) => [t.key, 0]));
-
-  for (const ev of events) {
-    const prev = live.get(ev.uid);
-    if (prev && TIER_BY_CODE[prev]) counts[TIER_BY_CODE[prev].key] -= 1;
-    live.set(ev.uid, ev.to);
-    const key = TIER_BY_CODE[ev.to].key;
-    counts[key] += 1;
-    if (counts[key] > highWater[key]) highWater[key] = counts[key];
-  }
-
-  return { highWater, current: counts };
 }
 
 function entitlementOf(countsByKey, rewards) {
@@ -132,18 +87,7 @@ function entitlementOf(countsByKey, rewards) {
   console.log(`uplines to examine: ${uplines.length}\n`);
 
   // One pass for every upgrade, keyed by member, so the replay needs no per-member query.
-  const [allUpgrades] = await pool.query(
-    `SELECT up.uid, c.producttype tier, up.transdate
-       FROM upgradetab up INNER JOIN codestab c ON c.id = up.codeid
-      WHERE c.producttype IN (10,20,30,40,50,60)
-      ORDER BY up.transdate ASC`
-  );
-  const upgradesByUid = new Map();
-  for (const up of allUpgrades) {
-    const uid = Number(up.uid);
-    if (!upgradesByUid.has(uid)) upgradesByUid.set(uid, []);
-    upgradesByUid.get(uid).push({ tier: Number(up.tier), transdate: up.transdate });
-  }
+  const upgradesByUid = await loadUpgradesByUid(pool);
 
   const findings = [];
   let examined = 0;
@@ -152,20 +96,8 @@ function entitlementOf(countsByKey, rewards) {
     const uid = Number(row.uid);
     examined += 1;
 
-    const [directs] = await pool.query(
-      `SELECT child.uid, child.accttype, child.currentaccttype, child.codeid,
-              child.cdamount, child.cdtotal, child.cdstatus, child.datereg
-         FROM usertab child WHERE child.drefid = ?`,
-      [uid]
-    );
-    if (directs.length < 5) continue;   // cannot hold a set of five
-
-    const eligible = [];
-    for (const d of directs) {
-      const effective = await getEffectiveAccountState(d.uid, d);
-      if (countsForDirectReferralSource(effective)) eligible.push(d);
-    }
-    if (eligible.length < 5) continue;
+    const eligible = await loadEligibleDirects(pool, uid);
+    if (eligible.length < 5) continue;   // cannot hold a set of five
 
     const { highWater, current } = replayTimeline(eligible, upgradesByUid);
     const earned = entitlementOf(highWater, rewards);

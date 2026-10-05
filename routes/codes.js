@@ -16,6 +16,7 @@ const { refreshMemberRankSnapshot } = require('../services/ranking');
 const { applyRepurchaseDelta } = require('../services/rankPoints');
 const { getTotalPointsForRange } = require('../services/income/unilevel');
 const { isEligibleForPackageVoucher, issuePackageVoucher } = require('../services/voucher');
+const { observePackageHighWater } = require('../services/income/hifiveBonus');
 
 /**
  * GET /api/codes?page=1
@@ -212,7 +213,7 @@ router.post('/upgrade', memberAuth, idempotent('codes.upgrade'), async (req, res
     await conn.beginTransaction();
 
     const [memberRows] = await conn.query(
-      `SELECT accttype, currentaccttype, codeid, cdamount, cdtotal, cdstatus
+      `SELECT accttype, currentaccttype, codeid, cdamount, cdtotal, cdstatus, drefid
          FROM usertab
         WHERE uid = ?
         LIMIT 1
@@ -245,6 +246,16 @@ router.post('/upgrade', memberAuth, idempotent('codes.upgrade'), async (req, res
     // already having been consumed. Upgrade accepts the same producttype range as
     // registration, so the identical exposure applies here.
     await assertCodeNotAlreadyConsumed(conn, code, codeData);
+
+    // This upgrade moves the member out of their sponsor's current Hi-Five tier. Record the
+    // sponsor's counts first so a set they already completed stays earned (V050 high-water).
+    // Reads go through the pool with plain SELECTs, so they do not wait on this row lock. A
+    // failure must not block the upgrade; the nightly sweep records counts again.
+    if (Number(member.drefid) > 0) {
+      await observePackageHighWater(Number(member.drefid)).catch((err) => {
+        console.error('[HiFive] sponsor high-water before upgrade failed for uid', member.drefid, err.message);
+      });
+    }
 
     // Update code status
     const [useResult] = await conn.query(
