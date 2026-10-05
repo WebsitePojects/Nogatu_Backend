@@ -178,14 +178,17 @@ function buildProductSummary({
   };
 }
 
-function buildPackageSummary({ directReferralPackages, claimedPackageSets, rewardAmounts, contributorsByPackage = {} }) {
+function buildPackageSummary({ directReferralPackages, claimedPackageSets, rewardAmounts, contributorsByPackage = {}, highWaterPackages = {} }) {
   const packages = PACKAGE_RULES.map((rule) => {
     const referralCount = Number(directReferralPackages[rule.key] || 0);
     const claimedSets = Number(claimedPackageSets[rule.key] || 0);
-    const qualifiedSets = Math.floor(referralCount / 5);
+    const earnedCount = effectivePackageCount(referralCount, highWaterPackages[rule.key]);
+    const qualifiedSets = Math.floor(earnedCount / 5);
     const availableClaims = Math.max(0, qualifiedSets - claimedSets);
     const rewardAmount = Number(rewardAmounts[rule.key] || 0);
-    const remainder = referralCount % 5;
+    // The next set needs the CURRENT count to pass the next multiple of five above what was
+    // already earned: directs who upgraded away do not count twice.
+    const nextSetAt = (qualifiedSets + 1) * 5;
     const contributorSplit = splitContributorsByClaimUsage(
       contributorsByPackage[rule.key] || [],
       claimedSets * 5,
@@ -202,7 +205,8 @@ function buildPackageSummary({ directReferralPackages, claimedPackageSets, rewar
       claimedSets,
       availableClaims,
       availableCashAmount: availableClaims * rewardAmount,
-      remainingToNextSet: remainder === 0 ? 5 : 5 - remainder,
+      highWaterCount: earnedCount,
+      remainingToNextSet: nextSetAt - referralCount,
       contributors: contributorSplit.all,
       availableContributors: contributorSplit.available,
       contributorHistory: contributorSplit.used,
@@ -367,6 +371,78 @@ async function getDirectReferralPackageCounts(uid) {
   }
 
   return { counts, contributorsByPackage };
+}
+
+/*
+ * High-water (V050, management policy 2026-09-25): a completed package set stays earned even after
+ * its directs upgrade out of the tier. Counts above are the CURRENT tiers, so a set dissolved on
+ * upgrade and the monotonic credit (owed = entitlement - ttlincome5) silently took the loss out of
+ * the member's NEXT set. Sets are now counted from the highest same-tier count ever observed.
+ */
+const HIGH_WATER_SOURCE_OBSERVED = 'observed';
+
+/** Highest observed same-tier direct count per package key. Missing table reads as no history. */
+async function getPackageHighWater(uid, db = pool) {
+  const highWater = normalizeCountMap(PACKAGE_RULES.map((rule) => rule.key));
+  try {
+    const [rows] = await db.query(
+      'SELECT producttype, high_water FROM hifive_package_highwatertab WHERE uid = ?',
+      [uid]
+    );
+    for (const row of rows) {
+      const rule = PACKAGE_RULES_BY_CODE[Number(row.producttype)];
+      if (rule) highWater[rule.key] = Number(row.high_water || 0);
+    }
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
+  }
+  return highWater;
+}
+
+/** Raises the stored high-water to `counts` where higher. Never lowers a row. */
+async function recordPackageHighWater(uid, counts, { db = pool, source = HIGH_WATER_SOURCE_OBSERVED } = {}) {
+  const rows = PACKAGE_RULES
+    .map((rule) => [Number(uid), rule.code, Math.trunc(Number(counts?.[rule.key] || 0)), source])
+    .filter(([, , count]) => count > 0);
+  if (!rows.length) return 0;
+  try {
+    // `source` is assigned first: later assignments in ON DUPLICATE KEY UPDATE see updated values.
+    const [result] = await db.query(
+      `INSERT INTO hifive_package_highwatertab (uid, producttype, high_water, source)
+       VALUES ?
+       ON DUPLICATE KEY UPDATE
+         source = IF(VALUES(high_water) > high_water, VALUES(source), source),
+         high_water = GREATEST(high_water, VALUES(high_water))`,
+      [rows]
+    );
+    return Number(result.affectedRows || 0);
+  } catch (error) {
+    if (error.code !== 'ER_NO_SUCH_TABLE') throw error;
+    return 0;
+  }
+}
+
+/**
+ * Records a member's current same-tier counts as high-water. Called by the auto-credit and,
+ * crucially, by the upgrade route for the SPONSOR before a direct changes tier, so a completed
+ * set is captured before the upgrade can dissolve it.
+ */
+async function observePackageHighWater(uid) {
+  const { counts } = await getDirectReferralPackageCounts(uid);
+  await recordPackageHighWater(uid, counts);
+  return counts;
+}
+
+function effectivePackageCount(current, highWater) {
+  return Math.max(Number(current || 0), Number(highWater || 0));
+}
+
+/** Total package entitlement in pesos: sets from max(current, high-water) per tier. */
+function packageEntitlement(counts, highWater, rewardAmounts) {
+  return PACKAGE_RULES.reduce((sum, rule) => {
+    const sets = Math.floor(effectivePackageCount(counts?.[rule.key], highWater?.[rule.key]) / 5);
+    return sum + sets * Number(rewardAmounts?.[rule.key] || 0);
+  }, 0);
 }
 
 async function getPackageRewardAmounts() {
@@ -860,7 +936,7 @@ async function getPackageClaimedSets(uid) {
 }
 
 async function buildHiFiveStatus(uid) {
-  const [productClaimedByKey, directReferralProducts, maintenancePoints, directReferralPackages, rewardAmounts, packageClaimedSets, directReferralCount] =
+  const [productClaimedByKey, directReferralProducts, maintenancePoints, directReferralPackages, rewardAmounts, packageClaimedSets, directReferralCount, packageHighWater] =
     await Promise.all([
       // PRODUCT claimed = THIS month's redeems (Minutes #14/B monthly reset), not the all-time
       // h5bonustab counter — kept consistent with the monthly qualifying window below.
@@ -871,6 +947,7 @@ async function buildHiFiveStatus(uid) {
       getPackageRewardAmounts(),
       getPackageClaimedSets(uid),
       getAllDirectReferralCount(uid),
+      getPackageHighWater(uid),
     ]);
 
   const productBonus = buildProductSummary({
@@ -886,6 +963,7 @@ async function buildHiFiveStatus(uid) {
     claimedPackageSets: packageClaimedSets,
     rewardAmounts,
     contributorsByPackage: directReferralPackages.contributorsByPackage,
+    highWaterPackages: packageHighWater,
   });
 
   return {
@@ -961,7 +1039,8 @@ async function submitPackageClaim(uid, packageKey, quantity) {
  *
  *     owed = max(0, totalHiFiveEntitlement - ttlincome5_alreadyPaid)
  *
- * where entitlement = SUM over packages of (qualifiedSets * packageReward). It credits `owed`
+ * where entitlement = SUM over packages of (qualifiedSets * packageReward), and qualifiedSets come
+ * from max(current, high-water) so a set dissolved by an upgrade stays earned (V050). It credits `owed`
  * exactly once; after crediting, ttlincome5 == entitlement so a re-run owes 0. Because the
  * basis is the authoritative ttlincome5 (which already holds legacy/manual hi-five that has NO
  * qualification row), this can NEVER double-pay the historical backlog — it only ever pays the
@@ -976,12 +1055,12 @@ async function submitPackageClaim(uid, packageKey, quantity) {
 async function autoCreditEligibleHiFivePackages(uid) {
   if (!(await hasHiFiveQualificationTable())) return { credited: 0, owed: 0 };
 
-  const status = await buildHiFiveStatus(uid).catch(() => null);
-  const packages = status?.packageBonus?.packages || [];
-  const entitlement = packages.reduce(
-    (sum, p) => sum + Number(p.qualifiedSets || 0) * Number(p.rewardAmount || 0),
-    0
-  );
+  // Record today's counts BEFORE reading the high-water, so a set completed right now is kept
+  // even if one of its directs upgrades before the next credit.
+  const { counts } = await getDirectReferralPackageCounts(uid);
+  await recordPackageHighWater(uid, counts);
+  const [highWater, rewardAmounts] = await Promise.all([getPackageHighWater(uid), getPackageRewardAmounts()]);
+  const entitlement = packageEntitlement(counts, highWater, rewardAmounts);
   if (entitlement < 1) return { credited: 0, owed: 0, entitlement: 0 };
 
   // Own transaction + FOR UPDATE on the wallet row makes this atomic AND self-serializing:
@@ -1070,6 +1149,10 @@ module.exports = {
   getDirectReferralProductPurchases,
   getMaintenanceProductPoints,
   getDirectReferralPackageCounts,
+  getPackageHighWater,
+  recordPackageHighWater,
+  observePackageHighWater,
+  packageEntitlement,
   getPackageRewardAmounts,
   getPackageClaimedSets,
   buildProductSummary,
