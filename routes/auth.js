@@ -11,6 +11,7 @@ const { getAccountTypeName } = require('../utils/helpers');
 const { writeAuditLog } = require('../services/audit');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
 const { sendPasswordResetEmail } = require('../services/mailer');
+const { validateNewPassword, matchesStoredPassword, SAME_AS_CURRENT_ERROR } = require('../utils/passwordPolicy');
 
 function normalizeLegacyUsername(value) {
   return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
@@ -46,7 +47,7 @@ router.post('/login', async (req, res) => {
     if (rows.length === 0) {
       return res.status(401).json({
         error: 'Invalid username or password',
-        ...(process.env.NODE_ENV !== 'production' ? { debugCode: 'USER_NOT_FOUND' } : {}),
+        ...(process.env.AUTH_DEBUG_CODES === 'true' ? { debugCode: 'USER_NOT_FOUND' } : {}),
       });
     }
 
@@ -86,7 +87,7 @@ router.post('/login', async (req, res) => {
     if (!passwordMatch) {
       return res.status(401).json({
         error: 'Invalid username or password',
-        ...(process.env.NODE_ENV !== 'production' ? { debugCode: isHashed ? 'HASH_MISMATCH' : 'PLAINTEXT_MISMATCH' } : {}),
+        ...(process.env.AUTH_DEBUG_CODES === 'true' ? { debugCode: isHashed ? 'HASH_MISMATCH' : 'PLAINTEXT_MISMATCH' } : {}),
       });
     }
 
@@ -225,16 +226,8 @@ router.post('/forgot-password', async (req, res) => {
           console.error('[Mailer] unexpected dispatch error:', err.message);
         });
       }
-
-      // In development we also return the token so the local reset flow can be
-      // tested without a mail gateway.
-      if (process.env.NODE_ENV !== 'production') {
-        return res.json({
-          success: true,
-          message: 'If the account exists, reset instructions will be sent.',
-          debugResetToken: rawToken,
-        });
-      }
+      // The token is never returned in the response, in any environment: green runs with
+      // NODE_ENV=development on a public host, so a "dev only" echo let anyone reset any account.
     }
 
     res.json({ success: true, message: 'If the account exists, reset instructions will be sent.' });
@@ -257,8 +250,16 @@ router.post('/reset-password', async (req, res) => {
     const newPassword = String(req.body.newPassword || req.body.password || '');
     const confirmPassword = String(req.body.confirmPassword || req.body.confirm || newPassword);
 
-    if (!token || !newPassword || newPassword !== confirmPassword || newPassword.length < 8) {
-      return res.status(400).json({ error: 'Enter a matching new password with at least 8 characters.' });
+    if (!token) {
+      return res.status(400).json({ error: 'Reset link is invalid or expired.' });
+    }
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'The two passwords do not match.' });
+    }
+    // Rules that need no account data are checked before touching the database.
+    const basic = validateNewPassword(newPassword);
+    if (!basic.ok) {
+      return res.status(400).json({ error: basic.error });
     }
 
     conn = await pool.getConnection();
@@ -281,6 +282,25 @@ router.post('/reset-password', async (req, res) => {
     }
 
     const tokenRow = tokenRows[0];
+
+    // Account-specific rules run only after the token proves the caller controls the account, so
+    // they reveal nothing to someone without a valid link. A rejection rolls back and leaves the
+    // token unused, letting the member try another password with the same link.
+    const [memberRows] = await conn.query(
+      'SELECT username, email, password FROM memberstab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      [tokenRow.member_uid]
+    );
+    const member = memberRows[0] || {};
+    const contextual = validateNewPassword(newPassword, { username: member.username, email: member.email });
+    if (!contextual.ok) {
+      await conn.rollback();
+      return res.status(400).json({ error: contextual.error });
+    }
+    if (await matchesStoredPassword(newPassword, member.password)) {
+      await conn.rollback();
+      return res.status(400).json({ error: SAME_AS_CURRENT_ERROR });
+    }
+
     const hashed = await bcrypt.hash(newPassword, 12);
     await conn.query('UPDATE memberstab SET password = ? WHERE uid = ? LIMIT 1', [hashed, tokenRow.member_uid]);
     await conn.query('UPDATE password_reset_tokenstab SET used_at = CURRENT_TIMESTAMP(6) WHERE id = ? LIMIT 1', [tokenRow.id]);

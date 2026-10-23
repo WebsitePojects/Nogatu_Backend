@@ -44,7 +44,7 @@ router.post('/login', async (req, res) => {
     if (rows.length === 0) {
       return res.status(401).json({
         error: 'Invalid username or password',
-        ...(process.env.NODE_ENV !== 'production' ? { debugCode: 'USER_NOT_FOUND' } : {}),
+        ...(process.env.AUTH_DEBUG_CODES === 'true' ? { debugCode: 'USER_NOT_FOUND' } : {}),
       });
     }
 
@@ -84,7 +84,7 @@ router.post('/login', async (req, res) => {
     if (!passwordMatch) {
       return res.status(401).json({
         error: 'Invalid username or password',
-        ...(process.env.NODE_ENV !== 'production' ? { debugCode: isHashed ? 'HASH_MISMATCH' : 'PLAINTEXT_MISMATCH' } : {}),
+        ...(process.env.AUTH_DEBUG_CODES === 'true' ? { debugCode: isHashed ? 'HASH_MISMATCH' : 'PLAINTEXT_MISMATCH' } : {}),
       });
     }
 
