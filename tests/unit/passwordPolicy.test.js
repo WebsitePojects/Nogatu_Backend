@@ -16,30 +16,23 @@ const STRONG = 'Mango-Tree-River-42';
 
 // ── The rules ────────────────────────────────────────────────────────────
 
-test('policy: accepts a reasonable password', () => {
-  assert.deepEqual(validateNewPassword(STRONG, { username: 'ana01', email: 'ana@example.test' }), { ok: true });
+test('policy: accepts any password of 8+ characters, including predictable ones (owner decision 2026-10-23)', () => {
+  for (const candidate of [STRONG, '12345678', 'password123', 'zzzzzzzz', 'Nogatu2026', 'ana01ana01']) {
+    assert.deepEqual(validateNewPassword(candidate), { ok: true }, `should accept ${JSON.stringify(candidate)}`);
+  }
 });
 
-test('policy: rejects short, over-72-byte, padded, common, repeated and digit-run passwords', () => {
-  const bad = [
-    '', 'short7', 'a'.repeat(73), 'é'.repeat(37), ` ${STRONG}`, `${STRONG} `,
-    'password123', 'PASSWORD123', 'Nogatu2026', '12345678', '87654321', '0123456789', 'zzzzzzzz',
-  ];
-  for (const candidate of bad) {
+test('policy: rejects empty, short, over-72-byte and space-padded passwords', () => {
+  for (const candidate of ['', 'short7', 'a'.repeat(73), 'é'.repeat(37), ` ${STRONG}`, `${STRONG} `]) {
     assert.equal(validateNewPassword(candidate).ok, false, `should reject ${JSON.stringify(candidate)}`);
   }
 });
 
 test('policy: 72 bytes is the ceiling, counted in bytes not characters', () => {
-  assert.equal(validateNewPassword('k'.repeat(72)).ok, false, 'one repeated char is rejected for another reason');
-  assert.equal(validateNewPassword('kq'.repeat(36)).ok, true);
-  assert.equal(validateNewPassword('kq'.repeat(36) + 'x').ok, false);
-});
-
-test('policy: rejects the username or the email name inside the password, case-insensitively', () => {
-  assert.equal(validateNewPassword('xxANA01xx-9', { username: 'ana01' }).ok, false);
-  assert.equal(validateNewPassword('my-anacruz-77', { email: 'AnaCruz@example.test' }).ok, false);
-  assert.equal(validateNewPassword(STRONG, { username: 'jo' }).ok, true, 'very short usernames are not checked');
+  assert.equal(validateNewPassword('k'.repeat(72)).ok, true);
+  assert.equal(validateNewPassword('k'.repeat(73)).ok, false);
+  assert.equal(validateNewPassword('é'.repeat(36)).ok, true, '36 two-byte characters = 72 bytes');
+  assert.equal(validateNewPassword('é'.repeat(37)).ok, false);
 });
 
 test('matchesStoredPassword: bcrypt, PHP plaintext, md5 and sha1 are all recognised', async () => {
@@ -99,7 +92,7 @@ function fakeResetDb({ tokenValid = true, member }) {
     release: () => {},
     query: async (sql, params) => {
       if (/FROM password_reset_tokenstab/.test(sql)) return [tokenValid ? [{ id: 9, member_uid: 7 }] : []];
-      if (/SELECT username, email, password FROM memberstab/.test(sql)) return [[member]];
+      if (/SELECT password FROM memberstab/.test(sql)) return [[member]];
       if (/^\s*(UPDATE|DELETE)/.test(sql)) { log.updates.push({ sql, params }); return [{ affectedRows: 1 }]; }
       return [[]];
     },
@@ -142,20 +135,11 @@ test('reset: a PHP-era plaintext current password is also recognised as the same
   assert.equal(log.updates.length, 0);
 });
 
-test('reset: a password containing the username is rejected after the token check', async () => {
-  const { pool, log } = fakeResetDb({ member: { username: 'ana01', email: 'ana@example.test', password: 'old-one-55' } });
-  const res = await call(handlerFor(loadAuthRoutes(pool), 'post', '/reset-password'),
-    { token: 'tok', newPassword: 'ana01-garden-77', confirmPassword: 'ana01-garden-77' });
-  assert.equal(res.statusCode, 400);
-  assert.match(res.body.error, /username/);
-  assert.equal(log.updates.length, 0);
-});
-
-test('reset: weak or mismatched input is refused before any database work', async () => {
+test('reset: too-short or mismatched input is refused before any database work', async () => {
   const { pool, log } = fakeResetDb({ member: {} });
   const handler = handlerFor(loadAuthRoutes(pool), 'post', '/reset-password');
 
-  assert.equal((await call(handler, { token: 'tok', newPassword: '12345678', confirmPassword: '12345678' })).statusCode, 400);
+  assert.equal((await call(handler, { token: 'tok', newPassword: 'short7', confirmPassword: 'short7' })).statusCode, 400);
   assert.equal((await call(handler, { token: 'tok', newPassword: STRONG, confirmPassword: `${STRONG}x` })).statusCode, 400);
   assert.equal(log.gotConnection, false);
 });
@@ -220,7 +204,7 @@ test('account page: changing to the current password is refused and nothing is w
   const pool = {
     query: async (sql, params) => {
       if (/information_schema/.test(sql)) return [[]];
-      if (/SELECT username, email, password FROM memberstab/.test(sql)) return [[current]];
+      if (/SELECT password FROM memberstab/.test(sql)) return [[current]];
       if (/SELECT uid FROM memberstab WHERE uid = /.test(sql)) return [[{ uid: 7 }]];
       if (/^\s*UPDATE/.test(sql)) { writes.push({ sql, params }); return [{ affectedRows: 1 }]; }
       return [[]];
@@ -237,7 +221,7 @@ test('account page: changing to the current password is refused and nothing is w
   assert.equal(same.statusCode, 400);
   assert.equal(same.body.error, SAME_AS_CURRENT_ERROR);
 
-  const weak = await call(handler, { password: 'password1', email: 'ana@example.test' }, { uid: 7 });
+  const weak = await call(handler, { password: 'short7', email: 'ana@example.test' }, { uid: 7 });
   assert.equal(weak.statusCode, 400);
   assert.equal(writes.length, 0);
 

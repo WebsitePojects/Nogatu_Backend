@@ -256,10 +256,9 @@ router.post('/reset-password', async (req, res) => {
     if (newPassword !== confirmPassword) {
       return res.status(400).json({ error: 'The two passwords do not match.' });
     }
-    // Rules that need no account data are checked before touching the database.
-    const basic = validateNewPassword(newPassword);
-    if (!basic.ok) {
-      return res.status(400).json({ error: basic.error });
+    const check = validateNewPassword(newPassword);
+    if (!check.ok) {
+      return res.status(400).json({ error: check.error });
     }
 
     conn = await pool.getConnection();
@@ -283,19 +282,14 @@ router.post('/reset-password', async (req, res) => {
 
     const tokenRow = tokenRows[0];
 
-    // Account-specific rules run only after the token proves the caller controls the account, so
-    // they reveal nothing to someone without a valid link. A rejection rolls back and leaves the
-    // token unused, letting the member try another password with the same link.
+    // The "same as current" check runs only after the token proves the caller controls the
+    // account, so it reveals nothing to someone without a valid link. A rejection rolls back and
+    // leaves the token unused, letting the member try another password with the same link.
     const [memberRows] = await conn.query(
-      'SELECT username, email, password FROM memberstab WHERE uid = ? LIMIT 1 FOR UPDATE',
+      'SELECT password FROM memberstab WHERE uid = ? LIMIT 1 FOR UPDATE',
       [tokenRow.member_uid]
     );
     const member = memberRows[0] || {};
-    const contextual = validateNewPassword(newPassword, { username: member.username, email: member.email });
-    if (!contextual.ok) {
-      await conn.rollback();
-      return res.status(400).json({ error: contextual.error });
-    }
     if (await matchesStoredPassword(newPassword, member.password)) {
       await conn.rollback();
       return res.status(400).json({ error: SAME_AS_CURRENT_ERROR });
