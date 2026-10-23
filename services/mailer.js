@@ -1,31 +1,47 @@
 /**
- * Mailer service — transactional email transport for the member portal.
+ * Mailer service — transactional email delivery for the member portal.
  *
- * Currently used only for password-reset delivery. The transport is created
- * lazily as a process-wide singleton so importing this module is side-effect
- * free (no SMTP connection until the first send).
+ * Currently used only for password-reset delivery. Two providers:
+ *   - Resend (HTTPS API) when RESEND_API_KEY and MAIL_FROM are set. Preferred.
+ *   - SMTP (nodemailer) when SMTP_HOST/USER/PASS and MAIL_FROM are set. Fallback.
+ * Neither configured: sending is skipped with a single warning, so the reset endpoint keeps working.
  *
- * Security: never log recipient addresses, tokens, or any PII. Only error
- * messages (err.message) are logged, never the error stack or the payload.
+ * Nothing is created at import time: the SMTP transport is a lazy singleton and Resend is a plain
+ * HTTPS call, so requiring this module has no side effects.
+ *
+ * Security: never log recipient addresses, tokens, reset links, or provider error messages (Resend
+ * messages can echo addresses). Only the provider, an HTTP status and an error name are logged.
  */
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const { buildPasswordResetEmail } = require('./emailTemplates/passwordReset');
 
-// Injectable transport factory so unit tests can stub nodemailer without a
-// real SMTP server. Defaults to the real nodemailer.createTransport.
+const RESEND_ENDPOINT = 'https://api.resend.com/emails';
+const SEND_TIMEOUT_MS = 10000;
+
+// Injectable so unit tests can stub delivery without SMTP or network access.
 let transportFactory = (options) => nodemailer.createTransport(options);
+let fetchImpl = (...args) => fetch(...args);
 let cachedTransport = null;
 let warnedNotConfigured = false;
 
+function isSmtpConfigured() {
+  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
 /**
- * True iff every SMTP setting required to send mail is present in the env.
+ * 'resend' | 'smtp' | null. Resend wins when both are configured, so adding the API key is enough
+ * to switch providers without removing the SMTP settings.
  */
+function resolveProvider() {
+  if (!process.env.MAIL_FROM) return null;
+  if (process.env.RESEND_API_KEY) return 'resend';
+  if (isSmtpConfigured()) return 'smtp';
+  return null;
+}
+
 function isMailerConfigured() {
-  return Boolean(
-    process.env.SMTP_HOST &&
-    process.env.SMTP_USER &&
-    process.env.SMTP_PASS &&
-    process.env.MAIL_FROM
-  );
+  return resolveProvider() !== null;
 }
 
 /**
@@ -43,13 +59,10 @@ function buildTransportOptions() {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
     },
-    connectionTimeout: 10000,
+    connectionTimeout: SEND_TIMEOUT_MS,
   };
 }
 
-/**
- * Lazily create (and cache) the singleton transport.
- */
 function getTransport() {
   if (!cachedTransport) {
     cachedTransport = transportFactory(buildTransportOptions());
@@ -57,27 +70,62 @@ function getTransport() {
   return cachedTransport;
 }
 
-function escapeHtml(value) {
-  return String(value == null ? '' : value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+async function sendViaSmtp(message) {
+  await getTransport().sendMail(message);
 }
 
 /**
- * Send a password-reset email. Never throws to the caller — on any failure it
- * logs err.message (message only) and returns { sent: false } so the calling
- * HTTP handler can keep its generic, non-enumerating 200 response.
+ * One reset link = one email. The key is derived from the link (which carries the single-use token),
+ * so if this request is ever retried Resend returns the first result instead of sending twice.
+ */
+function idempotencyKeyFor(resetUrl) {
+  return `pwreset-${crypto.createHash('sha256').update(String(resetUrl)).digest('hex').slice(0, 40)}`;
+}
+
+async function sendViaResend(message, idempotencyKey) {
+  const response = await fetchImpl(RESEND_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Idempotency-Key': idempotencyKey,
+    },
+    body: JSON.stringify({
+      from: message.from,
+      to: [message.to],
+      subject: message.subject,
+      html: message.html,
+      text: message.text,
+    }),
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    let errorName = 'unknown_error';
+    try {
+      const body = await response.json();
+      if (body && typeof body.name === 'string') errorName = body.name;
+    } catch {
+      // Non-JSON error body: the status code alone is reported.
+    }
+    const err = new Error(`Resend rejected the email (HTTP ${response.status}, ${errorName})`);
+    err.safeForLog = true;
+    throw err;
+  }
+}
+
+/**
+ * Send a password-reset email. Never throws to the caller — on any failure it logs a safe summary
+ * and returns { sent: false } so the calling HTTP handler keeps its generic, non-enumerating 200.
  *
  * @param {{ to: string, firstname?: string, resetUrl: string }} params
  * @returns {Promise<{ sent: boolean }>}
  */
 async function sendPasswordResetEmail({ to, firstname, resetUrl } = {}) {
-  if (!isMailerConfigured()) {
+  const provider = resolveProvider();
+  if (!provider) {
     if (!warnedNotConfigured) {
-      console.warn('[Mailer] SMTP not configured — password reset email skipped');
+      console.warn('[Mailer] No email provider configured — password reset email skipped');
       warnedNotConfigured = true;
     }
     return { sent: false };
@@ -89,81 +137,50 @@ async function sendPasswordResetEmail({ to, firstname, resetUrl } = {}) {
   }
 
   try {
-    const name = firstname ? String(firstname).trim() : '';
-    const greeting = name ? `Hi ${name},` : 'Hi,';
+    const content = buildPasswordResetEmail({ firstname, resetUrl });
+    const message = { from: process.env.MAIL_FROM, to, ...content };
 
-    const text = [
-      greeting,
-      '',
-      'We received a request to reset your NOGATU Alliance portal password.',
-      '',
-      `Reset your password here: ${resetUrl}`,
-      '',
-      'This link expires in 15 minutes. If you did not request this, ignore this email.',
-      '',
-      '— NOGATU Alliance',
-    ].join('\n');
-
-    const safeGreeting = escapeHtml(greeting);
-    const safeUrl = escapeHtml(resetUrl);
-    const html = `<!DOCTYPE html>
-<html>
-  <body style="margin:0;padding:0;background:#f4f5f7;font-family:Arial,Helvetica,sans-serif;color:#1f2937;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;padding:32px;">
-            <tr><td style="font-size:18px;font-weight:bold;color:#166534;padding-bottom:16px;">NOGATU Alliance</td></tr>
-            <tr><td style="font-size:15px;padding-bottom:12px;">${safeGreeting}</td></tr>
-            <tr><td style="font-size:14px;line-height:1.5;padding-bottom:20px;">We received a request to reset your NOGATU Alliance portal password.</td></tr>
-            <tr>
-              <td style="padding-bottom:20px;">
-                <a href="${safeUrl}" style="display:inline-block;background:#166534;color:#ffffff;text-decoration:none;font-size:14px;font-weight:bold;padding:12px 24px;border-radius:6px;">Reset password</a>
-              </td>
-            </tr>
-            <tr><td style="font-size:13px;line-height:1.5;color:#6b7280;padding-bottom:8px;">Or paste this link into your browser:<br><a href="${safeUrl}" style="color:#166534;word-break:break-all;">${safeUrl}</a></td></tr>
-            <tr><td style="font-size:13px;line-height:1.5;color:#6b7280;">This link expires in 15 minutes. If you did not request this, ignore this email.</td></tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>`;
-
-    await getTransport().sendMail({
-      from: process.env.MAIL_FROM,
-      to,
-      subject: 'Reset your NOGATU Alliance password',
-      text,
-      html,
-    });
-
+    if (provider === 'resend') {
+      await sendViaResend(message, idempotencyKeyFor(resetUrl));
+    } else {
+      await sendViaSmtp(message);
+    }
     return { sent: true };
   } catch (err) {
-    // message only — never the recipient address, token, or stack.
-    console.error('[Mailer] send failed:', err.message);
+    // Our own Resend error is known-safe; anything else (network, SMTP, timeout) is reduced to its
+    // name and code (e.g. "TimeoutError", "Error EAUTH") so no address or link can reach the logs
+    // through a library's error text.
+    const summary = err && err.safeForLog
+      ? err.message
+      : [(err && err.name) || 'Error', err && err.code].filter(Boolean).join(' ');
+    console.error(`[Mailer] ${provider} send failed:`, summary);
     return { sent: false };
   }
 }
 
 // --- Test hooks (not for production use) --------------------------------
-// Allow unit tests to inject a stub transport factory and reset the module's
-// cached singleton / warn-once state between cases.
 function __setTransportFactoryForTests(factory) {
   transportFactory = factory || ((options) => nodemailer.createTransport(options));
   cachedTransport = null;
+}
+
+function __setFetchForTests(impl) {
+  fetchImpl = impl || ((...args) => fetch(...args));
 }
 
 function __resetForTests() {
   cachedTransport = null;
   warnedNotConfigured = false;
   transportFactory = (options) => nodemailer.createTransport(options);
+  fetchImpl = (...args) => fetch(...args);
 }
 
 module.exports = {
   isMailerConfigured,
+  resolveProvider,
   buildTransportOptions,
   sendPasswordResetEmail,
   __setTransportFactoryForTests,
+  __setFetchForTests,
   __resetForTests,
 };
