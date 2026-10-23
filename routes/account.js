@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/database');
 const { memberAuth } = require('../middleware/auth');
 const { normalizeEmail, isValidEmail } = require('../utils/email');
+const { validateNewPassword, matchesStoredPassword, SAME_AS_CURRENT_ERROR } = require('../utils/passwordPolicy');
 const { resolveTin, isValidTin } = require('../utils/tin');
 const { listPackagePolicies } = require('../services/packagePolicy');
 const { normalizePayoutStorageValue, resolvePayoutOption, listPayoutOptions } = require('../services/payoutOptions');
@@ -150,7 +151,20 @@ router.put('/', memberAuth, async (req, res) => {
     ];
     const values = [address, payoutdetails, normalizedPayoutOption, contactnos, normalizedEmail || null];
 
-    if (password && password.trim()) {
+    // A blank field means "keep my password". Anything else must meet the same rules as a reset.
+    if (typeof password === 'string' && password.trim()) {
+      const [currentRows] = await pool.query(
+        'SELECT username, email, password FROM memberstab WHERE uid = ? LIMIT 1',
+        [uid]
+      );
+      const current = currentRows[0] || {};
+      const check = validateNewPassword(password, { username: current.username, email: current.email });
+      if (!check.ok) {
+        return res.status(400).json({ error: check.error });
+      }
+      if (await matchesStoredPassword(password, current.password)) {
+        return res.status(400).json({ error: SAME_AS_CURRENT_ERROR });
+      }
       const hashedPassword = await bcrypt.hash(password, 12);
       setClauses.push('password = ?');
       values.push(hashedPassword);
