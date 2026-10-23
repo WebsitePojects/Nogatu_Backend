@@ -153,16 +153,12 @@ router.put('/', memberAuth, async (req, res) => {
 
     // A blank field means "keep my password". Anything else must meet the same rules as a reset.
     if (typeof password === 'string' && password.trim()) {
-      const [currentRows] = await pool.query(
-        'SELECT username, email, password FROM memberstab WHERE uid = ? LIMIT 1',
-        [uid]
-      );
-      const current = currentRows[0] || {};
-      const check = validateNewPassword(password, { username: current.username, email: current.email });
+      const check = validateNewPassword(password);
       if (!check.ok) {
         return res.status(400).json({ error: check.error });
       }
-      if (await matchesStoredPassword(password, current.password)) {
+      const [currentRows] = await pool.query('SELECT password FROM memberstab WHERE uid = ? LIMIT 1', [uid]);
+      if (await matchesStoredPassword(password, (currentRows[0] || {}).password)) {
         return res.status(400).json({ error: SAME_AS_CURRENT_ERROR });
       }
       const hashedPassword = await bcrypt.hash(password, 12);
