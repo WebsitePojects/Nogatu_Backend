@@ -63,6 +63,16 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
     );
     const newRegistrationsMonth = Number(monthRows[0]?.cnt || 0);
 
+    // Money credited to members and not yet withdrawn (pending encashments are already
+    // debited from ttlcashbalance). Read-only; the stored balance is the authority.
+    const [cashRows] = await pool.query(
+      `SELECT ROUND(COALESCE(SUM(ttlcashbalance), 0), 2) AS total,
+              COALESCE(SUM(ttlcashbalance > 0), 0) AS holders
+       FROM payouttotaltab`
+    );
+    const totalCashBalance = Number(cashRows[0]?.total || 0);
+    const membersWithCashBalance = Number(cashRows[0]?.holders || 0);
+
     res.json({
       totalAccounts: totalPaid + totalFs + totalCd,
       paidAccounts: totalPaid,
@@ -75,6 +85,8 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
       totalIncomePaidOut,
       activeCdAccounts,
       newRegistrationsMonth,
+      totalCashBalance,
+      membersWithCashBalance,
     });
   } catch (err) {
     console.error('[Admin Dashboard] Error:', err);
