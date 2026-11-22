@@ -290,6 +290,9 @@ app.use('/api/auth/reset-password', resetPasswordLimiter);
 // ─── API Routes ──────────────────────────────────────────────
 // Member routes
 app.use('/api/auth', require('./routes/auth'));
+// nogatu.store asks whether a member's username + password are right before giving the member price.
+// Server to server (x-api-key = NCDMS_BRIDGE_KEY); off until that key is set.
+app.use('/api/external', require('./routes/externalMember').createExternalMemberRouter({ pool: require('./config/database').pool }));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/wallet', require('./routes/wallet'));
 app.use('/api/genealogy', require('./routes/genealogy'));

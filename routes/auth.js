@@ -13,9 +13,7 @@ const { normalizeEmail, isValidEmail } = require('../utils/email');
 const { sendPasswordResetEmail } = require('../services/mailer');
 const { validateNewPassword, matchesStoredPassword, SAME_AS_CURRENT_ERROR } = require('../utils/passwordPolicy');
 
-function normalizeLegacyUsername(value) {
-  return String(value || '').replace(/\s+/g, '').replace(/[^A-Za-z0-9 ]/g, '');
-}
+const { normalizeLegacyUsername } = require('../utils/legacyUsername');
 
 function hashResetToken(token) {
   return crypto.createHash('sha256').update(String(token || '')).digest('hex');
