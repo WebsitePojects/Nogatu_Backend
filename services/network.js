@@ -6,7 +6,7 @@
  */
 const { pool } = require('../config/database');
 const { getAccountTypeName, currentMonthRange } = require('../utils/helpers');
-const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo, countsForPairingSource } = require('./accountState');
+const { getEffectiveAccountState, getAccountStateLabel, getAccountEntryAuditInfo, countsForPairingSource, isUplineNeutralCd } = require('./accountState');
 const { getPackageBinaryValue } = require('./packagePolicy');
 
 function resolveGenealogyPoints(currentaccttype, storedBinaryPoints) {
@@ -568,7 +568,7 @@ async function getSubtreeFlat(rootUid, treeType = 'unilevel', maxDepth = 100) {
     // their package value as "pts to upline" would mis-attribute point sources.
     // NOTE: raw codeid/cdstatus here; effective post-upgrade state (upgradetab) is a
     // documented follow-up (ULTRACODE plan H1).
-    const binaryContributes = codeid === 1 || (codeid === 3 && cdstatus === 2);
+    const binaryContributes = codeid === 1 || (codeid === 3 && cdstatus === 2) || isUplineNeutralCd(r);
     return {
       uid: Number(r.uid),
       publicUid: r.public_uid || null,
