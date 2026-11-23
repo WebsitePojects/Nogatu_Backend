@@ -131,6 +131,20 @@ async function getEffectiveAccountState(uid, row, executor) {
   return accountRow;
 }
 
+// Sir Dino, 2026-11-23 ("4 Paid Accounts"): these members registered with CD codes but were
+// recorded as PAID. They are converted to unpaid CD (package kept) so their own encashments repay
+// the obligation (insertIncome deducts on codeid 3 + cdstatus 1). Their uplines must keep earning
+// exactly as before, so while they are CD they still count as direct-referral and pairing sources:
+// pairing contribution, pairing unlock, leadership source, Hi-Five sets. Once the CD is fully paid
+// they count anyway, so nothing changes for the uplines at payoff (no offset to retire, no double pay).
+// Keyed by uid AND codeid 3: the exception only applies to these four while they are CD.
+const UPLINE_NEUTRAL_CD_UIDS = Object.freeze([6581504, 4584545, 5658589, 3933627]);
+const UPLINE_NEUTRAL_CD_SET = new Set(UPLINE_NEUTRAL_CD_UIDS);
+
+function isUplineNeutralCd(row) {
+  return Boolean(row) && toNumber(row.codeid) === 3 && UPLINE_NEUTRAL_CD_SET.has(toNumber(row.uid));
+}
+
 function countsForPairingSource(row) {
   if (!row) return false;
 
@@ -142,7 +156,7 @@ function countsForPairingSource(row) {
     return true;
   }
 
-  return false;
+  return isUplineNeutralCd(row);
 }
 
 function countsForDirectReferralSource(row) {
@@ -156,7 +170,7 @@ function countsForDirectReferralSource(row) {
     return true;
   }
 
-  return false;
+  return isUplineNeutralCd(row);
 }
 
 function getAccountStateLabel(row) {
@@ -213,11 +227,12 @@ function getAccountEntryAuditInfo(row) {
   }
 
   if (codeid === 3) {
+    const neutral = isUplineNeutralCd(row);
     return {
       entryCode: 'CD',
       entryLabel: 'CD Unpaid',
-      sponsorCreditEligible: false,
-      sourceBinaryEligible: false,
+      sponsorCreditEligible: neutral,
+      sourceBinaryEligible: neutral,
     };
   }
 
@@ -237,4 +252,6 @@ module.exports = {
   countsForDirectReferralSource,
   getAccountStateLabel,
   getAccountEntryAuditInfo,
+  isUplineNeutralCd,
+  UPLINE_NEUTRAL_CD_UIDS,
 };
