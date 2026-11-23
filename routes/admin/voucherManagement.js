@@ -18,6 +18,7 @@ const {
   updateManualVoucherAvailment,
 } = require('../../services/voucher');
 const { SCHEMA_REQUIREMENTS, assertSchemaRequirements } = require('../../services/schemaReadiness');
+const { extendVoucherValidity, VoucherValidityError } = require('../../services/voucherValidity');
 
 // Hard cap on a single grant batch — bounds worst-case connection/transaction fan-out
 // per request and gives a clear 400 instead of a slow/huge silent loop.
@@ -637,6 +638,83 @@ router.post('/grant', adminAuth, adminRights([1, 2, 3]), idempotent('admin.vouch
   // `skippedCount` kept alongside `skipped` — the existing admin frontend
   // (VoucherGrant.jsx) reads `res.data.skippedCount`.
   res.json({ success: true, granted, skipped, skippedCount: skipped, results });
+});
+
+/**
+ * POST /api/admin/voucher-management/:id/extend-validity
+ * Body: { newExpiry: 'YYYY-MM-DD', reason }. Super-admin only (rights 1).
+ * The governing clock (expiry_date vs use_expires_at) is chosen server-side from the locked row;
+ * the service never touches balance/amount. Money-adjacent => idempotency key + row CAS + audit row.
+ */
+const EXTEND_ERROR_STATUS = { NOT_FOUND: 404, CONFLICT: 409 };
+
+router.post('/:id/extend-validity', adminAuth, adminRights([1]), idempotent('admin.voucherManagement.extendValidity'), async (req, res) => {
+  const voucherId = Number(req.params.id);
+  if (!Number.isInteger(voucherId) || voucherId <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid voucher id', code: 'INVALID_ID' });
+  }
+
+  // The audit row must name a real admin; refuse before any DB work rather than log id NULL.
+  const adminId = Number(req.session?.adminNumericId);
+  if (!Number.isInteger(adminId) || adminId <= 0) {
+    return res.status(401).json({ success: false, error: 'Admin session is missing an id. Please log in again.', code: 'NO_ADMIN_ID' });
+  }
+
+  try {
+    const data = await extendVoucherValidity({
+      voucherId,
+      newExpiry: req.body?.newExpiry,
+      reason: req.body?.reason,
+      admin: {
+        id: adminId,
+        username: String(req.session?.adminid || '').trim() || null,
+      },
+    });
+    return res.json({ success: true, data });
+  } catch (error) {
+    if (error instanceof VoucherValidityError) {
+      return res.status(EXTEND_ERROR_STATUS[error.code] || 400).json({ success: false, error: error.message, code: error.code });
+    }
+    if (error?.code === 'ER_NO_SUCH_TABLE') {
+      return res.status(503).json({ success: false, error: 'Voucher extension is not ready. Please run database migrations.', code: 'SCHEMA_NOT_READY' });
+    }
+    console.error('[Admin Voucher Management] Extend validity error:', error);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/admin/voucher-management/:id/validity-history
+ * Audit trail of validity extensions for one voucher, newest first (max 50).
+ */
+router.get('/:id/validity-history', adminAuth, adminRights([1, 2, 3]), async (req, res) => {
+  const voucherId = Number(req.params.id);
+  if (!Number.isInteger(voucherId) || voucherId <= 0) {
+    return res.status(400).json({ success: false, error: 'Invalid voucher id', code: 'INVALID_ID' });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      // Formatted in SQL so the admin sees server-local (Manila) time, not a UTC ISO string.
+      `SELECT id, voucher_id, uid, clock,
+              DATE_FORMAT(old_expiry, '%Y-%m-%d %H:%i') AS old_expiry,
+              DATE_FORMAT(new_expiry, '%Y-%m-%d %H:%i') AS new_expiry,
+              old_status, new_status, reason, admin_id, admin_username,
+              DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS created_at
+         FROM voucher_validity_extensiontab
+        WHERE voucher_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50`,
+      [voucherId]
+    );
+    return res.json({ success: true, data: rows });
+  } catch (error) {
+    if (error?.code === 'ER_NO_SUCH_TABLE') {
+      return res.status(503).json({ success: false, error: 'Voucher extension is not ready. Please run database migrations.', code: 'SCHEMA_NOT_READY' });
+    }
+    console.error('[Admin Voucher Management] Validity history error:', error);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
 
 module.exports = router;

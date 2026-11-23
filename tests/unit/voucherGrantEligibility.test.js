@@ -209,7 +209,7 @@ function loadVoucherManagementRouterForGrant({ scenarios = {}, idempotencyCaptur
     // captures the scope string so the test can prove the route is wrapped.
     [path.join(repoRoot, 'middleware', 'idempotency.js')]: {
       idempotent: (scope) => {
-        idempotencyCapture.scope = scope;
+        idempotencyCapture.scopes = [...(idempotencyCapture.scopes || []), scope];
         idempotencyCapture.calls = (idempotencyCapture.calls || 0) + 1;
         return (req, res, next) => next();
       },
@@ -335,10 +335,11 @@ test('POST /grant is wrapped in the idempotency middleware with a stable scope',
   const idempotencyCapture = {};
   loadVoucherManagementRouterForGrant({ idempotencyCapture });
 
-  assert.equal(idempotencyCapture.calls, 1, 'idempotent(scope) must be called exactly once when the router loads');
-  assert.equal(typeof idempotencyCapture.scope, 'string');
-  assert.ok(idempotencyCapture.scope.length > 0);
-  assert.equal(idempotencyCapture.scope, 'admin.voucherManagement.grant');
+  // The router wraps several mutating routes (grant, extend-validity); the grant
+  // scope must be registered exactly once and never shared with another route.
+  const scopes = idempotencyCapture.scopes || [];
+  assert.equal(scopes.filter((s) => s === 'admin.voucherManagement.grant').length, 1);
+  assert.equal(new Set(scopes).size, scopes.length, 'idempotency scopes must be unique per route');
 });
 
 // ── Isolation: one bad uid cannot roll back or block the others ───────────
