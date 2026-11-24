@@ -26,6 +26,10 @@ const fakePool = {
   async query(sql, params = []) {
     const s = sql.replace(/\s+/g, ' ');
     if (/binary_tree_closuretab/.test(s)) { const e = new Error('no closure'); e.code = 'ER_NO_SUCH_TABLE'; throw e; }
+    if (/FROM pairing_carry_resettab WHERE uid = \?/.test(s)) {
+      const day = world.resets && world.resets.get(Number(params[0]));
+      return [day ? [{ flush_day: day }] : []];
+    }
     if (/FROM upgradetab u INNER JOIN codestab c/.test(s)) { const r = latestUpgrade(Number(params[0])); return [r ? [r] : []]; }
     if (/FROM upgradetab WHERE transtype = 1 AND uid = \?/.test(s)) {
       return [world.upgrades.filter((u) => u.uid === Number(params[0]))
@@ -101,7 +105,13 @@ function buildWorld(seed, n = 70) {
     }
     users.set(uid, u);
   }
-  return { users, upgrades, codes, ttlincome2: new Map() };
+  // Ownership-handover carry resets on a few owners (own generator, so the trees stay as before).
+  const rr = rng(seed + 1000);
+  const resets = new Map();
+  for (let i = 0; i < 6; i += 1) {
+    resets.set(1 + Math.floor(rr() * n), day(Math.floor(rr() * 80)));
+  }
+  return { users, upgrades, codes, ttlincome2: new Map(), resets };
 }
 
 function snapshotOf(w) {
@@ -109,6 +119,7 @@ function snapshotOf(w) {
     users: [...w.users.values()].map((u) => ({ ...u, username: `m${u.uid}` })),
     upgrades: w.upgrades.map((u) => ({ ...u, code_row_id: w.codes.has(u.codeid) ? u.codeid : null, code: `U${u.id}`, codetype: w.codes.get(u.codeid)?.codetype, productamount: 10000 })),
     regCodes: [],
+    carryResets: [...(w.resets || new Map())].map(([uid, flushDay]) => ({ uid, flush_day: flushDay })),
   };
 }
 
@@ -126,7 +137,7 @@ for (const seed of [1, 7, 42, 99, 2026]) {
       const { left, right, directRows } = collectOwnerEntries(uid, cap, idx);
       const locked = !summarizeQualifiedDirectLegs(uid, directRows).canEarnPairing;
       if (real.eligibility) assert.equal(!locked, real.eligibility.canEarnPairing, `owner ${uid} eligibility`);
-      const mine = replayOwnerPairing({ left, right, capAccttype: cap, locked });
+      const mine = replayOwnerPairing({ left, right, capAccttype: cap, locked, carryFlushDay: idx.carryFlushDays.get(uid) || null });
       assert.equal(mine.totalPay, real.totalPay, `owner ${uid}`);
       const attributed = [...mine.shares.values()].reduce((t, s) => t + s.amount, 0);
       assert.ok(Math.abs(attributed - mine.totalPay) < 1e-6, `owner ${uid} attribution ${attributed} vs ${mine.totalPay}`);
@@ -298,4 +309,19 @@ test('income-per-code: a second build while one runs gets 429, then the first co
   release();
   await handler({ query: { from: '2026-05', to: '2026-12' } }, third);
   assert.equal(third.statusCode, 200, 'guard released after completion');
+});
+
+test('carry reset: the previous owner\'s waiting codes earn nothing after the cutoff', () => {
+  const e = (key, day, points) => ({ key, points, date: `${day} 00:00:00`, codeid: 1, sortTs: `${day} 01:00:00` });
+  const left = [e('old', '2026-11-01', 1000), e('newL', '2026-11-22', 500)];
+  const right = [e('newR', '2026-11-21', 500)];
+  const withReset = replayOwnerPairing({ left, right, capAccttype: 60, locked: false, carryFlushDay: '2026-11-20 00:00:00' });
+  assert.equal(withReset.totalPay, 500);
+  assert.equal((withReset.shares.get('old') || { amount: 0 }).amount, 0);
+  assert.equal(withReset.shares.get('newR').amount, 250);
+  assert.equal(withReset.shares.get('newL').amount, 250);
+  const control = replayOwnerPairing({ left, right, capAccttype: 60, locked: false });
+  assert.equal(control.totalPay, 500);
+  assert.equal(control.shares.get('old').amount, 250, 'control: without the reset the old code takes the match');
+  assert.equal((control.shares.get('newL') || { amount: 0 }).amount, 0);
 });

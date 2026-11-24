@@ -33,7 +33,7 @@ const {
   getAccountStateLabel,
 } = require('./accountState');
 const { summarizeQualifiedDirectLegs } = require('./binaryEligibility');
-const { pairingWeekKey } = require('./income/pairing');
+const { pairingWeekKey, isCarryFlushActive } = require('./income/pairing');
 const { rateForLeadershipLevel } = require('./income/leadership');
 const {
   getPackagePairingWeeklyCap,
@@ -123,13 +123,21 @@ const SNAPSHOT_QUERIES = {
                FROM codestab c
                JOIN usertab u ON u.activationcode = c.code
               GROUP BY c.code`,
+  carryResets: `SELECT uid, DATE_FORMAT(carry_flush_day, '%Y-%m-%d') AS flush_day
+                  FROM pairing_carry_resettab`,
 };
 
 async function loadSnapshot(db) {
   const out = {};
   for (const [name, sql] of Object.entries(SNAPSHOT_QUERIES)) {
-    const [rows] = await db.query(sql);
-    out[name] = rows;
+    try {
+      const [rows] = await db.query(sql);
+      out[name] = rows;
+    } catch (err) {
+      // Before V052 runs there are no carry resets; every other table must exist.
+      if (name !== 'carryResets' || err.code !== 'ER_NO_SUCH_TABLE') throw err;
+      out[name] = [];
+    }
   }
   return out;
 }
@@ -174,7 +182,10 @@ async function indexSnapshot(snapshot) {
     upgradesByUid.get(uid).push(up);
   }
   const codeTypes = new Map(snapshot.regCodes.map((r) => [String(r.code), String(r.codetypes || '')]));
-  return { users, children, upgradesByUid, codeTypes };
+  const carryFlushDays = new Map((snapshot.carryResets || [])
+    .filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(String(r.flush_day || '')))
+    .map((r) => [Number(r.uid), `${r.flush_day} 00:00:00`]));
+  return { users, children, upgradesByUid, codeTypes, carryFlushDays };
 }
 
 // ---- pairing replay (mirrors pairing.js getNumLevels + totalPairingAmount) ----------------------
@@ -222,7 +233,10 @@ function collectOwnerEntries(ownerUid, capAccttype, idx) {
  * queues and splits each day's credited pesos over them. `locked` = owner fails the
  * eligibility gate: the engine pays 0, the matches are still counted as blocked.
  */
-function replayOwnerPairing({ left, right, capAccttype, locked }) {
+function replayOwnerPairing({ left, right, capAccttype, locked, carryFlushDay = null }) {
+  // Carry reset (V052): same rule as totalPairingAmount, applied only once the reset day has come.
+  const flushDay = isCarryFlushActive(carryFlushDay) ? carryFlushDay : null;
+  let carryFlushed = false;
   const maxPay = getPackagePairingWeeklyCap(capAccttype) || 10000;
   const monthCap = getPackagePairingMonthlyCap(capAccttype) || 0;
   const sealingPoint = getPackageSealingPoint(capAccttype);
@@ -256,6 +270,14 @@ function replayOwnerPairing({ left, right, capAccttype, locked }) {
   };
 
   for (const day of days) {
+    if (flushDay && !carryFlushed && day >= flushDay) {
+      // The previous owner's unmatched points leave the queues with the carry.
+      lcounter = 0;
+      rcounter = 0;
+      lq = leftQ.length;
+      rq = rightQ.length;
+      carryFlushed = true;
+    }
     const { left: dl, right: dr } = byDay.get(day);
     dl.sort(order);
     dr.sort(order);
@@ -419,7 +441,9 @@ async function computeIncomePerCode(range, snapshot) {
     const { left, right, directRows } = collectOwnerEntries(ownerUid, capAccttype, idx);
     const locked = !summarizeQualifiedDirectLegs(ownerUid, directRows).canEarnPairing;
     if (locked) check.lockedOwners += 1;
-    const { totalPay, shares } = replayOwnerPairing({ left, right, capAccttype, locked });
+    const { totalPay, shares } = replayOwnerPairing({
+      left, right, capAccttype, locked, carryFlushDay: idx.carryFlushDays.get(ownerUid) || null,
+    });
     check.engineTotal += totalPay;
     for (const [key, s] of shares) {
       check.attributedTotal += s.amount;
