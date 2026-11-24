@@ -16,6 +16,7 @@ const {
 const { getPackagePolicy } = require('../services/packagePolicy');
 const { getEffectiveAccountState, countsForPairingSource, getAccountStateLabel } = require('../services/accountState');
 const { getBinaryPairingEligibility } = require('../services/binaryEligibility');
+const { getCarryResetLegPoints } = require('../services/income/pairing');
 
 router.get('/sources', memberAuth, async (req, res) => {
   try {
@@ -280,8 +281,16 @@ router.get('/', memberAuth, async (req, res) => {
     // traversal of all eligible PD/fully-paid-CD accounts. This is the authoritative
     // source and matches what the dashboard displays. Do NOT override with the
     // new ledger's availableLeftPoints which is only correct after full backfill.
+    // Same handover rule as the dashboard: after a carry reset the legs show only the PV earned
+    // from the reset day, so the previous owner's unmatched PV is not presented as waiting.
+    const resetLegs = await getCarryResetLegPoints(uid);
     const displayCounts = {
       ...counts,
+      ...(resetLegs ? {
+        totalPointsLeft: resetLegs.totalPointsLeft,
+        totalPointsRight: resetLegs.totalPointsRight,
+        carryResetDay: resetLegs.carryFlushDay.slice(0, 10),
+      } : {}),
       pairedPointsConsumed: Number(balances.pairedPoints || 0),
       strongLegPoints: Number(balances.strongLegPoints || 0),
       weakLegPoints: Number(balances.weakLegPoints || 0),

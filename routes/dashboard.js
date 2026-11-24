@@ -14,6 +14,7 @@ const {
 } = require('../services/income/unilevel');
 const { getLeadershipTraceability } = require('../services/income/leadership');
 const { getPairingCounts } = require('../services/network');
+const { getCarryResetLegPoints } = require('../services/income/pairing');
 const { getMemberGlobalBonus } = require('../services/globalBonus');
 const {
   getEffectiveAccountState,
@@ -184,6 +185,13 @@ router.get('/', memberAuth, async (req, res) => {
     //    back to recursive usertab traversal — always counts ALL descendants,
     //    not just direct children.
     const pairingCounts = await getPairingCounts(uid);
+    // After an ownership handover the previous owner's unmatched PV no longer counts, so the
+    // legs show only the PV earned from the handover day (null for every other account).
+    const resetLegs = await getCarryResetLegPoints(uid);
+    if (resetLegs) {
+      pairingCounts.totalPointsLeft = resetLegs.totalPointsLeft;
+      pairingCounts.totalPointsRight = resetLegs.totalPointsRight;
+    }
     const leftAccounts = pairingCounts.totalLeft;
     const rightAccounts = pairingCounts.totalRight;
     // binarypoints in usertab are stored as peso values (250=Bronze, 5000=Garnet, etc.)
