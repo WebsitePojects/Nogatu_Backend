@@ -97,8 +97,9 @@ function countsTowardPairing(entry) {
 function computeCarry(leftPoints, rightPoints, carryFlushDay, now = new Date()) {
   const flushActive = isCarryFlushActive(carryFlushDay, now);
   const sumLeg = (entries) => entries.reduce((total, entry) => {
-    if (!countsTowardPairing(entry)) return total;
-    if (flushActive && !(entry.date && entry.date >= carryFlushDay)) return total;
+    // Undated entries never pair in the engine (lp.date === date is never true), so they never wait.
+    if (!countsTowardPairing(entry) || !entry.date) return total;
+    if (flushActive && entry.date < carryFlushDay) return total;
     return total + Number(entry.points || 0);
   }, 0);
   const left = sumLeg(leftPoints);
