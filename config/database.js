@@ -14,6 +14,10 @@ const pool = mysql.createPool({
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
+  // mysql2 3.2x parses MariaDB JSON columns into objects; up to 3.19 they came back as strings, and
+  // the code (job payloads, codes_json, usage notes, audit states) is written for strings. Keep them
+  // strings so a driver upgrade cannot change what every reader receives.
+  jsonStrings: true,
 });
 
 async function testConnection() {
