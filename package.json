@@ -36,10 +36,16 @@
     "jszip": "^3.10.1",
     "multer": "^2.1.1",
     "mysql2": "^3.11.5",
-    "nodemailer": "^9.0.3"
+    "nodemailer": "^10.6.1"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",
     "nodemon": "^3.1.7"
+  },
+  "overrides": {
+    "express-mysql-session": {
+      "mysql2": "$mysql2"
+    },
+    "qs": "^6.17.1"
   }
 }
