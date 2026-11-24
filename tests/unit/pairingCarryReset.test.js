@@ -18,7 +18,8 @@ function entry(day, points, codeid = 1) {
 }
 
 function run(left, right, accttype, carryFlushDay) {
-  const dates = new Set([...left, ...right].map((e) => e.date));
+  // getNumLevels only adds real dates to allDates.
+  const dates = new Set([...left, ...right].map((e) => e.date).filter(Boolean));
   const totals = { totalleft: 0, totalpointsleft: 0, totalright: 0, totalpointsright: 0 };
   return totalPairingAmount(left, right, dates, accttype, totals, { carryFlushDay });
 }
@@ -90,6 +91,12 @@ test('a reset dated in the future is not active yet', () => {
   const left = [entry('2026-11-10', 1000)];
   assert.equal(computeCarry(left, [], '2026-11-25 00:00:00', now).carryLeft, 1000);
   assert.equal(computeCarry(left, [], '2026-11-24 00:00:00', now).carryLeft, 0);
+});
+
+test('undated entries never wait, like in the engine', () => {
+  const left = [{ uid: 0, points: 500, date: null, codeid: 1 }, entry('2026-11-11', 250)];
+  assert.equal(computeCarry(left, [], null, PAST_NOW).carryLeft, 250);
+  assert.equal(run(left, [], 60, null).carryLeft, 250);
 });
 
 test('FS-style entries (codeid 2) never count toward the carry', () => {
