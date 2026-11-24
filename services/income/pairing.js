@@ -51,6 +51,66 @@ function pairingWeekKey(dateValue) {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Carry reset (V052, account ownership handover). Returns the engine day ('YYYY-MM-DD 00:00:00')
+ * before which the member's unmatched carry is discarded, or null when the member has no reset.
+ * A missing table means the migration has not run, and then no reset row can exist either.
+ */
+async function getCarryFlushDay(uid, executor = pool) {
+  try {
+    const [rows] = await executor.query(
+      `SELECT DATE_FORMAT(carry_flush_day, '%Y-%m-%d') AS flush_day
+         FROM pairing_carry_resettab
+        WHERE uid = ?
+        LIMIT 1`,
+      [uid]
+    );
+    const day = rows && rows[0] ? rows[0].flush_day : null;
+    return day ? `${day} 00:00:00` : null;
+  } catch (err) {
+    if (err && (err.code === 'ER_NO_SUCH_TABLE' || Number(err.errno) === 1146)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+// Engine days come from stored dates (Node-era rows are UTC), so "today" is the UTC calendar day.
+function currentEngineDay(now = new Date()) {
+  return `${now.toISOString().slice(0, 10)} 00:00:00`;
+}
+
+// A reset dated in the future has not happened yet and must not hide carry the member still owns.
+function isCarryFlushActive(carryFlushDay, now = new Date()) {
+  return Boolean(carryFlushDay) && String(carryFlushDay) <= currentEngineDay(now);
+}
+
+function countsTowardPairing(entry) {
+  return Number(entry.codeid) === 1 || Number(entry.codeid) === 3;
+}
+
+/**
+ * Unmatched points left on each leg (the dashboard's "remaining PV"). Matching consumes equal
+ * points from both legs, so the carry is the difference of the leg sums; after a reset only the
+ * points dated on or after the flush day can still be waiting for a match.
+ */
+function computeCarry(leftPoints, rightPoints, carryFlushDay, now = new Date()) {
+  const flushActive = isCarryFlushActive(carryFlushDay, now);
+  const sumLeg = (entries) => entries.reduce((total, entry) => {
+    if (!countsTowardPairing(entry)) return total;
+    if (flushActive && !(entry.date && entry.date >= carryFlushDay)) return total;
+    return total + Number(entry.points || 0);
+  }, 0);
+  const left = sumLeg(leftPoints);
+  const right = sumLeg(rightPoints);
+  return {
+    countedLeft: left,
+    countedRight: right,
+    carryLeft: Math.max(0, left - right),
+    carryRight: Math.max(0, right - left),
+  };
+}
+
 async function getUpgradeAccounts(uid) {
   const [rows] = await pool.query(
     `SELECT uid,
@@ -185,11 +245,13 @@ async function getNumLevels(
 /**
  * Calculate total pairing amount with weekly caps
  */
-function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals) {
+function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals, options = {}) {
   const sortedDates = Array.from(allDates).sort();
   const maxPay = getPackagePairingWeeklyCap(accttype) || 10000;
   const monthCap = getPackagePairingMonthlyCap(accttype) || 0;
   const sealingPoint = getPackageSealingPoint(accttype);
+  const carryFlushDay = options.carryFlushDay || null;
+  let carryFlushed = false;
   let lcounter = 0;
   let rcounter = 0;
   let ttlbpay = 0;
@@ -199,16 +261,24 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
   const dailyReports = [];
 
   for (const date of sortedDates) {
+    // Ownership handover: the previous owner's unmatched carry never pairs after the cutoff.
+    // Pairing already earned before it, and the week/month cap usage, are left untouched.
+    if (carryFlushDay && !carryFlushed && date >= carryFlushDay) {
+      lcounter = 0;
+      rcounter = 0;
+      carryFlushed = true;
+    }
+
     let leftToday = 0;
     for (const lp of leftPoints) {
-      if (lp.date === date && (Number(lp.codeid) === 1 || Number(lp.codeid) === 3)) {
+      if (lp.date === date && countsTowardPairing(lp)) {
         leftToday += Number(lp.points || 0);
       }
     }
 
     let rightToday = 0;
     for (const rp of rightPoints) {
-      if (rp.date === date && (Number(rp.codeid) === 1 || Number(rp.codeid) === 3)) {
+      if (rp.date === date && countsTowardPairing(rp)) {
         rightToday += Number(rp.points || 0);
       }
     }
@@ -269,7 +339,13 @@ function totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals)
     }
   }
 
-  return { totalPay: ttlbpay, dailyReports: dailyReports };
+  // The cutoff has passed but no point is dated on or after it yet: the carry is still gone.
+  if (carryFlushDay && !carryFlushed) {
+    lcounter = 0;
+    rcounter = 0;
+  }
+
+  return { totalPay: ttlbpay, dailyReports: dailyReports, carryLeft: lcounter, carryRight: rcounter };
 }
 
 /**
@@ -318,6 +394,8 @@ async function getPairing(uid, accttype) {
   }, 0);
   const pairedPts = Math.min(leftPts, rightPts);
   const eligibility = await getBinaryPairingEligibility(uid);
+  const carryFlushDay = await getCarryFlushDay(uid);
+  const carry = computeCarry(leftPoints, rightPoints, carryFlushDay);
 
   if (allDates.size === 0) {
     return {
@@ -329,6 +407,8 @@ async function getPairing(uid, accttype) {
       pairedPts,
       dailyReports: [],
       eligibility,
+      carryFlushDay,
+      ...carry,
     };
   }
 
@@ -342,10 +422,14 @@ async function getPairing(uid, accttype) {
       pairedPts,
       dailyReports: [],
       eligibility,
+      carryFlushDay,
+      ...carry,
     };
   }
 
-  const pairingResult = totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals);
+  const pairingResult = totalPairingAmount(leftPoints, rightPoints, allDates, accttype, totals, {
+    carryFlushDay: isCarryFlushActive(carryFlushDay) ? carryFlushDay : null,
+  });
 
   return {
     totalPay: pairingResult.totalPay,
@@ -356,6 +440,29 @@ async function getPairing(uid, accttype) {
     pairedPts: pairedPts,
     dailyReports: pairingResult.dailyReports,
     eligibility,
+    carryFlushDay,
+    ...carry,
+  };
+}
+
+/**
+ * Leg PV for display on an account whose carry was reset. Counts only the points dated from the
+ * reset day, with the same engine the wallet uses, so the "unmatched PV" shown to the new owner is
+ * exactly what can still pay. Returns null for every account without an active reset, and the
+ * caller keeps its usual figures.
+ */
+async function getCarryResetLegPoints(uid) {
+  const carryFlushDay = await getCarryFlushDay(uid);
+  if (!isCarryFlushActive(carryFlushDay)) {
+    return null;
+  }
+  const account = await getEffectiveAccountState(uid);
+  const accttype = Number(account?.currentaccttype || account?.accttype || 0);
+  const result = await getPairing(uid, accttype);
+  return {
+    carryFlushDay,
+    totalPointsLeft: Number(result.countedLeft || 0),
+    totalPointsRight: Number(result.countedRight || 0),
   };
 }
 
@@ -479,4 +586,15 @@ async function savePairingReport(uid, reports, conn = pool) {
   }
 }
 
-module.exports = { getPairing, getPairingReport, savePairingReport, totalPairingAmount, pairingWeekKey, PAIRING_CAPS };
+module.exports = {
+  getPairing,
+  getPairingReport,
+  savePairingReport,
+  totalPairingAmount,
+  pairingWeekKey,
+  PAIRING_CAPS,
+  getCarryFlushDay,
+  getCarryResetLegPoints,
+  computeCarry,
+  isCarryFlushActive,
+};

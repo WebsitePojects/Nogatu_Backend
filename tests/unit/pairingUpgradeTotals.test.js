@@ -72,6 +72,10 @@ test('upgrade-driven pairing totals include appended upgrade points in daily rep
         return [[]];
       }
 
+      if (sql.indexOf('FROM pairing_carry_resettab') >= 0) {
+        return [[]];
+      }
+
       if (sql.indexOf('FROM upgradetab') >= 0) {
         return [[{
           uid: 200,
