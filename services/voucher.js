@@ -488,8 +488,21 @@ async function getVouchers(uid) {
     [uid]
   );
 
+  // Display-only: a failure here must never hide the member's vouchers.
+  let extensionsByVoucher = new Map();
+  try {
+    const { getVoucherExtensionNotices } = require('./voucherValidity');
+    const notices = await getVoucherExtensionNotices(uid, pool);
+    extensionsByVoucher = new Map(notices.map((n) => [n.voucherId, n]));
+  } catch (error) {
+    console.error('[Vouchers] Extension notice lookup failed:', error.message);
+  }
+
   return rows.map((row) => ({
     ...row,
+    validity_extension: extensionsByVoucher.has(Number(row.id))
+      ? (({ extendedOn, newExpiry, isRecent }) => ({ extendedOn, newExpiry, isRecent }))(extensionsByVoucher.get(Number(row.id)))
+      : null,
     expiry_mode: getVoucherExpiryMode(row),
     expiry_label: buildVoucherExpiryLabel({
       unusedExpiryDate: row.expiry_date,

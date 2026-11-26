@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const { memberAuth } = require('../middleware/auth');
 const { getVouchers, redeemVoucher } = require('../services/voucher');
+const { getVoucherExtensionNotices } = require('../services/voucherValidity');
 
 /**
  * GET /api/vouchers
@@ -17,6 +18,21 @@ router.get('/', memberAuth, async (req, res) => {
     res.json({ vouchers });
   } catch (err) {
     console.error('[Vouchers] List error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/vouchers/notices
+ * Extensions of the member's vouchers made in the last 30 days and still in effect.
+ * Light enough for the dashboard: one indexed query, no expiry sweep.
+ */
+router.get('/notices', memberAuth, async (req, res) => {
+  try {
+    const notices = (await getVoucherExtensionNotices(req.session.uid)).filter((n) => n.isRecent);
+    res.json({ notices });
+  } catch (err) {
+    console.error('[Vouchers] Notices error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

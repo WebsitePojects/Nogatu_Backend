@@ -215,7 +215,66 @@ async function extendVoucherValidity({ voucherId, newExpiry, reason, admin = {},
   }
 }
 
+/**
+ * Member-facing notice of an admin extension (Sir Dino, 2026-11-23: tell the member when
+ * their voucher is extended).
+ *
+ * Returns only extensions that are STILL IN EFFECT: the latest extension of each of the
+ * member's vouchers, on the clock that governs now, whose date is still exactly the voucher's
+ * governing date, on an active voucher that has not run out. If the member uses an unused
+ * voucher after an unused-clock extension, the used clock takes over and the notice drops
+ * instead of promising a date that no longer applies.
+ *
+ * The admin's reason and name are internal notes and are never returned.
+ * isRecent = extended within NOTICE_RECENT_DAYS (drives the banner; the voucher row shows the
+ * note for as long as the extension is in effect).
+ */
+const NOTICE_RECENT_DAYS = 30;
+
+const EXTENSION_NOTICE_SQL = `
+  SELECT e.id, e.voucher_id, e.clock,
+         DATE_FORMAT(e.new_expiry, '%Y-%m-%d') AS new_expiry,
+         DATE_FORMAT(e.created_at, '%Y-%m-%d') AS extended_on,
+         (e.created_at >= NOW() - INTERVAL ${NOTICE_RECENT_DAYS} DAY) AS is_recent,
+         v.package_type, v.voucher_amount
+    FROM voucher_validity_extensiontab e
+    JOIN voucherstab v ON v.id = e.voucher_id AND v.uid = e.uid
+   WHERE e.uid = ?
+     AND e.id = (SELECT MAX(x.id) FROM voucher_validity_extensiontab x WHERE x.voucher_id = e.voucher_id)
+     AND v.status = 1
+     AND (
+           (e.clock = 'unused' AND v.first_used_at IS NULL
+             AND v.expiry_date = e.new_expiry AND v.expiry_date >= NOW())
+        OR (e.clock = 'used' AND v.first_used_at IS NOT NULL
+             AND v.use_expires_at = e.new_expiry AND v.use_expires_at >= NOW())
+         )
+   ORDER BY e.id DESC`;
+
+async function getVoucherExtensionNotices(uid, executor = null) {
+  const memberUid = Number(uid);
+  if (!Number.isInteger(memberUid) || memberUid <= 0) return [];
+  try {
+    const [rows] = await (executor || getPool()).query(EXTENSION_NOTICE_SQL, [memberUid]);
+    return (rows || []).map((r) => ({
+      extensionId: Number(r.id),
+      voucherId: Number(r.voucher_id),
+      clock: r.clock,
+      newExpiry: r.new_expiry,
+      extendedOn: r.extended_on,
+      isRecent: Number(r.is_recent) === 1,
+      packageType: Number(r.package_type),
+      voucherAmount: Number(r.voucher_amount),
+    }));
+  } catch (error) {
+    // V051 not migrated yet on this database: nothing has been extended, so nothing to show.
+    if (error && error.code === 'ER_NO_SUCH_TABLE') return [];
+    throw error;
+  }
+}
+
 module.exports = {
+  NOTICE_RECENT_DAYS,
+  getVoucherExtensionNotices,
   MAX_EXTENSION_MONTHS_FROM_NOW,
   MIN_REASON_LENGTH,
   MAX_REASON_LENGTH,
