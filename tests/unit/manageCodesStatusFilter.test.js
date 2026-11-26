@@ -225,3 +225,31 @@ test('the export route rejects an unknown status with 400', async () => {
   assert.equal(res.statusCode, 400);
   assert.equal(loaded.queries.filter((q) => !/^SHOW TABLES LIKE/i.test(q.sql.trim())).length, 0);
 });
+
+// 2026-11-26: `?status[0]=x` (or a repeated key) arrives as an array/object, which used
+// to throw on .trim() and return 500. Every filter must reject it as a 400 before any
+// data query runs.
+for (const key of ['status', 'q', 'owner', 'dateFrom', 'dateTo']) {
+  test('list: an array value for "' + key + '" is a 400 with zero data queries', async () => {
+    const r = await listWith({ [key]: ['used'] });
+    assert.equal(r.res.statusCode, 400);
+    assert.match(r.res.body.error, new RegExp(key));
+    assert.equal(r.queries.length, 0);
+  });
+}
+
+test('list: an object value (status[a]=b) is a 400, not a 500', async () => {
+  const r = await listWith({ status: { a: 'b' } });
+  assert.equal(r.res.statusCode, 400);
+});
+
+for (const pair of [['/export', 'owner'], ['/history', 'q'], ['/history/export', 'q'], ['/lookup-account', 'username']]) {
+  test(pair[0] + ': an array value for "' + pair[1] + '" is a 400', async () => {
+    const loaded = loadCodesRouter();
+    const res = makeRes();
+    await runHandlers(getRouteHandlers(loaded.router, 'get', pair[0]), {
+      query: { [pair[1]]: ['x', 'y'] }, session: { adminrights: 1, adminid: 'admin' },
+    }, res);
+    assert.equal(res.statusCode, 400);
+  });
+}

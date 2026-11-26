@@ -179,10 +179,16 @@ router.get('/validate-placement', async (req, res) => {
  */
 router.get('/available-position', memberAuth, async (req, res) => {
   try {
+    // Without this check a missing or junk placementUid became NaN and failed in the
+    // query as a 500. A uid is a positive whole number; anything else is a bad request.
     const { placementUid } = req.query;
-    const position = await registrationService.getAvailablePosition(Number(placementUid));
+    if (typeof placementUid !== 'string' || !/^[1-9]\d{0,10}$/.test(placementUid.trim())) {
+      return res.status(400).json({ error: 'placementUid must be a positive whole number' });
+    }
+    const position = await registrationService.getAvailablePosition(Number(placementUid.trim()));
     res.json({ position });
   } catch (err) {
+    console.error('[Registration] Available position error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

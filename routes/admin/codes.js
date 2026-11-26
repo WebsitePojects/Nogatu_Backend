@@ -69,11 +69,21 @@ function getTransferSources() {
   return transferSourcesPromise;
 }
 
-class InvalidCodeStatusFilterError extends Error {
-  constructor(value) {
-    super(`Unknown status filter: ${value}`);
-    this.name = 'InvalidCodeStatusFilterError';
+class InvalidCodeFilterError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'InvalidCodeFilterError';
   }
+}
+
+// Express parses `?status[0]=x` or a repeated `?status=a&status=b` into an array or
+// object, which has no .trim() -- that used to surface as a 500. A filter is one text
+// value; anything else is a malformed request and is rejected, never coerced.
+function readFilterText(req, key, fallback = '') {
+  const value = req.query[key];
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'string') throw new InvalidCodeFilterError(`Filter "${key}" must be a single text value`);
+  return value.trim();
 }
 
 /**
@@ -91,10 +101,10 @@ class InvalidCodeStatusFilterError extends Error {
 async function buildCodeFilter(req, adminRight) {
   const conds = [adminRight === 2 ? 'c.codestatus <= 1' : 'c.codestatus <= 2'];
   const params = [];
-  const q = (req.query.q || '').trim();
-  const owner = (req.query.owner || '').trim();
-  const dateFrom = (req.query.dateFrom || '').trim();
-  const dateTo = (req.query.dateTo || '').trim();
+  const q = readFilterText(req, 'q');
+  const owner = readFilterText(req, 'owner');
+  const dateFrom = readFilterText(req, 'dateFrom');
+  const dateTo = readFilterText(req, 'dateTo');
 
   if (q) {
     if (/^\d+$/.test(q)) {
@@ -113,8 +123,8 @@ async function buildCodeFilter(req, adminRight) {
   if (ISO_DATE.test(dateFrom)) { conds.push('c.dategen >= ?'); params.push(`${dateFrom} 00:00:00`); }
   if (ISO_DATE.test(dateTo)) { conds.push('c.dategen < DATE_ADD(?, INTERVAL 1 DAY)'); params.push(dateTo); }
 
-  const status = (req.query.status || 'all').trim().toLowerCase();
-  if (!CODE_STATUS_FILTERS.has(status)) throw new InvalidCodeStatusFilterError(status);
+  const status = (readFilterText(req, 'status') || 'all').toLowerCase();
+  if (!CODE_STATUS_FILTERS.has(status)) throw new InvalidCodeFilterError(`Unknown status filter: ${status}`);
   if (status === 'not_released') conds.push('c.codestatus = 0');
   else if (status === 'released') conds.push('c.codestatus = 1');
   else if (status === 'used') conds.push('c.codestatus = 2');
@@ -366,7 +376,7 @@ router.get('/', adminAuth, adminRights([1, 3]), async (req, res) => {
 
     res.json({ codes, total, page, totalPages: Math.ceil(total / perPage) });
   } catch (err) {
-    if (err instanceof InvalidCodeStatusFilterError) {
+    if (err instanceof InvalidCodeFilterError) {
       return res.status(400).json({ error: err.message });
     }
     console.error('[Admin Codes] List error:', err);
@@ -399,7 +409,7 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
     );
 
     const statusLabel = (s) => (s === 0 ? 'Not Released' : s === 1 ? 'Released' : 'Used');
-    const owner = (req.query.owner || '').trim().replace(/[^A-Za-z0-9_-]/g, '') || 'all';
+    const owner = readFilterText(req, 'owner').replace(/[^A-Za-z0-9_-]/g, '') || 'all';
     const filename = `activation-codes-${owner}`;
 
     // CSV kept as an explicit fallback; default is a real .xlsx with fixed
@@ -437,7 +447,7 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
     await wb.xlsx.write(res);
     res.end();
   } catch (err) {
-    if (err instanceof InvalidCodeStatusFilterError) {
+    if (err instanceof InvalidCodeFilterError) {
       return res.status(400).json({ error: err.message });
     }
     console.error('[Admin Codes] Export error:', err);
@@ -448,11 +458,12 @@ router.get('/export', adminAuth, adminRights([1, 3]), async (req, res) => {
 router.get('/history', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page) || 1);
-    const q = (req.query.q || '').trim();
+    const q = readFilterText(req, 'q');
     const perPage = Math.min(100, Math.max(1, Number(req.query.perPage) || 30));
     const result = await listAdminActivationHistory({ page, perPage, codeQuery: q });
     res.json(result);
   } catch (err) {
+    if (err instanceof InvalidCodeFilterError) return res.status(400).json({ error: err.message });
     console.error('[Admin Codes] History error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -460,7 +471,7 @@ router.get('/history', adminAuth, adminRights([1, 3]), async (req, res) => {
 
 router.get('/history/export', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const q = (req.query.q || '').trim();
+    const q = readFilterText(req, 'q');
     const history = await listAdminActivationHistory({ page: 1, perPage: 1000, codeQuery: q });
     const csv = buildSectionedCsv([
       {
@@ -480,6 +491,7 @@ router.get('/history/export', adminAuth, adminRights([1, 3]), async (req, res) =
     ]);
     sendCsv(res, 'activation-code-history', csv);
   } catch (err) {
+    if (err instanceof InvalidCodeFilterError) return res.status(400).json({ error: err.message });
     console.error('[Admin Codes] History export error:', err);
     res.status(500).json({ error: 'Failed to export activation code history' });
   }
@@ -491,7 +503,7 @@ router.get('/history/export', adminAuth, adminRights([1, 3]), async (req, res) =
  */
 router.get('/lookup-account', adminAuth, adminRights([1, 3]), async (req, res) => {
   try {
-    const username = sanitizeAlphaNum((req.query.username || '').trim());
+    const username = sanitizeAlphaNum(readFilterText(req, 'username'));
     if (!username) {
       return res.status(400).json({ error: 'Username is required' });
     }
@@ -526,6 +538,7 @@ router.get('/lookup-account', adminAuth, adminRights([1, 3]), async (req, res) =
       },
     });
   } catch (err) {
+    if (err instanceof InvalidCodeFilterError) return res.status(400).json({ error: err.message });
     console.error('[Admin Codes] Lookup account error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }

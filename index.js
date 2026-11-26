@@ -314,6 +314,7 @@ app.use('/api/applications', require('./routes/applications').router);
 // Admin routes
 // readonlyGuard blocks all non-GET requests for accounts with role='readonly'
 const { readonlyGuard } = require('./middleware/auth');
+const { errorHandler } = require('./middleware/errorHandler');
 app.use('/api/admin', readonlyGuard);
 
 app.use('/api/admin/auth', require('./routes/admin/auth'));
@@ -382,10 +383,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // ─── Error handler ───────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error('[Server Error]', err.stack);
-  res.status(500).json({ error: 'Internal server error' });
-});
+app.use(errorHandler);
 
 // ─── Start ───────────────────────────────────────────────────
 async function start() {
